@@ -82,6 +82,11 @@
               host = "aarch64-linux";
               hardwareOptimization = "rockpro64";
             }).gcc.tune}" = "cortex-a72.cortex-a53"
+            test "${
+              if inputs.self.lib.mkNixosStrictCrossSystem == inputs.self.lib.mkNixosSwitchSystem
+              then "1"
+              else "0"
+            }" = "1"
             touch $out
           '';
 

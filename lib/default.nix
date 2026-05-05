@@ -325,7 +325,7 @@
       ''
     else throw "crossbow: executor `${executor.kind}` is not implemented in phase 1";
 
-  mkNixosStrictCrossSystem = {
+  mkNixosSwitchSystem = {
     nixpkgs ? inputs.nixpkgs,
     build,
     host,
@@ -376,6 +376,8 @@
         ];
     };
 
+  mkNixosStrictCrossSystem = mkNixosSwitchSystem;
+
   mkNixosNativeSubstitutedSystem = {
     nixpkgs ? inputs.nixpkgs,
     host,
@@ -418,7 +420,7 @@
         ];
     };
 
-  mkNixosCrossSystem = mkNixosStrictCrossSystem;
+  mkNixosCrossSystem = mkNixosSwitchSystem;
 
   withCrossSupport = {
     inputs,
@@ -465,6 +467,7 @@
         mkCross
         mkCrossCheck
         mkNixosCrossSystem
+        mkNixosSwitchSystem
         mkNixosStrictCrossSystem
         mkNixosNativeSubstitutedSystem
         withCrossSupport
