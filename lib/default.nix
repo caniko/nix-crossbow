@@ -184,7 +184,7 @@
             nixpkgs.buildPlatform = lib.mkForce build;
             nixpkgs.hostPlatform = lib.mkForce host;
 
-            system.extraSystemBuilderCmds = ''
+            system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
               cat > $out/nix-support/crossbow-cache-mode <<'EOF'
               ${cacheMode.name}
@@ -218,7 +218,7 @@
           {
             nixpkgs.hostPlatform = lib.mkForce host;
 
-            system.extraSystemBuilderCmds = ''
+            system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
               cat > $out/nix-support/crossbow-cache-mode <<'EOF'
               ${cacheMode.name}
