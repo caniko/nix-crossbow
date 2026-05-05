@@ -41,6 +41,56 @@
     cacheModes.${mode}
     or (throw "crossbow: unsupported cache mode `${mode}`; expected one of ${lib.concatStringsSep ", " (builtins.attrNames cacheModes)}");
 
+  hardwareProfiles = {
+    rockpro64 = {
+      name = "rockpro64";
+      system = "aarch64-linux";
+      vendor = "pine64";
+      soc = "rk3399";
+      description = "Pine64 RockPro64 / RK3399: Cortex-A72 + Cortex-A53 big.LITTLE ARMv8-A";
+      platform = {
+        gcc = {
+          arch = "armv8-a";
+          tune = "cortex-a72.cortex-a53";
+        };
+      };
+    };
+  };
+
+  hardwareProfileFor = hardwareOptimization:
+    if hardwareOptimization == null
+    then null
+    else if lib.isString hardwareOptimization
+    then hardwareProfiles.${hardwareOptimization}
+      or (throw "crossbow: unsupported hardware optimization profile `${hardwareOptimization}`; expected one of ${lib.concatStringsSep ", " (builtins.attrNames hardwareProfiles)}")
+    else hardwareOptimization;
+
+  mkOptimizedHostPlatform = {
+    host,
+    hardwareOptimization ? null,
+  }: let
+    hostTarget = targetFor host;
+    profile = hardwareProfileFor hardwareOptimization;
+  in
+    if profile == null
+    then host
+    else if (profile.system or host) != host
+    then throw "crossbow: hardware optimization profile `${profile.name or "<unnamed>"}` is for `${profile.system}` but host is `${host}`"
+    else
+      hostTarget
+      // (profile.platform or {})
+      // {
+        system = host;
+        config = hostTarget.config;
+      };
+
+  hardwareOptimizationName = hardwareOptimization: let
+    profile = hardwareProfileFor hardwareOptimization;
+  in
+    if profile == null
+    then null
+    else profile.name or "custom";
+
   unsupportedToolchainMessage = {
     build,
     host,
@@ -171,8 +221,13 @@
     host,
     modules,
     specialArgs ? {},
+    hardwareOptimization ? null,
   }: let
     cacheMode = cacheModeFor "strict-cross";
+    hostPlatform = mkOptimizedHostPlatform {
+      inherit host hardwareOptimization;
+    };
+    profileName = hardwareOptimizationName hardwareOptimization;
   in
     nixpkgs.lib.nixosSystem {
       system = build;
@@ -182,13 +237,18 @@
         ++ [
           ({config, ...}: {
             nixpkgs.buildPlatform = lib.mkForce build;
-            nixpkgs.hostPlatform = lib.mkForce host;
+            nixpkgs.hostPlatform = lib.mkForce hostPlatform;
 
             system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
               cat > $out/nix-support/crossbow-cache-mode <<'EOF'
               ${cacheMode.name}
               EOF
+              ${lib.optionalString (profileName != null) ''
+                cat > $out/nix-support/crossbow-hardware-optimization <<'EOF'
+                ${profileName}
+                EOF
+              ''}
             '';
 
             assertions = [
@@ -206,8 +266,13 @@
     host,
     modules,
     specialArgs ? {},
+    hardwareOptimization ? null,
   }: let
     cacheMode = cacheModeFor "native-substituted";
+    hostPlatform = mkOptimizedHostPlatform {
+      inherit host hardwareOptimization;
+    };
+    profileName = hardwareOptimizationName hardwareOptimization;
   in
     nixpkgs.lib.nixosSystem {
       system = host;
@@ -216,13 +281,18 @@
         modules
         ++ [
           {
-            nixpkgs.hostPlatform = lib.mkForce host;
+            nixpkgs.hostPlatform = lib.mkForce hostPlatform;
 
             system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
               cat > $out/nix-support/crossbow-cache-mode <<'EOF'
               ${cacheMode.name}
               EOF
+              ${lib.optionalString (profileName != null) ''
+                cat > $out/nix-support/crossbow-hardware-optimization <<'EOF'
+                ${profileName}
+                EOF
+              ''}
             '';
           }
         ];
@@ -263,6 +333,10 @@
         targets
         cacheModes
         cacheModeFor
+        hardwareProfiles
+        hardwareProfileFor
+        mkOptimizedHostPlatform
+        hardwareOptimizationName
         unsupportedToolchainMessage
         selectToolchain
         mkCross

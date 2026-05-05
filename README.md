@@ -14,7 +14,33 @@ Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and
 - `lib.mkNixosStrictCrossSystem`: evaluate a NixOS system with explicit `buildPlatform` and `hostPlatform`.
 - `lib.mkNixosNativeSubstitutedSystem`: evaluate a host-native NixOS system for cache-first QEMU-free substitution.
 - `lib.mkNixosCrossSystem`: compatibility alias for `mkNixosStrictCrossSystem`.
+- `lib.hardwareProfiles`: optional target hardware profiles such as `rockpro64`.
+- `lib.mkOptimizedHostPlatform`: merge a hardware profile into a Nix host platform descriptor.
 - `lib.withCrossSupport`: augment package outputs with cross variants.
+
+## Target Hardware Optimization
+
+Strict cross builds may opt into host hardware tuning without changing the build machine:
+
+```nix
+crossbow.lib.mkNixosStrictCrossSystem {
+  build = "x86_64-linux";
+  host = "aarch64-linux";
+  hardwareOptimization = crossbow.lib.hardwareProfiles.rockpro64;
+  modules = [ ./root/hosts/thething ];
+}
+```
+
+Profiles are regular Nix platform metadata. The `rockpro64` profile currently sets:
+
+```nix
+{
+  gcc.arch = "armv8-a";
+  gcc.tune = "cortex-a72.cortex-a53";
+}
+```
+
+This keeps the ABI at the normal `aarch64-linux` baseline while asking compilers that honor nixpkgs platform metadata to tune code generation for RK3399-class cores.
 
 ## Cache Modes
 

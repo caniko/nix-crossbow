@@ -56,6 +56,8 @@
             test "${inputs.self.lib.targets.wasm32-wasi.config}" = "wasm32-wasi"
             test "${inputs.self.lib.cacheModes.strict-cross.name}" = "strict-cross"
             test "${inputs.self.lib.cacheModes.native-substituted.name}" = "native-substituted"
+            test "${inputs.self.lib.hardwareProfiles.rockpro64.platform.gcc.tune}" = "cortex-a72.cortex-a53"
+            test "${inputs.self.lib.hardwareOptimizationName "rockpro64"}" = "rockpro64"
             touch $out
           '';
 
