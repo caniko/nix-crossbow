@@ -116,8 +116,12 @@
     else
       package.overrideAttrs (old: let
         nativeInputs = resolved.nativeBuildInputs or (_: []);
+        optimizedNativeBuildInputs =
+          if language == "go"
+          then []
+          else nativeInputs pkgs;
         commonAttrs = {
-          nativeBuildInputs = appendList (old.nativeBuildInputs or []) (nativeInputs pkgs);
+          nativeBuildInputs = appendList (old.nativeBuildInputs or []) optimizedNativeBuildInputs;
           passthru =
             (old.passthru or {})
             // {
@@ -133,7 +137,6 @@
         // (
           if language == "go"
           then {
-            GOFLAGS = appendString (old.GOFLAGS or "") (resolved.goFlags or []);
             enableParallelBuilding = old.enableParallelBuilding or true;
           }
           else if language == "rust"
