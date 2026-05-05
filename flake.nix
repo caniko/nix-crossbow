@@ -56,8 +56,32 @@
             test "${inputs.self.lib.targets.wasm32-wasi.config}" = "wasm32-wasi"
             test "${inputs.self.lib.cacheModes.strict-cross.name}" = "strict-cross"
             test "${inputs.self.lib.cacheModes.native-substituted.name}" = "native-substituted"
+            test "${
+              if inputs.self.lib.buildOptimizationProfiles.cache-first.changesHashes
+              then "1"
+              else "0"
+            }" = "0"
+            test "${
+              if inputs.self.lib.buildOptimizationProfiles.fast-local.changesHashes
+              then "1"
+              else "0"
+            }" = "1"
+            test "${
+              if builtins.elem "-flto=thin" inputs.self.lib.buildOptimizationProfiles.fast-local.cFlags
+              then "1"
+              else "0"
+            }" = "1"
+            test "${
+              if builtins.elem "-fuse-ld=mold" inputs.self.lib.buildOptimizationProfiles.fast-local.linkFlags
+              then "1"
+              else "0"
+            }" = "1"
             test "${inputs.self.lib.hardwareProfiles.rockpro64.platform.gcc.tune}" = "cortex-a72.cortex-a53"
             test "${inputs.self.lib.hardwareOptimizationName "rockpro64"}" = "rockpro64"
+            test "${(inputs.self.lib.mkOptimizedHostPlatform {
+              host = "aarch64-linux";
+              hardwareOptimization = "rockpro64";
+            }).gcc.tune}" = "cortex-a72.cortex-a53"
             touch $out
           '';
 

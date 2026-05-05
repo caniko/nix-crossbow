@@ -41,6 +41,113 @@
     cacheModes.${mode}
     or (throw "crossbow: unsupported cache mode `${mode}`; expected one of ${lib.concatStringsSep ", " (builtins.attrNames cacheModes)}");
 
+  buildOptimizationProfiles = {
+    cache-first = {
+      name = "cache-first";
+      changesHashes = false;
+      cFlags = [];
+      linkFlags = [];
+      rustFlags = [];
+      goFlags = [];
+      nativeBuildInputs = pkgs: [];
+      description = "Preserve nixpkgs derivation hashes and maximize binary cache reuse.";
+    };
+    fast-local = {
+      name = "fast-local";
+      changesHashes = true;
+      cFlags = ["-flto=thin"];
+      linkFlags = ["-fuse-ld=mold"];
+      rustFlags = [
+        "-C"
+        "lto=thin"
+        "-C"
+        "link-arg=-fuse-ld=mold"
+      ];
+      goFlags = ["-trimpath"];
+      nativeBuildInputs = pkgs: [
+        pkgs.mold
+      ];
+      description = "Use local build accelerators for derivations that are not expected to substitute.";
+    };
+  };
+
+  buildOptimizationProfileFor = profile:
+    if profile == null
+    then buildOptimizationProfiles.cache-first
+    else if lib.isString profile
+    then buildOptimizationProfiles.${profile}
+      or (throw "crossbow: unsupported build optimization profile `${profile}`; expected one of ${lib.concatStringsSep ", " (builtins.attrNames buildOptimizationProfiles)}")
+    else profile;
+
+  appendString = oldValue: values: let
+    newValue = lib.concatStringsSep " " values;
+  in
+    lib.concatStringsSep " " (lib.filter (value: value != "") [oldValue newValue]);
+
+  appendList = oldValue: values: oldValue ++ values;
+
+  applyBuildOptimization = {
+    pkgs,
+    profile ? buildOptimizationProfiles.cache-first,
+    package,
+    language ? "generic",
+  }: let
+    resolved = buildOptimizationProfileFor profile;
+    metadata = {
+      inherit language;
+      profile = resolved.name or "custom";
+      changesHashes = resolved.changesHashes or true;
+    };
+  in
+    if !(resolved.changesHashes or true)
+    then
+      package
+      // {
+        passthru =
+          (package.passthru or {})
+          // {
+            crossbow =
+              (package.passthru.crossbow or {})
+              // {
+                buildOptimization = metadata;
+              };
+          };
+      }
+    else
+      package.overrideAttrs (old: let
+        nativeInputs = resolved.nativeBuildInputs or (_: []);
+        commonAttrs = {
+          nativeBuildInputs = appendList (old.nativeBuildInputs or []) (nativeInputs pkgs);
+          passthru =
+            (old.passthru or {})
+            // {
+              crossbow =
+                ((old.passthru or {}).crossbow or {})
+                // {
+                  buildOptimization = metadata;
+                };
+            };
+        };
+      in
+        commonAttrs
+        // (
+          if language == "go"
+          then {
+            GOFLAGS = appendString (old.GOFLAGS or "") (resolved.goFlags or []);
+            enableParallelBuilding = old.enableParallelBuilding or true;
+          }
+          else if language == "rust"
+          then {
+            RUSTFLAGS = appendString (old.RUSTFLAGS or "") (resolved.rustFlags or []);
+            CARGO_PROFILE_RELEASE_LTO = old.CARGO_PROFILE_RELEASE_LTO or "thin";
+            CARGO_PROFILE_RELEASE_CODEGEN_UNITS = old.CARGO_PROFILE_RELEASE_CODEGEN_UNITS or "1";
+          }
+          else {
+            NIX_CFLAGS_COMPILE = appendString (old.NIX_CFLAGS_COMPILE or "") (resolved.cFlags or []);
+            NIX_LDFLAGS = appendString (old.NIX_LDFLAGS or "") (resolved.linkFlags or []);
+          }
+        ));
+
   hardwareProfiles = {
     rockpro64 = {
       name = "rockpro64";
@@ -222,8 +329,10 @@
     modules,
     specialArgs ? {},
     hardwareOptimization ? null,
+    buildOptimization ? buildOptimizationProfiles.cache-first,
   }: let
     cacheMode = cacheModeFor "strict-cross";
+    buildProfile = buildOptimizationProfileFor buildOptimization;
     hostPlatform = mkOptimizedHostPlatform {
       inherit host hardwareOptimization;
     };
@@ -243,6 +352,9 @@
               mkdir -p $out/nix-support
               cat > $out/nix-support/crossbow-cache-mode <<'EOF'
               ${cacheMode.name}
+              EOF
+              cat > $out/nix-support/crossbow-build-optimization <<'EOF'
+              ${buildProfile.name}
               EOF
               ${lib.optionalString (profileName != null) ''
                 cat > $out/nix-support/crossbow-hardware-optimization <<'EOF'
@@ -267,8 +379,10 @@
     modules,
     specialArgs ? {},
     hardwareOptimization ? null,
+    buildOptimization ? buildOptimizationProfiles.cache-first,
   }: let
     cacheMode = cacheModeFor "native-substituted";
+    buildProfile = buildOptimizationProfileFor buildOptimization;
     hostPlatform = mkOptimizedHostPlatform {
       inherit host hardwareOptimization;
     };
@@ -287,6 +401,9 @@
               mkdir -p $out/nix-support
               cat > $out/nix-support/crossbow-cache-mode <<'EOF'
               ${cacheMode.name}
+              EOF
+              cat > $out/nix-support/crossbow-build-optimization <<'EOF'
+              ${buildProfile.name}
               EOF
               ${lib.optionalString (profileName != null) ''
                 cat > $out/nix-support/crossbow-hardware-optimization <<'EOF'
@@ -333,6 +450,9 @@
         targets
         cacheModes
         cacheModeFor
+        buildOptimizationProfiles
+        buildOptimizationProfileFor
+        applyBuildOptimization
         hardwareProfiles
         hardwareProfileFor
         mkOptimizedHostPlatform
