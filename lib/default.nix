@@ -358,12 +358,13 @@
     profileName = hardwareOptimizationName hardwareOptimization;
   in
     nixpkgs.lib.nixosSystem {
-      system = host;
+      system = build;
       inherit specialArgs;
       modules =
         modules
         ++ [
           ({config, ...}: {
+            nixpkgs.buildPlatform = lib.mkForce build;
             nixpkgs.hostPlatform = lib.mkForce host;
 
             system.systemBuilderCommands = ''
