@@ -19,6 +19,28 @@
   isWindows = system: osOf system == "windows";
   isWasm = system: lib.hasPrefix "wasm" system;
 
+  cacheModes = {
+    strict-cross = {
+      name = "strict-cross";
+      proves = "build machine compiles host artifacts without QEMU";
+      cacheExpectation = "low nixpkgs binary cache reuse because cross derivation paths differ from native paths";
+    };
+    native-substituted = {
+      name = "native-substituted";
+      proves = "build machine can orchestrate and substitute host-system artifacts without QEMU";
+      cacheExpectation = "high nixpkgs binary cache reuse when host-system paths are available from substituters";
+    };
+    remote-native = {
+      name = "remote-native";
+      proves = "build machine can route missing host-system builds to native hardware without QEMU";
+      cacheExpectation = "uses substitutes first, then a native remote builder for missing host-system paths";
+    };
+  };
+
+  cacheModeFor = mode:
+    cacheModes.${mode}
+    or (throw "crossbow: unsupported cache mode `${mode}`; expected one of ${lib.concatStringsSep ", " (builtins.attrNames cacheModes)}");
+
   unsupportedToolchainMessage = {
     build,
     host,
@@ -143,13 +165,15 @@
       ''
     else throw "crossbow: executor `${executor.kind}` is not implemented in phase 1";
 
-  mkNixosCrossSystem = {
+  mkNixosStrictCrossSystem = {
     nixpkgs ? inputs.nixpkgs,
     build,
     host,
     modules,
     specialArgs ? {},
-  }:
+  }: let
+    cacheMode = cacheModeFor "strict-cross";
+  in
     nixpkgs.lib.nixosSystem {
       system = build;
       inherit specialArgs;
@@ -160,6 +184,13 @@
             nixpkgs.buildPlatform = lib.mkForce build;
             nixpkgs.hostPlatform = lib.mkForce host;
 
+            system.extraSystemBuilderCmds = ''
+              mkdir -p $out/nix-support
+              cat > $out/nix-support/crossbow-cache-mode <<'EOF'
+              ${cacheMode.name}
+              EOF
+            '';
+
             assertions = [
               {
                 assertion = !lib.elem host (config.boot.binfmt.emulatedSystems or []);
@@ -169,6 +200,35 @@
           })
         ];
     };
+
+  mkNixosNativeSubstitutedSystem = {
+    nixpkgs ? inputs.nixpkgs,
+    host,
+    modules,
+    specialArgs ? {},
+  }: let
+    cacheMode = cacheModeFor "native-substituted";
+  in
+    nixpkgs.lib.nixosSystem {
+      system = host;
+      inherit specialArgs;
+      modules =
+        modules
+        ++ [
+          {
+            nixpkgs.hostPlatform = lib.mkForce host;
+
+            system.extraSystemBuilderCmds = ''
+              mkdir -p $out/nix-support
+              cat > $out/nix-support/crossbow-cache-mode <<'EOF'
+              ${cacheMode.name}
+              EOF
+            '';
+          }
+        ];
+    };
+
+  mkNixosCrossSystem = mkNixosStrictCrossSystem;
 
   withCrossSupport = {
     inputs,
@@ -201,11 +261,15 @@
     // {
       inherit
         targets
+        cacheModes
+        cacheModeFor
         unsupportedToolchainMessage
         selectToolchain
         mkCross
         mkCrossCheck
         mkNixosCrossSystem
+        mkNixosStrictCrossSystem
+        mkNixosNativeSubstitutedSystem
         withCrossSupport
         ;
 

@@ -54,6 +54,8 @@
             test "${inputs.self.lib.nixSystemToZigTarget "aarch64-linux"}" = "aarch64-linux-gnu"
             test "${inputs.self.lib.nixSystemToGnuConfig "aarch64-linux"}" = "aarch64-unknown-linux-gnu"
             test "${inputs.self.lib.targets.wasm32-wasi.config}" = "wasm32-wasi"
+            test "${inputs.self.lib.cacheModes.strict-cross.name}" = "strict-cross"
+            test "${inputs.self.lib.cacheModes.native-substituted.name}" = "native-substituted"
             touch $out
           '';
 

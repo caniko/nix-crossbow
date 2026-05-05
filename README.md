@@ -11,8 +11,18 @@ Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and
 - `lib.nixSystemToGnuConfig`: Nix system string to GNU config mapping.
 - `lib.mkCross`: build a package function with an inferred OS-pair toolchain.
 - `lib.mkCrossCheck`: create a separate check derivation with a pluggable executor.
-- `lib.mkNixosCrossSystem`: evaluate a NixOS system with explicit `buildPlatform` and `hostPlatform`.
+- `lib.mkNixosStrictCrossSystem`: evaluate a NixOS system with explicit `buildPlatform` and `hostPlatform`.
+- `lib.mkNixosNativeSubstitutedSystem`: evaluate a host-native NixOS system for cache-first QEMU-free substitution.
+- `lib.mkNixosCrossSystem`: compatibility alias for `mkNixosStrictCrossSystem`.
 - `lib.withCrossSupport`: augment package outputs with cross variants.
+
+## Cache Modes
+
+Crossbow names cache strategy explicitly:
+
+- `strict-cross`: the build machine compiles host artifacts. This is the strongest QEMU-free proof, but nixpkgs binary cache hits are usually low because cross derivation paths differ from native host-system paths.
+- `native-substituted`: the build machine evaluates or orchestrates a host-native system and downloads host-system paths from substituters. This is the right mode when you want `cache.nixos.org` aarch64 binaries on an x86_64 machine.
+- `remote-native`: use substituters first and route missing host-system builds to native hardware.
 
 ## Supported Now
 
