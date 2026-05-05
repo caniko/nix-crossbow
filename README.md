@@ -2,7 +2,7 @@
 
 Crossbow is a Nix flake for QEMU-free cross-compilation. It models compilation and execution separately: a toolchain builds a host artifact, and an executor describes how checks run.
 
-Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and exposes the strict NixOS cross-system helper needed for Canix's atlas-to-thething proof. WASM, Windows, and Darwin targets are present in the public platform map, but their backends intentionally fail until their sysroot and executor stories are implemented.
+Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and exposes NixOS helpers for cache-shaped single-switch deployments and strict cross-system proofs. WASM, Windows, and Darwin targets are present in the public platform map, but their backends intentionally fail until their sysroot and executor stories are implemented.
 
 ## Public API
 
@@ -11,22 +11,33 @@ Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and
 - `lib.nixSystemToGnuConfig`: Nix system string to GNU config mapping.
 - `lib.mkCross`: build a package function with an inferred OS-pair toolchain.
 - `lib.mkCrossCheck`: create a separate check derivation with a pluggable executor.
-- `lib.mkNixosStrictCrossSystem`: evaluate a NixOS system with explicit `buildPlatform` and `hostPlatform`.
+- `lib.mkNixosSwitchSystem`: evaluate a cache-shaped host NixOS system for one `nixos-rebuild switch`, while explicit package overrides may be cross-built.
+- `lib.mkNixosStrictCrossSystem`: evaluate a full strict-cross NixOS system with explicit `buildPlatform` and `hostPlatform`.
 - `lib.mkNixosNativeSubstitutedSystem`: evaluate a host-native NixOS system for cache-first QEMU-free substitution.
-- `lib.mkNixosCrossSystem`: compatibility alias for `mkNixosStrictCrossSystem`.
+- `lib.mkNixosCrossSystem`: compatibility alias for `mkNixosSwitchSystem`.
+- `lib.mkCrossOverlay`: build-side cross package override module helper for cache-shaped NixOS systems.
 - `lib.hardwareProfiles`: optional target hardware profiles such as `rockpro64`.
 - `lib.mkOptimizedHostPlatform`: merge a hardware profile into a Nix host platform descriptor.
 - `lib.withCrossSupport`: augment package outputs with cross variants.
 
 ## Target Hardware Optimization
 
-Strict cross builds may opt into host hardware tuning without changing the build machine:
+Package-level cross or local optimized builds may opt into host hardware tuning without changing the whole NixOS platform:
+
+```nix
+crossbow.lib.applyBuildOptimization {
+  inherit pkgs package;
+  profile = crossbow.lib.buildOptimizationProfiles.fast-local;
+  hardwareOptimization = crossbow.lib.hardwareProfiles.rockpro64;
+}
+```
+
+Strict full-system proof builds are still available separately:
 
 ```nix
 crossbow.lib.mkNixosStrictCrossSystem {
   build = "x86_64-linux";
   host = "aarch64-linux";
-  hardwareOptimization = crossbow.lib.hardwareProfiles.rockpro64;
   modules = [ ./root/hosts/thething ];
 }
 ```
@@ -47,6 +58,7 @@ This keeps the ABI at the normal `aarch64-linux` baseline while asking compilers
 Crossbow names cache strategy explicitly:
 
 - `strict-cross`: the build machine compiles host artifacts. This is the strongest QEMU-free proof, but nixpkgs binary cache hits are usually low because cross derivation paths differ from native host-system paths.
+- `cache-shaped-with-cross-overrides`: host-system derivations keep their normal cache shape, while explicit package overrides may use cross derivations from the build machine.
 - `native-substituted`: the build machine evaluates or orchestrates a host-native system and downloads host-system paths from substituters. This is the right mode when you want `cache.nixos.org` aarch64 binaries on an x86_64 machine.
 - `remote-native`: use substituters first and route missing host-system builds to native hardware.
 

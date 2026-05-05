@@ -56,6 +56,7 @@
             test "${inputs.self.lib.targets.wasm32-wasi.config}" = "wasm32-wasi"
             test "${inputs.self.lib.cacheModes.strict-cross.name}" = "strict-cross"
             test "${inputs.self.lib.cacheModes.native-substituted.name}" = "native-substituted"
+            test "${inputs.self.lib.cacheModes.cache-shaped-with-cross-overrides.name}" = "cache-shaped-with-cross-overrides"
             test "${
               if inputs.self.lib.buildOptimizationProfiles.cache-first.changesHashes
               then "1"
@@ -86,7 +87,7 @@
               if inputs.self.lib.mkNixosStrictCrossSystem == inputs.self.lib.mkNixosSwitchSystem
               then "1"
               else "0"
-            }" = "1"
+            }" = "0"
             touch $out
           '';
 

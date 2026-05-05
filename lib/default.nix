@@ -35,6 +35,11 @@
       proves = "build machine can route missing host-system builds to native hardware without QEMU";
       cacheExpectation = "uses substitutes first, then a native remote builder for missing host-system paths";
     };
+    cache-shaped-with-cross-overrides = {
+      name = "cache-shaped-with-cross-overrides";
+      proves = "host-system closure keeps native cache shape while explicit packages may be cross-built";
+      cacheExpectation = "high nixpkgs binary cache reuse; only opt-in package overrides use cross derivation paths";
+    };
   };
 
   cacheModeFor = mode:
@@ -348,6 +353,59 @@
     hardwareOptimization ? null,
     buildOptimization ? buildOptimizationProfiles.cache-first,
   }: let
+    cacheMode = cacheModeFor "cache-shaped-with-cross-overrides";
+    buildProfile = buildOptimizationProfileFor buildOptimization;
+    profileName = hardwareOptimizationName hardwareOptimization;
+  in
+    nixpkgs.lib.nixosSystem {
+      system = host;
+      inherit specialArgs;
+      modules =
+        modules
+        ++ [
+          ({config, ...}: {
+            nixpkgs.hostPlatform = lib.mkForce host;
+
+            system.systemBuilderCommands = ''
+              mkdir -p $out/nix-support
+              cat > $out/nix-support/crossbow-mode <<'EOF'
+              ${cacheMode.name}
+              EOF
+              cat > $out/nix-support/crossbow-cache-mode <<'EOF'
+              ${cacheMode.name}
+              EOF
+              cat > $out/nix-support/crossbow-build-system <<'EOF'
+              ${build}
+              EOF
+              cat > $out/nix-support/crossbow-build-optimization <<'EOF'
+              ${buildProfile.name}
+              EOF
+              ${lib.optionalString (profileName != null) ''
+                cat > $out/nix-support/crossbow-hardware-optimization <<'EOF'
+                ${profileName}
+                EOF
+              ''}
+            '';
+
+            assertions = [
+              {
+                assertion = !lib.elem host (config.boot.binfmt.emulatedSystems or []);
+                message = "crossbow NixOS switch must not rely on boot.binfmt.emulatedSystems for ${host}";
+              }
+            ];
+          })
+        ];
+    };
+
+  mkNixosStrictCrossSystem = {
+    nixpkgs ? inputs.nixpkgs,
+    build,
+    host,
+    modules,
+    specialArgs ? {},
+    hardwareOptimization ? null,
+    buildOptimization ? buildOptimizationProfiles.cache-first,
+  }: let
     cacheMode = cacheModeFor "strict-cross";
     buildProfile = buildOptimizationProfileFor buildOptimization;
     profileName = hardwareOptimizationName hardwareOptimization;
@@ -364,8 +422,14 @@
 
             system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
+              cat > $out/nix-support/crossbow-mode <<'EOF'
+              ${cacheMode.name}
+              EOF
               cat > $out/nix-support/crossbow-cache-mode <<'EOF'
               ${cacheMode.name}
+              EOF
+              cat > $out/nix-support/crossbow-build-system <<'EOF'
+              ${build}
               EOF
               cat > $out/nix-support/crossbow-build-optimization <<'EOF'
               ${buildProfile.name}
@@ -387,7 +451,34 @@
         ];
     };
 
-  mkNixosStrictCrossSystem = mkNixosSwitchSystem;
+  mkCrossOverlay = {
+    nixpkgs ? inputs.nixpkgs,
+    build,
+    host,
+    overrides ? [],
+    buildOptimization ? buildOptimizationProfiles.cache-first,
+    hardwareOptimization ? null,
+  }: let
+    crossPkgs = import nixpkgs {
+      system = build;
+      crossSystem = host;
+    };
+    buildProfile = buildOptimizationProfileFor buildOptimization;
+    hardwareProfile = hardwareProfileFor hardwareOptimization;
+    mkOverrideModule = override:
+      if lib.isFunction override
+      then
+        override {
+          pkgs = crossPkgs;
+          inherit build host;
+          buildOptimization = buildProfile;
+          hardwareOptimization = hardwareProfile;
+          crossbow = self;
+        }
+      else override;
+  in {
+    imports = map mkOverrideModule overrides;
+  };
 
   mkNixosNativeSubstitutedSystem = {
     nixpkgs ? inputs.nixpkgs,
@@ -478,6 +569,7 @@
         mkNixosSwitchSystem
         mkNixosStrictCrossSystem
         mkNixosNativeSubstitutedSystem
+        mkCrossOverlay
         withCrossSupport
         ;
 
