@@ -1,0 +1,216 @@
+{inputs}: let
+  nixpkgs = inputs.nixpkgs;
+  lib = nixpkgs.lib;
+
+  platformMap = import ./platform-map.nix {inherit lib;};
+  targets = import ./targets.nix;
+
+  targetFor = system:
+    targets.${system}
+    or (throw "crossbow: unsupported host platform `${system}`; add it to lib/targets.nix and lib/platform-map.nix first");
+
+  osOf = system: let
+    parts = lib.splitString "-" system;
+  in
+    lib.last parts;
+
+  isLinux = system: osOf system == "linux";
+  isDarwin = system: osOf system == "darwin";
+  isWindows = system: osOf system == "windows";
+  isWasm = system: lib.hasPrefix "wasm" system;
+
+  unsupportedToolchainMessage = {
+    build,
+    host,
+    darwinSdk ? null,
+  }:
+    if isWasm host
+    then "crossbow: wasm toolchain is declared but not implemented in phase 1"
+    else if isWindows host
+    then "crossbow: windows toolchain is declared but not implemented in phase 1"
+    else if isLinux build && isDarwin host && darwinSdk == null
+    then ''
+      crossbow: linux-to-darwin cross-compilation requires darwinSdk.
+      Set darwinSdk = /path/to/MacOSX.sdk and configure osxcross.
+    ''
+    else if isDarwin host
+    then "crossbow: darwin toolchain is declared but not implemented in phase 1"
+    else "crossbow: unsupported toolchain pair `${build}` -> `${host}`";
+
+  selectToolchain = {
+    build,
+    host,
+    pkgs,
+    darwinSdk ? null,
+  }:
+    if isLinux build && isLinux host
+    then
+      import ../toolchains/linux-linux.nix {
+        inherit pkgs;
+        crossbow = self;
+        buildSystem = build;
+        hostSystem = host;
+      }
+    else if isWasm host
+    then throw (unsupportedToolchainMessage {inherit build host darwinSdk;})
+    else if isWindows host
+    then throw (unsupportedToolchainMessage {inherit build host darwinSdk;})
+    else if isLinux build && isDarwin host && darwinSdk == null
+    then throw (unsupportedToolchainMessage {inherit build host darwinSdk;})
+    else if isDarwin host
+    then throw (unsupportedToolchainMessage {inherit build host darwinSdk;})
+    else throw (unsupportedToolchainMessage {inherit build host darwinSdk;});
+
+  mkCross = {
+    pkgs,
+    host,
+    package,
+    build ? pkgs.stdenv.buildPlatform.system,
+    target ? null,
+    toolchain ?
+      selectToolchain {
+        inherit build host pkgs;
+      },
+    doCheck ? true,
+    checkRunner ? null,
+    darwinSdk ? null,
+  }: let
+    hostTarget = targetFor host;
+    out =
+      if lib.isFunction package
+      then
+        package {
+          inherit pkgs toolchain;
+          buildSystem = build;
+          hostSystem = host;
+          targetSystem = target;
+          stdenv = pkgs.stdenv;
+        }
+      else
+        import package {
+          inherit pkgs toolchain;
+          buildSystem = build;
+          hostSystem = host;
+          targetSystem = target;
+          stdenv = pkgs.stdenv;
+        };
+    check =
+      if doCheck
+      then
+        mkCrossCheck {
+          inherit pkgs out;
+          host = hostTarget;
+          executor =
+            if checkRunner != null
+            then checkRunner
+            else self.executors.native-builder {};
+        }
+      else null;
+  in
+    out
+    // {
+      passthru =
+        (out.passthru or {})
+        // {
+          crossbow = {
+            inherit build host target toolchain check;
+          };
+        };
+    };
+
+  mkCrossCheck = {
+    pkgs,
+    out,
+    host,
+    executor ? self.executors.native-builder {},
+  }: let
+    checkName = out.name or out.pname or "crossbow";
+  in
+    if executor.kind == "skip"
+    then
+      pkgs.runCommand "${checkName}-check-skipped" {
+        passthru.crossbow.skipReason = executor.reason;
+      } ''
+        printf '%s\n' '${executor.reason}' > $out
+      ''
+    else if executor.kind == "native-builder"
+    then
+      pkgs.runCommand "${checkName}-native-builder-check" {
+        passthru.crossbow.requiredSystem = host.system;
+      } ''
+        test -n '${host.system}'
+        touch $out
+      ''
+    else throw "crossbow: executor `${executor.kind}` is not implemented in phase 1";
+
+  mkNixosCrossSystem = {
+    nixpkgs ? inputs.nixpkgs,
+    build,
+    host,
+    modules,
+    specialArgs ? {},
+  }:
+    nixpkgs.lib.nixosSystem {
+      system = build;
+      inherit specialArgs;
+      modules =
+        modules
+        ++ [
+          ({config, ...}: {
+            nixpkgs.buildPlatform = lib.mkForce build;
+            nixpkgs.hostPlatform = lib.mkForce host;
+
+            assertions = [
+              {
+                assertion = !lib.elem host (config.boot.binfmt.emulatedSystems or []);
+                message = "crossbow strict NixOS proof must not rely on boot.binfmt.emulatedSystems for ${host}";
+              }
+            ];
+          })
+        ];
+    };
+
+  withCrossSupport = {
+    inputs,
+    buildSystems,
+    crossTargets,
+    packages,
+    darwinSdk ? null,
+  }: let
+    forBuildSystem = build: let
+      pkgs = inputs.nixpkgs.legacyPackages.${build};
+      native = packages pkgs;
+      crossForPackage = name: package:
+        lib.listToAttrs (map (target: {
+            name = "${name}-${target.system}";
+            value = mkCross {
+              inherit pkgs build package darwinSdk;
+              host = target.system;
+              doCheck = false;
+            };
+          })
+          crossTargets);
+    in
+      native // lib.concatMapAttrs crossForPackage native;
+  in {
+    packages = lib.genAttrs buildSystems forBuildSystem;
+  };
+
+  self =
+    platformMap
+    // {
+      inherit
+        targets
+        unsupportedToolchainMessage
+        selectToolchain
+        mkCross
+        mkCrossCheck
+        mkNixosCrossSystem
+        withCrossSupport
+        ;
+
+      executors = import ../executors {lib = self;};
+      toolchains = import ../toolchains {lib = self;};
+    };
+in
+  self
