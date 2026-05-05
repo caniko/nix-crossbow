@@ -89,15 +89,27 @@
   applyBuildOptimization = {
     pkgs,
     profile ? buildOptimizationProfiles.cache-first,
+    hardwareOptimization ? null,
     package,
     language ? "generic",
   }: let
     resolved = buildOptimizationProfileFor profile;
+    hardwareProfile = hardwareProfileFor hardwareOptimization;
+    hardwareFlags =
+      if hardwareProfile == null
+      then []
+      else
+        lib.optionals (hardwareProfile.platform.gcc ? arch) ["-march=${hardwareProfile.platform.gcc.arch}"]
+        ++ lib.optionals (hardwareProfile.platform.gcc ? tune) ["-mtune=${hardwareProfile.platform.gcc.tune}"];
     metadata = {
       inherit language;
       profile = resolved.name or "custom";
       changesHashes = resolved.changesHashes or true;
     };
+    hardwareMetadata =
+      if hardwareProfile == null
+      then null
+      else hardwareProfile.name or "custom";
   in
     if !(resolved.changesHashes or true)
     then
@@ -110,6 +122,7 @@
               (package.passthru.crossbow or {})
               // {
                 buildOptimization = metadata;
+                hardwareOptimization = hardwareMetadata;
               };
           };
       }
@@ -129,6 +142,7 @@
                 ((old.passthru or {}).crossbow or {})
                 // {
                   buildOptimization = metadata;
+                  hardwareOptimization = hardwareMetadata;
                 };
             };
         };
@@ -146,7 +160,7 @@
             CARGO_PROFILE_RELEASE_CODEGEN_UNITS = old.CARGO_PROFILE_RELEASE_CODEGEN_UNITS or "1";
           }
           else {
-            NIX_CFLAGS_COMPILE = appendString (old.NIX_CFLAGS_COMPILE or "") (resolved.cFlags or []);
+            NIX_CFLAGS_COMPILE = appendString (old.NIX_CFLAGS_COMPILE or "") ((resolved.cFlags or []) ++ hardwareFlags);
             NIX_LDFLAGS = appendString (old.NIX_LDFLAGS or "") (resolved.linkFlags or []);
           }
         ));
@@ -336,9 +350,6 @@
   }: let
     cacheMode = cacheModeFor "strict-cross";
     buildProfile = buildOptimizationProfileFor buildOptimization;
-    hostPlatform = mkOptimizedHostPlatform {
-      inherit host hardwareOptimization;
-    };
     profileName = hardwareOptimizationName hardwareOptimization;
   in
     nixpkgs.lib.nixosSystem {
@@ -349,7 +360,7 @@
         ++ [
           ({config, ...}: {
             nixpkgs.buildPlatform = lib.mkForce build;
-            nixpkgs.hostPlatform = lib.mkForce hostPlatform;
+            nixpkgs.hostPlatform = lib.mkForce host;
 
             system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
@@ -388,9 +399,6 @@
   }: let
     cacheMode = cacheModeFor "native-substituted";
     buildProfile = buildOptimizationProfileFor buildOptimization;
-    hostPlatform = mkOptimizedHostPlatform {
-      inherit host hardwareOptimization;
-    };
     profileName = hardwareOptimizationName hardwareOptimization;
   in
     nixpkgs.lib.nixosSystem {
@@ -400,7 +408,7 @@
         modules
         ++ [
           {
-            nixpkgs.hostPlatform = lib.mkForce hostPlatform;
+            nixpkgs.hostPlatform = lib.mkForce host;
 
             system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
