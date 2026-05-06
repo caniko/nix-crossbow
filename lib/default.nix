@@ -490,6 +490,7 @@
           nuke-references = hostPkgs.callPackage
             (hostPkgs.path + "/pkgs/build-support/nuke-references") {
               replaceVarsWith = buildPkgs.replaceVarsWith;
+              inherit (hostPkgs.darwin) signingUtils;
             };
 
           # `makeModulesClosure` shrinks a kernel modules tree using `kmod`
