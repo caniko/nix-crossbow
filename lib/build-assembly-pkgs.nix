@@ -140,7 +140,8 @@
           # `nativeBuildInputs` element by `makeModulesClosure` and other
           # helpers that strip Nix store references from artifacts. Output
           # is a perl text script — arch-portable.
-          nuke-references = hostPkgs.callPackage
+          nuke-references =
+            hostPkgs.callPackage
             (hostPkgs.path + "/pkgs/build-support/nuke-references") {
               replaceVarsWith = buildPkgs.replaceVarsWith;
               inherit (hostPkgs.darwin) signingUtils;

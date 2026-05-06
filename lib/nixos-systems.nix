@@ -47,10 +47,7 @@
     ''}
   '';
 
-  binfmtAssertion = host: kind: {
-    config,
-    ...
-  }: {
+  binfmtAssertion = host: kind: {config, ...}: {
     assertions = [
       {
         assertion = !lib.elem host (config.boot.binfmt.emulatedSystems or []);
