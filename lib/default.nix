@@ -477,7 +477,38 @@
               // {inherit (buildPkgs.stdenvNoCC) mkDerivation;};
             buildPackages = buildPkgs.buildPackages;
           };
-        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv;};
+
+          buildPlatformStdenvNoCC =
+            hostPkgs.stdenvNoCC
+            // {inherit (buildPkgs.stdenvNoCC) mkDerivation;};
+
+          # `nuke-references` provides the `nuke-refs` perl script via
+          # `replaceVarsWith` (allowSubstitutes=false). It is consumed as a
+          # `nativeBuildInputs` element by `makeModulesClosure` and other
+          # helpers that strip Nix store references from artifacts. Output
+          # is a perl text script — arch-portable.
+          nuke-references = hostPkgs.callPackage
+            (hostPkgs.path + "/pkgs/build-support/nuke-references") {
+              replaceVarsWith = buildPkgs.replaceVarsWith;
+            };
+
+          # `makeModulesClosure` shrinks a kernel modules tree using `kmod`
+          # (modprobe) and `nuke-refs`. `kmod` reads ELF metadata
+          # arch-independently, so build-platform `kmod` can introspect
+          # aarch64 modules on x86_64 and produce the same modules.dep
+          # text. Output is host-arch .ko files (substituted, not built)
+          # plus arch-portable text (depmod info) — safe to flip the
+          # assembly drv to system = build.
+          makeModulesClosure = args:
+            hostPkgs.callPackage
+            (hostPkgs.path + "/pkgs/build-support/kernel/modules-closure.nix")
+            (args
+              // {
+                stdenvNoCC = buildPlatformStdenvNoCC;
+                kmod = buildPkgs.kmod;
+                nukeReferences = nuke-references;
+              });
+        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv nuke-references makeModulesClosure;};
       in
         hostPkgs
         // builtins.intersectAttrs buildAssemblyAttrNames buildPkgs
