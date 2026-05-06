@@ -10,6 +10,7 @@
       linkFlags = [];
       rustFlags = [];
       goFlags = [];
+      goLdflags = [];
       nativeBuildInputs = pkgs: [];
       description = "Preserve nixpkgs derivation hashes and maximize binary cache reuse.";
     };
@@ -24,7 +25,11 @@
         "-C"
         "link-arg=-fuse-ld=mold"
       ];
+      # Go's compiler does its own linking and ignores `-fuse-ld=mold`;
+      # `-trimpath` shaves stat/path-canonicalisation work off every package
+      # while keeping output identical modulo embedded paths.
       goFlags = ["-trimpath"];
+      goLdflags = ["-s" "-w"];
       nativeBuildInputs = pkgs: [
         pkgs.mold
       ];
@@ -40,12 +45,17 @@
       or (throw "crossbow: unsupported build optimization profile `${profile}`; expected one of ${lib.concatStringsSep ", " (builtins.attrNames buildOptimizationProfiles)}")
     else profile;
 
+  # Whitespace-tokenise an existing flag string and skip values already
+  # present, so re-applying optimization on a package that already sets the
+  # same flag (e.g. nixpkgs caddy already uses `-trimpath`) doesn't produce
+  # duplicates like "-trimpath -trimpath".
   appendString = oldValue: values: let
-    newValue = lib.concatStringsSep " " values;
+    existing = lib.filter (s: s != "") (lib.splitString " " oldValue);
+    novel = lib.filter (v: !(lib.elem v existing)) values;
   in
-    lib.concatStringsSep " " (lib.filter (value: value != "") [oldValue newValue]);
+    lib.concatStringsSep " " (existing ++ novel);
 
-  appendList = oldValue: values: oldValue ++ values;
+  appendList = oldValue: values: oldValue ++ (lib.filter (v: !(lib.elem v oldValue)) values);
 
   applyBuildOptimization = {
     pkgs,
@@ -90,6 +100,10 @@
     else
       package.overrideAttrs (old: let
         nativeInputs = resolved.nativeBuildInputs or (_: []);
+        # Go has its own toolchain linker — mold is irrelevant for pure-Go
+        # builds. CGo can benefit from mold, but plumbing it via
+        # `nativeBuildInputs` here would change derivation hashes for every
+        # Go package without measurable gain on the targets we care about.
         optimizedNativeBuildInputs =
           if language == "go"
           then []
@@ -111,14 +125,38 @@
         commonAttrs
         // (
           if language == "go"
-          then {
-            enableParallelBuilding = old.enableParallelBuilding or true;
-          }
+          then let
+            # Merge `GOFLAGS` into whichever form the underlying derivation
+            # already uses. Pure-`env` packages (structured-attrs) keep
+            # `env.GOFLAGS`; legacy mkDerivation packages (caddy as of writing)
+            # keep top-level `GOFLAGS`. Setting both raises a build-time
+            # "overlapping attributes" error.
+            usesEnv = (old ? env) && (old.env ? GOFLAGS);
+            mergedGoflags = appendString (
+              if usesEnv
+              then old.env.GOFLAGS
+              else old.GOFLAGS or ""
+            ) (resolved.goFlags or []);
+          in
+            {
+              enableParallelBuilding = old.enableParallelBuilding or true;
+              # `ldflags` is appended to the final link step (e.g. `-s -w` to
+              # strip symbol/debug info).
+              ldflags = appendList (old.ldflags or []) (resolved.goLdflags or []);
+            }
+            // (
+              if usesEnv
+              then {env = old.env // {GOFLAGS = mergedGoflags;};}
+              else {GOFLAGS = mergedGoflags;}
+            )
           else if language == "rust"
           then {
             RUSTFLAGS = appendString (old.RUSTFLAGS or "") (resolved.rustFlags or []);
             CARGO_PROFILE_RELEASE_LTO = old.CARGO_PROFILE_RELEASE_LTO or "thin";
             CARGO_PROFILE_RELEASE_CODEGEN_UNITS = old.CARGO_PROFILE_RELEASE_CODEGEN_UNITS or "1";
+            # `-march=…/-mtune=…` for native CGo/CXX deps; Rust itself reads
+            # `-Ctarget-cpu` via `RUSTFLAGS` (already included where set).
+            NIX_CFLAGS_COMPILE = appendString (old.NIX_CFLAGS_COMPILE or "") hardwareFlags;
           }
           else {
             NIX_CFLAGS_COMPILE = appendString (old.NIX_CFLAGS_COMPILE or "") ((resolved.cFlags or []) ++ hardwareFlags);
