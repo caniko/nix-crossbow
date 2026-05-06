@@ -377,16 +377,24 @@
     runCommandWith = null;
     writeText = null;
     writeTextFile = null;
+    writeTextDir = null;
+    writeScript = null;
+    writeScriptBin = null;
     writeShellScript = null;
     writeShellScriptBin = null;
     writeShellApplication = null;
+    writeNginxConfig = null;
+    writeCueValidator = null;
     symlinkJoin = null;
     linkFarm = null;
     linkFarmFromDrvs = null;
+    concatText = null;
     concatTextFile = null;
     applyPatches = null;
     substituteAll = null;
     substitute = null;
+    replaceVars = null;
+    replaceVarsWith = null;
     writeReferencesToFile = null;
   };
 
