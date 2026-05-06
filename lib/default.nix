@@ -368,47 +368,110 @@
   # extra work versus a normal native NixOS eval is a handful of attribute
   # rebinds in trivial-builders.
   #
-  # Two-pronged override:
+  # Replace only the trivial-builder helpers with build-platform versions.
+  # Crucially we leave `pkgs.stdenvNoCC` untouched: real packages (tzdata,
+  # gnu-config, applyPatches outputs, …) and the bootstrap chain that derives
+  # `pkgs.stdenv` from `stdenvNoCC` would otherwise see different hashes and
+  # fall out of the binary cache.
   #
-  # 1. Replace just the `mkDerivation` entry point on `stdenvNoCC` so any
-  #    direct caller (notably `pkgs.stdenvNoCC.mkDerivation` in
-  #    nixos/modules/system/activation/top-level.nix:58, which builds
-  #    `system.build.toplevel`) emits build-platform derivations. The rest of
-  #    `stdenvNoCC` (hostPlatform, cc, helpers) stays bound to the host pkgs
-  #    so deep nixpkgs internals like `stdenvNoCCAsCC` in
-  #    `pkgs/top-level/all-packages.nix` and `wrappers/default.nix` don't
-  #    cross-recurse.
-  #
-  # 2. Replace the trivial-builder helpers wholesale with the build-platform
-  #    versions. They're top-level pkgs attrs, so cross-platform substitution
-  #    is safe and propagates through everything that calls runCommand /
-  #    writeText / symlinkJoin / linkFarm / applyPatches.
-  mkBuildAssemblyOverlay = {buildPkgs}: _final: prev: {
-    stdenvNoCC =
-      prev.stdenvNoCC
-      // {
-        inherit (buildPkgs.stdenvNoCC) mkDerivation;
-      };
+  # NixOS's text/symlink scaffolding flows through these helpers (see
+  # nixpkgs/build-support/trivial-builders), so swapping them is sufficient
+  # for `system.build.etc`, unit files, activation scripts, registry JSON,
+  # Home Manager wrappers, etc. The one exception is `system.build.toplevel`
+  # itself, which calls `pkgs.stdenvNoCC.mkDerivation` directly — that is
+  # handled by `mkToplevelOverrideModule` below.
+  mkBuildAssemblyOverlay = {buildPkgs}: _final: _prev:
+    builtins.intersectAttrs {
+      runCommand = null;
+      runCommandLocal = null;
+      runCommandWith = null;
+      writeText = null;
+      writeTextFile = null;
+      writeShellScript = null;
+      writeShellScriptBin = null;
+      writeShellApplication = null;
+      symlinkJoin = null;
+      linkFarm = null;
+      linkFarmFromDrvs = null;
+      concatTextFile = null;
+      applyPatches = null;
+      substituteAll = null;
+      substitute = null;
+      writeReferencesToFile = null;
+    }
+    buildPkgs;
 
-    inherit
-      (buildPkgs)
-      runCommand
-      runCommandLocal
-      runCommandWith
-      writeText
-      writeTextFile
-      writeShellScript
-      writeShellScriptBin
-      writeShellApplication
-      symlinkJoin
-      linkFarm
-      linkFarmFromDrvs
-      concatTextFile
-      applyPatches
-      substituteAll
-      substitute
-      writeReferencesToFile
-      ;
+  # Mirror of nixos/modules/system/activation/top-level.nix's `baseSystem`
+  # construction, but built via `buildPkgs.stdenvNoCC.mkDerivation` so the
+  # resulting derivation has `system = build`. The script is intentionally
+  # identical to nixpkgs upstream — it is shell that writes symlinks and
+  # text files, identical content regardless of build platform — and the
+  # references inside it (kernel, systemd, etc) remain native host paths
+  # that substitute from cache.
+  mkToplevelOverrideModule = {buildPkgs}: {
+    config,
+    lib,
+    ...
+  }: let
+    inherit (lib) optionalString;
+    systemBuilder = ''
+      mkdir $out
+
+      ${
+        if config.boot.initrd.enable && config.boot.initrd.systemd.enable
+        then ''
+          cp "$systemd/lib/systemd/systemd" $out/init
+
+          ${optionalString (!config.system.nixos-init.enable) ''
+            cp ${config.system.build.bootStage2} $out/prepare-root
+            substituteInPlace $out/prepare-root --subst-var-by systemConfig $out
+          ''}
+        ''
+        else ''
+          cp ${config.system.build.bootStage2} $out/init
+          substituteInPlace $out/init --subst-var-by systemConfig $out
+        ''
+      }
+
+      ln -s ${config.system.build.etc}/etc $out/etc
+
+      ln -s ${config.system.path} $out/sw
+      ln -s "$systemd" $out/systemd
+
+      echo -n "systemd ${toString config.systemd.package.interfaceVersion}" > $out/init-interface-version
+      echo -n "$nixosLabel" > $out/nixos-version
+      echo -n "${config.boot.kernelPackages.stdenv.hostPlatform.system}" > $out/system
+
+      ${config.system.systemBuilderCommands}
+
+      cp "$extraDependenciesPath" "$out/extra-dependencies"
+
+      ${optionalString (!config.boot.isContainer && config.boot.bootspec.enable) ''
+        ${config.boot.bootspec.writer}
+        ${optionalString config.boot.bootspec.enableValidation ''${config.boot.bootspec.validator} "$out/${config.boot.bootspec.filename}"''}
+      ''}
+    '';
+
+    crossbowBaseSystem = buildPkgs.stdenvNoCC.mkDerivation (
+      {
+        name = "nixos-system-${config.system.name}-${config.system.nixos.label}";
+        preferLocalBuild = true;
+        allowSubstitutes = false;
+        passAsFile = ["extraDependencies"];
+        buildCommand = systemBuilder;
+
+        systemd = config.systemd.package;
+
+        nixosLabel = config.system.nixos.label;
+
+        inherit (config.system) extraDependencies;
+      }
+      // config.system.systemBuilderArgs
+    );
+  in {
+    system.build.toplevel = lib.mkForce (
+      lib.asserts.checkAssertWarn config.assertions config.warnings crossbowBaseSystem
+    );
   };
 
   mkNixosSwitchSystem = {
@@ -427,6 +490,7 @@
     buildProfile = buildOptimizationProfileFor buildOptimization;
     profileName = hardwareOptimizationName hardwareOptimization;
     assemblyOverlay = mkBuildAssemblyOverlay {inherit buildPkgs;};
+    toplevelOverride = mkToplevelOverrideModule {inherit buildPkgs;};
   in
     nixpkgs.lib.nixosSystem {
       # Evaluate as a single-platform native host system: pkgs has cache-shape
@@ -437,6 +501,7 @@
       modules =
         modules
         ++ [
+          toplevelOverride
           ({config, ...}: {
             nixpkgs.hostPlatform = lib.mkForce host;
             nixpkgs.overlays = [assemblyOverlay];
@@ -639,6 +704,7 @@
         unsupportedToolchainMessage
         selectToolchain
         mkBuildAssemblyOverlay
+        mkToplevelOverrideModule
         mkCross
         mkCrossCheck
         mkNixosCrossSystem
