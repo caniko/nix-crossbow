@@ -396,6 +396,14 @@
     replaceVars = null;
     replaceVarsWith = null;
     writeReferencesToFile = null;
+    # `pkgs.formats.{json,ini,keyValue,toml,yaml,...}` is widely used by
+    # NixOS modules (e.g. services.openssh's `sshd.conf-settings` via
+    # `formats.keyValue`). Each `.generate` is a closure over the
+    # *original* hostPkgs `writeText` captured at pkgs construction
+    # time, so shadowing only `writeText` does not reach into it.
+    # Replacing the entire `formats` namespace with `buildPkgs.formats`
+    # makes generated config files emit `system = build`.
+    formats = null;
   };
 
   # The crucial design choice: we shadow these attrs on `_module.args.pkgs`
