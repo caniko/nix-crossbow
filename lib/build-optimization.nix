@@ -11,6 +11,7 @@
       rustFlags = [];
       goFlags = [];
       goLdflags = [];
+      goEnv = {};
       nativeBuildInputs = pkgs: [];
       description = "Preserve nixpkgs derivation hashes and maximize binary cache reuse.";
     };
@@ -30,6 +31,12 @@
       # while keeping output identical modulo embedded paths.
       goFlags = ["-trimpath"];
       goLdflags = ["-s" "-w"];
+      # `CGO_ENABLED=0` skips C toolchain setup and the cgo link step. For
+      # pure-Go packages (the common case — caddy, most plugins) this is a
+      # straight 10–30% wallclock win and produces a static binary, so
+      # `nuke-references` has less to do downstream too. CGo-using packages
+      # opt out by setting `goEnv = {}` on a custom profile.
+      goEnv = {CGO_ENABLED = "0";};
       nativeBuildInputs = pkgs: [
         pkgs.mold
       ];
@@ -126,6 +133,7 @@
         // (
           if language == "go"
           then let
+            goEnv = resolved.goEnv or {};
             # Merge `GOFLAGS` into whichever form the underlying derivation
             # already uses. Pure-`env` packages (structured-attrs) keep
             # `env.GOFLAGS`; legacy mkDerivation packages (caddy as of writing)
@@ -137,6 +145,11 @@
               then old.env.GOFLAGS
               else old.GOFLAGS or ""
             ) (resolved.goFlags or []);
+            # `goEnv` entries (e.g. CGO_ENABLED=0) override any existing
+            # value on the package — the optimization profile is the
+            # authoritative source for these knobs. Land them in `env` if
+            # the package uses structured-attrs, otherwise as top-level
+            # drv attrs.
           in
             {
               enableParallelBuilding = old.enableParallelBuilding or true;
@@ -146,8 +159,8 @@
             }
             // (
               if usesEnv
-              then {env = old.env // {GOFLAGS = mergedGoflags;};}
-              else {GOFLAGS = mergedGoflags;}
+              then {env = old.env // {GOFLAGS = mergedGoflags;} // goEnv;}
+              else {GOFLAGS = mergedGoflags;} // goEnv
             )
           else if language == "rust"
           then {
