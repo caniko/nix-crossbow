@@ -368,38 +368,87 @@
   # extra work versus a normal native NixOS eval is a handful of attribute
   # rebinds in trivial-builders.
   #
-  # Replace only the trivial-builder helpers with build-platform versions.
-  # Crucially we leave `pkgs.stdenvNoCC` untouched: real packages (tzdata,
-  # gnu-config, applyPatches outputs, …) and the bootstrap chain that derives
-  # `pkgs.stdenv` from `stdenvNoCC` would otherwise see different hashes and
-  # fall out of the binary cache.
+  # Set of trivial-builder attributes that NixOS modules use to assemble
+  # text/symlink scaffolding (etc, units, activation scripts, registry JSON,
+  # Home Manager wrappers, system.build.toplevel, …). Listed once and reused.
+  buildAssemblyAttrNames = {
+    runCommand = null;
+    runCommandLocal = null;
+    runCommandWith = null;
+    writeText = null;
+    writeTextFile = null;
+    writeShellScript = null;
+    writeShellScriptBin = null;
+    writeShellApplication = null;
+    symlinkJoin = null;
+    linkFarm = null;
+    linkFarmFromDrvs = null;
+    concatTextFile = null;
+    applyPatches = null;
+    substituteAll = null;
+    substitute = null;
+    writeReferencesToFile = null;
+  };
+
+  # The crucial design choice: we shadow these attrs on `_module.args.pkgs`
+  # via a plain `//` rather than via `nixpkgs.overlays`.
   #
-  # NixOS's text/symlink scaffolding flows through these helpers (see
-  # nixpkgs/build-support/trivial-builders), so swapping them is sufficient
-  # for `system.build.etc`, unit files, activation scripts, registry JSON,
-  # Home Manager wrappers, etc. The one exception is `system.build.toplevel`
-  # itself, which calls `pkgs.stdenvNoCC.mkDerivation` directly — that is
-  # handled by `mkToplevelOverrideModule` below.
-  mkBuildAssemblyOverlay = {buildPkgs}: _final: _prev:
-    builtins.intersectAttrs {
-      runCommand = null;
-      runCommandLocal = null;
-      runCommandWith = null;
-      writeText = null;
-      writeTextFile = null;
-      writeShellScript = null;
-      writeShellScriptBin = null;
-      writeShellApplication = null;
-      symlinkJoin = null;
-      linkFarm = null;
-      linkFarmFromDrvs = null;
-      concatTextFile = null;
-      applyPatches = null;
-      substituteAll = null;
-      substitute = null;
-      writeReferencesToFile = null;
-    }
-    buildPkgs;
+  # An overlay applies at the nixpkgs fix-point and is observed by every
+  # `callPackage` in pkgs, including the stdenv bootstrap chain — so even
+  # overriding just `runCommand` propagates into `stdenv-linux`, glibc, gcc,
+  # tzdata, and every aarch64 cache-shape derivation, blowing the binary
+  # cache. (Empirically verified: empty overlay leaves stdenv-linux hash
+  # untouched; `{ runCommand = buildPkgs.runCommand; }` overlay changes it.)
+  #
+  # A `_module.args.pkgs` override is *post-fixpoint*: callers in NixOS
+  # modules see the swapped helpers, but every package in the runtime
+  # closure (kernel, systemd, python, tzdata) was constructed before the
+  # shadow and keeps its native cache-shape hash. Substitution from
+  # cache.nixos.org and Attic continues to work; only flake-specific
+  # scaffolding produced via the swapped helpers gets `system = build`.
+  mkBuildAssemblyPkgsModule = {
+    nixpkgs,
+    host,
+    buildPkgs,
+  }: {
+    config,
+    lib,
+    ...
+  }: {
+    # Construct host pkgs ourselves from `nixpkgs` (NixOS would otherwise do
+    # the same import internally for `_module.args.pkgs`'s default; with our
+    # `mkForce` override that default is never forced). Net cost: still one
+    # nixpkgs import per eval.
+    _module.args.pkgs = lib.mkForce (
+      let
+        hostPkgs = import nixpkgs {
+          localSystem = {system = host;};
+          inherit (config.nixpkgs) config overlays;
+        };
+      in
+        hostPkgs
+        // builtins.intersectAttrs buildAssemblyAttrNames buildPkgs
+        // {
+          # `nixos/modules/system/activation/top-level.nix:58` builds
+          # `system.build.toplevel` directly via `pkgs.stdenvNoCC.mkDerivation`,
+          # bypassing the trivial-builder helpers. Shadow only the
+          # `mkDerivation` entry point on `stdenvNoCC` so the toplevel and
+          # any other direct-`mkDerivation` callsite emit `system = build`.
+          # The rest of `stdenvNoCC` (hostPlatform, cc, helpers) stays bound
+          # to the host pkgs — and because this shadow lives on
+          # `_module.args.pkgs` (post-fixpoint), it does not cross-recurse
+          # through nixpkgs internals like the overlay form did.
+          stdenvNoCC =
+            hostPkgs.stdenvNoCC
+            // {inherit (buildPkgs.stdenvNoCC) mkDerivation;};
+        }
+    );
+  };
+
+  # Backwards-compatible no-op overlay alias. The fix-point overlay shape
+  # cannot achieve the build/host split without breaking cache; callers that
+  # need the seam should consume `mkBuildAssemblyPkgsModule` instead.
+  mkBuildAssemblyOverlay = _: _final: _prev: {};
 
   # Mirror of nixos/modules/system/activation/top-level.nix's `baseSystem`
   # construction, but built via `buildPkgs.stdenvNoCC.mkDerivation` so the
@@ -489,8 +538,7 @@
     cacheMode = cacheModeFor "cache-shaped-with-cross-overrides";
     buildProfile = buildOptimizationProfileFor buildOptimization;
     profileName = hardwareOptimizationName hardwareOptimization;
-    assemblyOverlay = mkBuildAssemblyOverlay {inherit buildPkgs;};
-    toplevelOverride = mkToplevelOverrideModule {inherit buildPkgs;};
+    assemblyPkgsModule = mkBuildAssemblyPkgsModule {inherit nixpkgs host buildPkgs;};
   in
     nixpkgs.lib.nixosSystem {
       # Evaluate as a single-platform native host system: pkgs has cache-shape
@@ -501,10 +549,9 @@
       modules =
         modules
         ++ [
-          toplevelOverride
+          assemblyPkgsModule
           ({config, ...}: {
             nixpkgs.hostPlatform = lib.mkForce host;
-            nixpkgs.overlays = [assemblyOverlay];
 
             system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
@@ -704,6 +751,7 @@
         unsupportedToolchainMessage
         selectToolchain
         mkBuildAssemblyOverlay
+        mkBuildAssemblyPkgsModule
         mkToplevelOverrideModule
         mkCross
         mkCrossCheck
