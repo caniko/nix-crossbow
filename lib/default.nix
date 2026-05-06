@@ -636,7 +636,23 @@
         modules
         ++ [
           assemblyPkgsModule
-          ({config, ...}: {
+          ({
+            config,
+            lib,
+            ...
+          }: {
+            # Provide a `crossbowCrossPkgs` module arg for callers that want to
+            # build specific packages (Go, Rust, …) cross-compiled on the build
+            # platform instead of natively on host. Caches differ from
+            # cache.nixos.org for cross builds, but that's already accepted by
+            # callers who opt in (e.g. via canix `applyBuildOptimization` paths
+            # that inspect `crossbowCrossPkgs != null`).
+            _module.args.crossbowCrossPkgs = lib.mkOverride 999 (import nixpkgs {
+              localSystem = {system = build;};
+              crossSystem = {system = host;};
+              inherit (config.nixpkgs) config overlays;
+            });
+
             nixpkgs.hostPlatform = lib.mkForce host;
 
             system.systemBuilderCommands = ''
