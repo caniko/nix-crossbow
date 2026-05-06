@@ -441,9 +441,47 @@
           localSystem = {system = host;};
           inherit (config.nixpkgs) config overlays;
         };
+
+        # A handful of packages are `callPackage`'d at hostPkgs construction
+        # time and capture host-platform `replaceVarsWith`/`replaceVars`. They
+        # set `allowSubstitutes = false` (forced inside `replaceVarsWith`),
+        # which means cache substitution cannot recover their host-arch drvs
+        # — they must be built on the build platform or fail. Output is a
+        # text file with no architecture-specific runtime, so re-constructing
+        # them via `.override` with build-platform helpers is safe.
+        installerToolsShadow = let
+          nixos-enter = hostPkgs.nixos-enter.override {
+            replaceVarsWith = buildPkgs.replaceVarsWith;
+          };
+          nixos-install = hostPkgs.nixos-install.override {
+            replaceVarsWith = buildPkgs.replaceVarsWith;
+            inherit nixos-enter;
+          };
+          nixos-build-vms = hostPkgs.nixos-build-vms.override {
+            replaceVarsWith = buildPkgs.replaceVarsWith;
+          };
+          # `buildEnv` builds via `stdenvNoCC.mkDerivation` and internally
+          # uses `replaceVars ./builder.pl` plus `buildPackages.perl` to
+          # assemble symlinks. All three need build-platform versions, or
+          # the env-assembly drv is host-arch (aarch64) and its perl cannot
+          # execute on the build host.
+          #
+          # `pkgs.buildEnv` uses `lib.makeOverridable` whose `.override` only
+          # accepts the *inner* args (name, paths, ...), not callPackage's
+          # outer args. Re-callPackage the buildenv source path to inject
+          # the build-platform helpers we need.
+          buildEnv = hostPkgs.callPackage (hostPkgs.path + "/pkgs/build-support/buildenv") {
+            replaceVars = buildPkgs.replaceVars;
+            stdenvNoCC =
+              hostPkgs.stdenvNoCC
+              // {inherit (buildPkgs.stdenvNoCC) mkDerivation;};
+            buildPackages = buildPkgs.buildPackages;
+          };
+        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv;};
       in
         hostPkgs
         // builtins.intersectAttrs buildAssemblyAttrNames buildPkgs
+        // installerToolsShadow
         // {
           # `nixos/modules/system/activation/top-level.nix:58` builds
           # `system.build.toplevel` directly via `pkgs.stdenvNoCC.mkDerivation`,
