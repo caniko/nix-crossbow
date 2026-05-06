@@ -147,6 +147,28 @@
               inherit (hostPkgs.darwin) signingUtils;
             };
 
+          # `makeInitrdNG` assembles the systemd initrd from a contents
+          # manifest. It captures host `stdenvNoCC`, `cpio`, `pkgsBuildHost`,
+          # and `makeInitrdNGTool` at callPackage time, so even with our
+          # `_module.args.pkgs.buildPackages` shadow set the resulting drv is
+          # host-arch and its `make-initrd-ng` tool/`cpio` cannot exec on the
+          # build host. Re-callPackage with build-platform helpers; the cpio
+          # archive output is arch-independent.
+          # `pkgs.makeInitrdNG` in all-packages.nix is `callPackage path` with
+          # no second arg — args are supplied on each call site. To preserve
+          # that calling convention while injecting build-platform helpers,
+          # take the user's args at the call site and feed them through
+          # callPackage merged with our overrides.
+          makeInitrdNG = userArgs:
+            hostPkgs.callPackage
+            (hostPkgs.path + "/pkgs/build-support/kernel/make-initrd-ng.nix")
+            ({
+                stdenvNoCC = buildPlatformStdenvNoCC;
+                inherit (buildPkgs) cpio ubootTools makeInitrdNGTool binutils;
+                pkgsBuildHost = buildPkgs;
+              }
+              // userArgs);
+
           # `makeModulesClosure` shrinks a kernel modules tree using `kmod`
           # (modprobe) and `nuke-refs`. `kmod` reads ELF metadata
           # arch-independently, so build-platform `kmod` can introspect
@@ -163,7 +185,7 @@
                 kmod = buildPkgs.kmod;
                 nukeReferences = nuke-references;
               });
-        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv nuke-references makeModulesClosure;};
+        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv nuke-references makeInitrdNG makeModulesClosure;};
       in
         hostPkgs
         // builtins.intersectAttrs buildAssemblyAttrNames buildPkgs
@@ -179,6 +201,21 @@
           # `_module.args.pkgs` (post-fixpoint), it does not cross-recurse
           # through nixpkgs internals like the overlay form did.
           stdenvNoCC = buildPlatformStdenvNoCC;
+
+          # Point `pkgs.buildPackages` at the build-platform pkgs. Modules
+          # use `pkgs.buildPackages.<binary>` to mark a tool as a build-time
+          # dependency rather than a runtime one (e.g. home-manager's
+          # `hm-modules-messages` runs `msgfmt` from `pkgs.buildPackages.gettext`
+          # to compile `.po` → `.mo`). Without this shadow, on a single-platform
+          # host pkgs, `pkgs.buildPackages` is a self-reference to host pkgs and
+          # `.gettext` resolves to the host-arch binary, which fails to exec on
+          # the build host with `Exec format error`.
+          #
+          # In a true `nixpkgs.crossSystem` setup `pkgs.buildPackages` is the
+          # build-platform pkgs; this shadow gives the same semantics in our
+          # cache-shape pattern where we import host pkgs single-platform and
+          # carry build pkgs alongside.
+          buildPackages = buildPkgs;
         }
     );
   };
