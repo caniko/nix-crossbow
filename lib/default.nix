@@ -344,6 +344,73 @@
       ''
     else throw "crossbow: executor `${executor.kind}` is not implemented in phase 1";
 
+  # Overlay that splits the closure along the stdenv/stdenvNoCC seam:
+  #
+  #   stdenv      (with CC) → host platform → kernel, glibc, systemd, python …
+  #                                           keep the native cache shape so
+  #                                           cache.nixos.org / Attic substitute.
+  #
+  #   stdenvNoCC  (text/symlink scaffolding) → build platform → runCommand,
+  #                                           writeText, writeShellScript,
+  #                                           symlinkJoin, linkFarm … all of
+  #                                           NixOS's generated config and
+  #                                           system.build.toplevel are produced
+  #                                           by these helpers (see nixpkgs
+  #                                           build-support/trivial-builders).
+  #
+  # Result: the runtime closure is host-native cache-shaped, and every flake-
+  # specific assembly derivation has system = build, so the build machine can
+  # realise it with no remote builder, no QEMU, no binfmt.
+  # Caller passes an already-realised build-platform pkgs (e.g.
+  # `nixpkgs.legacyPackages.${build}` from flake-parts' withSystem). We never
+  # call `import nixpkgs { system = build; }` ourselves — that would double the
+  # evaluation cost of every switch. Crossbow is a cheap optimisation path:
+  # extra work versus a normal native NixOS eval is a handful of attribute
+  # rebinds in trivial-builders.
+  #
+  # Two-pronged override:
+  #
+  # 1. Replace just the `mkDerivation` entry point on `stdenvNoCC` so any
+  #    direct caller (notably `pkgs.stdenvNoCC.mkDerivation` in
+  #    nixos/modules/system/activation/top-level.nix:58, which builds
+  #    `system.build.toplevel`) emits build-platform derivations. The rest of
+  #    `stdenvNoCC` (hostPlatform, cc, helpers) stays bound to the host pkgs
+  #    so deep nixpkgs internals like `stdenvNoCCAsCC` in
+  #    `pkgs/top-level/all-packages.nix` and `wrappers/default.nix` don't
+  #    cross-recurse.
+  #
+  # 2. Replace the trivial-builder helpers wholesale with the build-platform
+  #    versions. They're top-level pkgs attrs, so cross-platform substitution
+  #    is safe and propagates through everything that calls runCommand /
+  #    writeText / symlinkJoin / linkFarm / applyPatches.
+  mkBuildAssemblyOverlay = {buildPkgs}: _final: prev: {
+    stdenvNoCC =
+      prev.stdenvNoCC
+      // {
+        inherit (buildPkgs.stdenvNoCC) mkDerivation;
+      };
+
+    inherit
+      (buildPkgs)
+      runCommand
+      runCommandLocal
+      runCommandWith
+      writeText
+      writeTextFile
+      writeShellScript
+      writeShellScriptBin
+      writeShellApplication
+      symlinkJoin
+      linkFarm
+      linkFarmFromDrvs
+      concatTextFile
+      applyPatches
+      substituteAll
+      substitute
+      writeReferencesToFile
+      ;
+  };
+
   mkNixosSwitchSystem = {
     nixpkgs ? inputs.nixpkgs,
     build,
@@ -352,20 +419,27 @@
     specialArgs ? {},
     hardwareOptimization ? null,
     buildOptimization ? buildOptimizationProfiles.cache-first,
+    # Pre-realised build-platform pkgs. Defaults to nixpkgs.legacyPackages, the
+    # cached lazyAttrs flake-parts already builds — no second `import nixpkgs`.
+    buildPkgs ? nixpkgs.legacyPackages.${build},
   }: let
     cacheMode = cacheModeFor "cache-shaped-with-cross-overrides";
     buildProfile = buildOptimizationProfileFor buildOptimization;
     profileName = hardwareOptimizationName hardwareOptimization;
+    assemblyOverlay = mkBuildAssemblyOverlay {inherit buildPkgs;};
   in
     nixpkgs.lib.nixosSystem {
-      system = build;
+      # Evaluate as a single-platform native host system: pkgs has cache-shape
+      # names for every compiled package. The build/host split is achieved by
+      # the stdenvNoCC overlay below, not by nixpkgs.buildPlatform.
+      system = host;
       inherit specialArgs;
       modules =
         modules
         ++ [
           ({config, ...}: {
-            nixpkgs.buildPlatform = lib.mkForce build;
             nixpkgs.hostPlatform = lib.mkForce host;
+            nixpkgs.overlays = [assemblyOverlay];
 
             system.systemBuilderCommands = ''
               mkdir -p $out/nix-support
@@ -564,6 +638,7 @@
         hardwareOptimizationName
         unsupportedToolchainMessage
         selectToolchain
+        mkBuildAssemblyOverlay
         mkCross
         mkCrossCheck
         mkNixosCrossSystem
