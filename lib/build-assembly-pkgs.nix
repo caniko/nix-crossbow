@@ -135,6 +135,19 @@
             buildPackages = buildPkgs.buildPackages;
           };
 
+          # `pkgs.makeDBusConf` runs `xsltproc` at build time to generate
+          # `system.conf`/`session.conf` (XML text) and is consumed by the
+          # NixOS dbus module. The drv is `runCommand` with
+          # `allowSubstitutes = false`, captured at hostPkgs callPackage
+          # time — host-arch by default. Re-construct with build-platform
+          # `runCommand` and `libxslt`/`findXMLCatalogs` so the assembly
+          # builds on the build host. Output is arch-portable XML.
+          makeDBusConf = hostPkgs.makeDBusConf.override {
+            runCommand = buildPkgs.runCommand;
+            libxslt = buildPkgs.libxslt;
+            findXMLCatalogs = buildPkgs.findXMLCatalogs;
+          };
+
           # `nuke-references` provides the `nuke-refs` perl script via
           # `replaceVarsWith` (allowSubstitutes=false). It is consumed as a
           # `nativeBuildInputs` element by `makeModulesClosure` and other
@@ -185,7 +198,7 @@
                 kmod = buildPkgs.kmod;
                 nukeReferences = nuke-references;
               });
-        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv nuke-references makeInitrdNG makeModulesClosure;};
+        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv makeDBusConf nuke-references makeInitrdNG makeModulesClosure;};
       in
         hostPkgs
         // builtins.intersectAttrs buildAssemblyAttrNames buildPkgs

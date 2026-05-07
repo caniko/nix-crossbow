@@ -163,14 +163,40 @@
               else {GOFLAGS = mergedGoflags;} // goEnv
             )
           else if language == "rust"
-          then {
-            RUSTFLAGS = appendString (old.RUSTFLAGS or "") (resolved.rustFlags or []);
-            CARGO_PROFILE_RELEASE_LTO = old.CARGO_PROFILE_RELEASE_LTO or "thin";
-            CARGO_PROFILE_RELEASE_CODEGEN_UNITS = old.CARGO_PROFILE_RELEASE_CODEGEN_UNITS or "1";
-            # `-march=…/-mtune=…` for native CGo/CXX deps; Rust itself reads
-            # `-Ctarget-cpu` via `RUSTFLAGS` (already included where set).
-            NIX_CFLAGS_COMPILE = appendString (old.NIX_CFLAGS_COMPILE or "") hardwareFlags;
-          }
+          then let
+            # Rust packages may set `RUSTFLAGS`, `CARGO_PROFILE_*` and
+            # `NIX_CFLAGS_COMPILE` in `env` (structured-attrs, e.g.
+            # nixpkgs vector) or as top-level mkDerivation args
+            # (legacy). Setting both raises a build-time "overlapping
+            # attributes" error, so detect and merge into the form the
+            # package already uses.
+            usesEnv = (old ? env) && lib.any (k: old.env ? ${k}) ["RUSTFLAGS" "CARGO_PROFILE_RELEASE_LTO" "CARGO_PROFILE_RELEASE_CODEGEN_UNITS" "NIX_CFLAGS_COMPILE"];
+            getOld = k:
+              if usesEnv && old.env ? ${k}
+              then old.env.${k}
+              else old.${k} or "";
+            mergedRustflags = appendString (getOld "RUSTFLAGS") (resolved.rustFlags or []);
+            mergedCflags = appendString (getOld "NIX_CFLAGS_COMPILE") hardwareFlags;
+            cargoLto = getOld "CARGO_PROFILE_RELEASE_LTO";
+            cargoCgUnits = getOld "CARGO_PROFILE_RELEASE_CODEGEN_UNITS";
+            rustEnv = {
+              RUSTFLAGS = mergedRustflags;
+              CARGO_PROFILE_RELEASE_LTO =
+                if cargoLto != ""
+                then cargoLto
+                else "thin";
+              CARGO_PROFILE_RELEASE_CODEGEN_UNITS =
+                if cargoCgUnits != ""
+                then cargoCgUnits
+                else "1";
+              # `-march=…/-mtune=…` for native CGo/CXX deps; Rust itself
+              # reads `-Ctarget-cpu` via `RUSTFLAGS` (already included where set).
+              NIX_CFLAGS_COMPILE = mergedCflags;
+            };
+          in
+            if usesEnv
+            then {env = old.env // rustEnv;}
+            else rustEnv
           else {
             NIX_CFLAGS_COMPILE = appendString (old.NIX_CFLAGS_COMPILE or "") ((resolved.cFlags or []) ++ hardwareFlags);
             NIX_LDFLAGS = appendString (old.NIX_LDFLAGS or "") (resolved.linkFlags or []);
