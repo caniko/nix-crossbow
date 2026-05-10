@@ -199,9 +199,44 @@
                 nukeReferences = nuke-references;
               });
         in {inherit nixos-enter nixos-install nixos-build-vms buildEnv makeDBusConf nuke-references makeInitrdNG makeModulesClosure;};
+
+        # Re-import trivial-builders with `runtimeShell` pinned to host
+        # bash, while keeping `stdenvNoCC` on the build platform. Result:
+        # `writeShellScript`/`writeScript`/`writeShellApplication` etc.
+        # produce drvs whose `system = build` (atlas builds them, no QEMU)
+        # but whose embedded `#!${runtimeShell}` shebang references
+        # aarch64 bash. Without this, every NixOS module call that emits
+        # a shell script (unit-script-*, home-manager-generation,
+        # nftables helpers, network-setup, ...) bakes in a build-arch
+        # shebang and fails ENOEXEC at run time on the host.
+        # The wrapProgram/makeWrapper class is handled separately by the
+        # narrowed `buildPackages` shadow below.
+        hostShellTrivialBuilders =
+          import (buildPkgs.path + "/pkgs/build-support/trivial-builders") {
+            inherit lib;
+            inherit (buildPkgs) config;
+            stdenv = buildPkgs.stdenv;
+            stdenvNoCC = buildPlatformStdenvNoCC;
+            runtimeShell = "${hostPkgs.bash}${hostPkgs.bash.shellPath}";
+            inherit (buildPkgs.pkgsBuildHost) jq shellcheck-minimal lndir;
+          };
       in
         hostPkgs
         // builtins.intersectAttrs buildAssemblyAttrNames buildPkgs
+        // {
+          # Override only the shebang-baking subset of trivial-builders.
+          # Non-shebang helpers brought in by the intersection above
+          # (runCommand, symlinkJoin, linkFarm, writeText*, formats,
+          # replaceVars*, concatText*, applyPatches) keep their
+          # build-platform construction.
+          inherit (hostShellTrivialBuilders)
+            writeScript
+            writeScriptBin
+            writeShellScript
+            writeShellScriptBin
+            writeShellApplication
+            ;
+        }
         // installerToolsShadow
         // {
           # `nixos/modules/system/activation/top-level.nix:58` builds
@@ -215,20 +250,15 @@
           # through nixpkgs internals like the overlay form did.
           stdenvNoCC = buildPlatformStdenvNoCC;
 
-          # Point `pkgs.buildPackages` at the build-platform pkgs. Modules
-          # use `pkgs.buildPackages.<binary>` to mark a tool as a build-time
-          # dependency rather than a runtime one (e.g. home-manager's
-          # `hm-modules-messages` runs `msgfmt` from `pkgs.buildPackages.gettext`
-          # to compile `.po` → `.mo`). Without this shadow, on a single-platform
-          # host pkgs, `pkgs.buildPackages` is a self-reference to host pkgs and
-          # `.gettext` resolves to the host-arch binary, which fails to exec on
-          # the build host with `Exec format error`.
-          #
-          # In a true `nixpkgs.crossSystem` setup `pkgs.buildPackages` is the
-          # build-platform pkgs; this shadow gives the same semantics in our
-          # cache-shape pattern where we import host pkgs single-platform and
-          # carry build pkgs alongside.
-          buildPackages = buildPkgs;
+          # Narrow shadow: only the specific binaries that NixOS modules invoke
+          # at module-build time and that need to execute on the build platform.
+          # We do NOT shadow buildPackages wholesale — that severs nixpkgs's
+          # stdenv-splicing contract for makeWrapper/runtimeShell/cc and produces
+          # build-arch shebangs in host-arch wrappers. See Phase-2 for the
+          # permanent fix; this is the unblock.
+          buildPackages = hostPkgs.buildPackages // {
+            inherit (buildPkgs) gettext;
+          };
         }
     );
   };
