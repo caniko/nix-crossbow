@@ -198,7 +198,44 @@
                 kmod = buildPkgs.kmod;
                 nukeReferences = nuke-references;
               });
-        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv makeDBusConf nuke-references makeInitrdNG makeModulesClosure;};
+
+          # `pkgs.deviceTree` exposes two helpers consumed by the NixOS
+          # `hardware.deviceTree` module (`nixos/modules/hardware/device-tree.nix`):
+          #
+          #   compileDTS    → `stdenv.mkDerivation` that runs `$CC -E` on a
+          #                   `.dts` text file and pipes through `dtc` to
+          #                   emit a `.dtbo` blob.
+          #   applyOverlays → `stdenvNoCC.mkDerivation` that runs
+          #                   `apply_overlays.py` over base `.dtb`s to
+          #                   produce the assembled `dtbs/` tree consumed
+          #                   by systemd-boot / extlinux / kernel.nix.
+          #
+          # Both are callPackage'd at hostPkgs construction time and
+          # capture host `stdenv`/`stdenvNoCC` — the `_module.args.pkgs`
+          # shadow further down cannot reach them. Result: every host
+          # with `hardware.deviceTree.overlays != []` (rockpro64, rpi,
+          # allwinner, ...) leaks host-arch assembly drvs into the
+          # toplevel closure. Substitutes mask this when the cache is
+          # online; offline builds (no remote builder, no binfmt, no
+          # reachable cache) hit `Required system: aarch64-linux` with
+          # no fallback.
+          #
+          # Both helpers' outputs are arch-portable: `.dtbo` and the
+          # assembled `dtbs/` tree are bytes interpreted by the target
+          # kernel, with no executable content. Preprocessing `.dts`
+          # with the build-platform `$CC -E` is arch-agnostic (header
+          # include paths are textual prefixes, not compiled artifacts),
+          # and `dtc`/`apply_overlays.py` operate on data. Safe to
+          # re-construct against the build platform.
+          deviceTree =
+            hostPkgs.callPackage
+            (hostPkgs.path + "/pkgs/os-specific/linux/device-tree") {
+              stdenv = buildPkgs.stdenv;
+              stdenvNoCC = buildPlatformStdenvNoCC;
+              dtc = buildPkgs.dtc;
+              inherit (buildPkgs) writers python3;
+            };
+        in {inherit nixos-enter nixos-install nixos-build-vms buildEnv makeDBusConf nuke-references makeInitrdNG makeModulesClosure deviceTree;};
 
         # Re-import trivial-builders with `runtimeShell` pinned to host
         # bash, while keeping `stdenvNoCC` on the build platform. Result:
