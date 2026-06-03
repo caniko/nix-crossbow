@@ -6,89 +6,145 @@ use crate::{Error, Result};
 
 const METADATA_JSON: &str = include_str!("../../../data/crossbow-metadata.json");
 
+/// Complete Crossbow metadata loaded from `data/crossbow-metadata.json`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Metadata {
+    /// Canonical host target descriptors keyed by Crossbow target name.
     pub targets: BTreeMap<String, TargetDescriptor>,
+    /// Nix-system to compiler-target mappings.
     pub platform_mappings: PlatformMappings,
+    /// Named cache strategy descriptors.
     pub cache_modes: BTreeMap<String, CacheMode>,
+    /// Named hardware optimization profiles.
     pub hardware_profiles: BTreeMap<String, HardwareProfile>,
+    /// Named build optimization profiles.
     pub build_optimization_profiles: BTreeMap<String, BuildOptimizationProfile>,
 }
 
+/// Nix target descriptor used by Crossbow public metadata APIs.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct TargetDescriptor {
+    /// Nix system string for the target.
     pub system: String,
+    /// GNU-style target config string.
     pub config: String,
 }
 
+/// Compiler target mappings keyed by Nix system string.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct PlatformMappings {
+    /// Zig target triples keyed by Nix system string.
     pub zig_targets: BTreeMap<String, String>,
+    /// GNU config triples keyed by Nix system string.
     pub gnu_configs: BTreeMap<String, String>,
 }
 
+/// Public descriptor for a Crossbow cache mode.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct CacheMode {
+    /// Stable cache mode name.
     pub name: String,
+    /// What the mode proves operationally.
     pub proves: String,
+    /// Expected binary-cache reuse behavior.
     pub cache_expectation: String,
 }
 
+/// Hardware-specific compiler tuning profile.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct HardwareProfile {
+    /// Stable profile name.
     pub name: String,
+    /// Nix system the profile applies to, when constrained.
     pub system: Option<String>,
+    /// Hardware vendor name, when known.
     pub vendor: Option<String>,
+    /// System-on-chip identifier, when known.
     pub soc: Option<String>,
+    /// Human-readable profile description.
     pub description: Option<String>,
+    /// Platform metadata merged into the host platform.
     pub platform: Option<PlatformMetadata>,
 }
 
+/// Partial Nix platform metadata carried by hardware profiles.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct PlatformMetadata {
+    /// GCC/Clang architecture and tuning metadata.
     pub gcc: Option<GccMetadata>,
 }
 
+/// GCC/Clang architecture and tune settings.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 pub struct GccMetadata {
+    /// `-march` value represented as nixpkgs platform metadata.
     pub arch: Option<String>,
+    /// `-mtune` value represented as nixpkgs platform metadata.
     pub tune: Option<String>,
 }
 
+/// Build optimization profile shared between Nix and Rust validation.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct BuildOptimizationProfile {
+    /// Stable profile name.
     pub name: String,
+    /// Whether applying the profile changes derivation hashes.
     pub changes_hashes: bool,
+    /// C compiler flags.
     pub c_flags: Vec<String>,
+    /// Linker flags.
     pub link_flags: Vec<String>,
+    /// Rust compiler flags.
     pub rust_flags: Vec<String>,
+    /// Go compiler flags.
     pub go_flags: Vec<String>,
+    /// Go linker flags.
     pub go_ldflags: Vec<String>,
+    /// Go environment overrides.
     pub go_env: BTreeMap<String, String>,
+    /// Human-readable profile description.
     pub description: String,
 }
 
+/// Hardware optimization input accepted by Rust helpers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HardwareOptimization<'a> {
+    /// Lookup a named profile from [`Metadata::hardware_profiles`].
     Named(&'a str),
+    /// Use a caller-provided custom profile.
     Custom(HardwareProfile),
 }
 
+/// Host platform after applying optional hardware optimization metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OptimizedHostPlatform {
+    /// Nix system string for the optimized host platform.
     pub system: String,
+    /// GNU-style target config string preserved from the host target.
     pub config: String,
+    /// Optional GCC/Clang platform tuning metadata.
     pub gcc: Option<GccMetadata>,
 }
 
+/// Loads embedded Crossbow metadata.
+///
+/// # Errors
+///
+/// Returns [`Error::MetadataJson`] if the embedded JSON cannot be parsed.
 pub fn metadata() -> Result<Metadata> {
     serde_json::from_str(METADATA_JSON).map_err(Into::into)
 }
 
+/// Looks up a target descriptor by Crossbow target name.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedHostPlatform`] when `system` is not present in
+/// [`Metadata::targets`].
 pub fn target_for<'a>(metadata: &'a Metadata, system: &str) -> Result<&'a TargetDescriptor> {
     metadata
         .targets
@@ -98,6 +154,11 @@ pub fn target_for<'a>(metadata: &'a Metadata, system: &str) -> Result<&'a Target
         })
 }
 
+/// Looks up the Zig target triple for a Nix system string.
+///
+/// # Errors
+///
+/// Returns [`Error::MissingPlatformMapping`] if no Zig mapping exists.
 pub fn nix_system_to_zig_target(metadata: &Metadata, system: &str) -> Result<String> {
     lookup_platform_mapping(
         "Zig target",
@@ -106,6 +167,11 @@ pub fn nix_system_to_zig_target(metadata: &Metadata, system: &str) -> Result<Str
     )
 }
 
+/// Looks up the GNU config triple for a Nix system string.
+///
+/// # Errors
+///
+/// Returns [`Error::MissingPlatformMapping`] if no GNU config mapping exists.
 pub fn nix_system_to_gnu_config(metadata: &Metadata, system: &str) -> Result<String> {
     lookup_platform_mapping(
         "GNU config",
@@ -114,6 +180,11 @@ pub fn nix_system_to_gnu_config(metadata: &Metadata, system: &str) -> Result<Str
     )
 }
 
+/// Looks up a named cache mode.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedCacheMode`] if `mode` is unknown.
 pub fn cache_mode_for<'a>(metadata: &'a Metadata, mode: &str) -> Result<&'a CacheMode> {
     metadata
         .cache_modes
@@ -129,6 +200,12 @@ pub fn cache_mode_for<'a>(metadata: &'a Metadata, mode: &str) -> Result<&'a Cach
         })
 }
 
+/// Resolves optional hardware optimization input to a profile.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedHardwareProfile`] when a named profile is not
+/// present in [`Metadata::hardware_profiles`].
 pub fn hardware_profile_for<'a>(
     metadata: &'a Metadata,
     hardware_optimization: Option<HardwareOptimization<'a>>,
@@ -153,6 +230,12 @@ pub fn hardware_profile_for<'a>(
     }
 }
 
+/// Returns the display name for optional hardware optimization input.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedHardwareProfile`] when a named profile is not
+/// present in [`Metadata::hardware_profiles`].
 pub fn hardware_optimization_name(
     metadata: &Metadata,
     hardware_optimization: Option<HardwareOptimization<'_>>,
@@ -160,6 +243,14 @@ pub fn hardware_optimization_name(
     Ok(hardware_profile_for(metadata, hardware_optimization)?.map(|profile| profile.name))
 }
 
+/// Merges a hardware profile into a host platform descriptor.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedHostPlatform`] when `host` is unknown,
+/// [`Error::UnsupportedHardwareProfile`] when a named profile is unknown, or
+/// [`Error::HardwareProfileHostMismatch`] when the profile targets another
+/// system.
 pub fn optimized_host_platform(
     metadata: &Metadata,
     host: &str,
@@ -189,6 +280,12 @@ pub fn optimized_host_platform(
     })
 }
 
+/// Looks up a build optimization profile, defaulting to `cache-first`.
+///
+/// # Errors
+///
+/// Returns [`Error::UnsupportedBuildOptimizationProfile`] when `profile` names
+/// an unknown profile.
 pub fn build_optimization_profile_for<'a>(
     metadata: &'a Metadata,
     profile: Option<&str>,
@@ -208,6 +305,8 @@ pub fn build_optimization_profile_for<'a>(
         })
 }
 
+/// Returns the public unsupported-toolchain message for a build/host pair.
+#[must_use]
 pub fn unsupported_toolchain_message(build: &str, host: &str, darwin_sdk: Option<&str>) -> String {
     if is_wasm(host) {
         "crossbow: wasm toolchain is declared but not implemented in phase 1".to_owned()
@@ -222,22 +321,32 @@ pub fn unsupported_toolchain_message(build: &str, host: &str, darwin_sdk: Option
     }
 }
 
+/// Returns the operating-system suffix from a Nix system string.
+#[must_use]
 pub fn os_of(system: &str) -> Option<&str> {
     system.rsplit('-').next()
 }
 
+/// Returns true when `system` is a Linux Nix system.
+#[must_use]
 pub fn is_linux(system: &str) -> bool {
     os_of(system) == Some("linux")
 }
 
+/// Returns true when `system` is a Darwin Nix system.
+#[must_use]
 pub fn is_darwin(system: &str) -> bool {
     os_of(system) == Some("darwin")
 }
 
+/// Returns true when `system` is a Windows Nix system.
+#[must_use]
 pub fn is_windows(system: &str) -> bool {
     os_of(system) == Some("windows")
 }
 
+/// Returns true when `system` is a WebAssembly Nix system.
+#[must_use]
 pub fn is_wasm(system: &str) -> bool {
     system.starts_with("wasm")
 }

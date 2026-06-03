@@ -6,22 +6,40 @@ use crate::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed options for one `crossbow-switch` CLI invocation.
 pub struct CliOptions {
+    /// Rebuild action passed to `nixos-rebuild`.
     pub action: String,
+    /// Flake reference passed to `nixos-rebuild --flake`.
     pub flake_attr: String,
+    /// Attribute built first to realise the system toplevel.
     pub toplevel_attr: String,
+    /// Optional SSH target passed to `nixos-rebuild --target-host`.
     pub target_ssh: Option<String>,
+    /// Whether activation should pass `--use-substitutes`.
     pub use_substitutes: bool,
+    /// Whether the closure should be published and verified before activation.
     pub capture: bool,
+    /// Whether local activation should run `nixos-rebuild` through `sudo`.
     pub sudo: bool,
+    /// Shell command that receives store paths on stdin and publishes them.
     pub publish_command: Option<String>,
+    /// Shell command that receives store paths on stdin and prints missing paths.
     pub verify_command: Option<String>,
 }
 
+/// Returns the command-line usage string.
+#[must_use]
 pub fn usage() -> &'static str {
     "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--capture --publish-command <command>] [--verify-command <command>] [--sudo]"
 }
 
+/// Parses CLI arguments into [`CliOptions`].
+///
+/// # Errors
+///
+/// Returns [`Error`] for unknown flags, missing required values,
+/// unsupported rebuild actions, or capture mode without a publish command.
 pub fn parse_args<I, S>(args: I) -> Result<CliOptions>
 where
     I: IntoIterator<Item = S>,
@@ -111,6 +129,12 @@ where
     })
 }
 
+/// Parses process arguments and runs the switch plan.
+///
+/// # Errors
+///
+/// Returns [`Error`] when argument parsing fails, when build or
+/// activation commands fail, or when publish/verify reports missing cache paths.
 pub fn run_from_env() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
@@ -122,6 +146,12 @@ pub fn run_from_env() -> Result<()> {
     run_with_options(&options)
 }
 
+/// Runs one CLI switch invocation from already-parsed options.
+///
+/// # Errors
+///
+/// Returns [`Error`] for the same build, publish, verify, and
+/// activation failures as [`crate::run_cache_shaped_switch`].
 pub fn run_with_options(options: &CliOptions) -> Result<()> {
     let plan = SwitchPlan {
         action: &options.action,

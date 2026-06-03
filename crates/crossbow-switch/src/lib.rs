@@ -1,9 +1,21 @@
+//! Runtime support for Crossbow cache-shaped NixOS switch orchestration.
+//!
+//! The crate keeps impure runtime work in Rust: building a toplevel, collecting
+//! the closure to publish, checking cache availability, and finally invoking
+//! `nixos-rebuild` with QEMU-free cache-shaped flags.
+
+#![warn(missing_docs)]
+
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+/// Command-line entry points for the `crossbow-switch` binary.
 pub mod cli;
+/// Error and result types shared by the library and binary.
 pub mod error;
+/// Executor descriptor validation for Crossbow check planning.
 pub mod executor;
+/// Typed access to Crossbow's shared target/profile metadata.
 pub mod metadata;
 
 pub use error::{Error, Result};
@@ -17,6 +29,7 @@ pub use error::{Error, Result};
 /// `use_substitutes` adds `--use-substitutes`, which shifts transfer to the
 /// target's own substituters and is only appropriate when the target trusts the
 /// cache that has been populated before activation.
+#[must_use]
 pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
     let mut flags = vec![
         "--builders".to_string(),
@@ -76,6 +89,7 @@ pub trait Verifier {
 }
 
 /// A verifier for callers that treat a successful publish as sufficient proof.
+#[derive(Debug, Clone, Copy, Default)]
 pub struct TrustPublish;
 
 impl Verifier for TrustPublish {
@@ -85,6 +99,7 @@ impl Verifier for TrustPublish {
 }
 
 /// Inputs for one cache-shaped NixOS rebuild.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchPlan<'a> {
     /// Rebuild action, such as `switch`, `boot`, `test`, or `build`.
     pub action: &'a str,

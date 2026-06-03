@@ -1,19 +1,51 @@
 use crate::{Error, Result};
 
+/// Executor descriptor accepted by Crossbow check planning.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorDescriptor {
-    NativeBuilder { builders: Vec<String> },
-    Skip { reason: String },
-    Wasmtime { configured: bool },
-    Wine { configured: bool },
+    /// Check by requiring a native builder for the host system.
+    NativeBuilder {
+        /// Optional builder names accepted by the descriptor.
+        builders: Vec<String>,
+    },
+    /// Mark the check as intentionally skipped with a human-readable reason.
+    Skip {
+        /// Human-readable skip reason.
+        reason: String,
+    },
+    /// Declared WASI executor stub.
+    Wasmtime {
+        /// Whether a concrete wasmtime package was supplied by the caller.
+        configured: bool,
+    },
+    /// Declared Windows/Wine executor stub.
+    Wine {
+        /// Whether a concrete wine package was supplied by the caller.
+        configured: bool,
+    },
 }
 
+/// Planned check behavior derived from an [`ExecutorDescriptor`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckPlan {
-    NativeBuilder { required_system: String },
-    Skipped { reason: String },
+    /// Native-builder checks record the system that must be executable.
+    NativeBuilder {
+        /// Host system required by the check.
+        required_system: String,
+    },
+    /// Skipped checks emit the supplied reason.
+    Skipped {
+        /// Human-readable skip reason.
+        reason: String,
+    },
 }
 
+/// Validates an executor descriptor for a package check.
+///
+/// # Errors
+///
+/// Returns [`Error::NativeBuilderMissingHost`] when a native-builder check has
+/// no host system, and [`Error::ExecutorNotImplemented`] for declared stubs.
 pub fn plan_executor_check(
     executor: &ExecutorDescriptor,
     host_system: &str,
@@ -43,6 +75,11 @@ pub fn plan_executor_check(
     }
 }
 
+/// Parses an executor kind name into an [`ExecutorDescriptor`].
+///
+/// # Errors
+///
+/// Returns [`Error::UnknownExecutor`] for names Crossbow does not recognize.
 pub fn parse_executor_kind(kind: &str) -> Result<ExecutorDescriptor> {
     match kind {
         "native-builder" => Ok(ExecutorDescriptor::NativeBuilder {

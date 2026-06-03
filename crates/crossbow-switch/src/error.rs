@@ -1,166 +1,302 @@
 use std::string::FromUtf8Error;
 
+/// Errors produced by Crossbow switch planning, metadata lookup, and runtime commands.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// A target system was not present in the shared metadata.
     #[error(
         "crossbow: unsupported host platform `{system}`; add it to lib/targets.nix and lib/platform-map.nix first"
     )]
-    UnsupportedHostPlatform { system: String },
+    UnsupportedHostPlatform {
+        /// Unsupported Nix system string.
+        system: String,
+    },
 
+    /// A Nix system did not have the requested compiler target mapping.
     #[error("crossbow: no {name} mapping for `{system}`")]
-    MissingPlatformMapping { name: String, system: String },
+    MissingPlatformMapping {
+        /// Mapping table name.
+        name: String,
+        /// Nix system string that was missing.
+        system: String,
+    },
 
+    /// A cache mode name was not present in the shared metadata.
     #[error("crossbow: unsupported cache mode `{mode}`; expected one of {expected}")]
-    UnsupportedCacheMode { mode: String, expected: String },
+    UnsupportedCacheMode {
+        /// Unsupported cache mode.
+        mode: String,
+        /// Comma-separated supported cache modes.
+        expected: String,
+    },
 
+    /// A hardware optimization profile name was not present in the shared metadata.
     #[error(
         "crossbow: unsupported hardware optimization profile `{profile}`; expected one of {expected}"
     )]
-    UnsupportedHardwareProfile { profile: String, expected: String },
+    UnsupportedHardwareProfile {
+        /// Unsupported profile name.
+        profile: String,
+        /// Comma-separated supported profile names.
+        expected: String,
+    },
 
+    /// A hardware optimization profile was used with the wrong host system.
     #[error(
         "crossbow: hardware optimization profile `{profile}` is for `{profile_system}` but host is `{host}`"
     )]
     HardwareProfileHostMismatch {
+        /// Profile name.
         profile: String,
+        /// System the profile supports.
         profile_system: String,
+        /// Host system requested by the caller.
         host: String,
     },
 
+    /// A build optimization profile name was not present in the shared metadata.
     #[error(
         "crossbow: unsupported build optimization profile `{profile}`; expected one of {expected}"
     )]
-    UnsupportedBuildOptimizationProfile { profile: String, expected: String },
+    UnsupportedBuildOptimizationProfile {
+        /// Unsupported profile name.
+        profile: String,
+        /// Comma-separated supported profile names.
+        expected: String,
+    },
 
+    /// A native-builder check was planned without a host system.
     #[error("crossbow: native-builder check `{check_name}` requires a non-empty host system")]
-    NativeBuilderMissingHost { check_name: String },
+    NativeBuilderMissingHost {
+        /// Check derivation name.
+        check_name: String,
+    },
 
+    /// A declared executor exists in metadata but has no phase-1 implementation.
     #[error("crossbow: executor `{kind}` is declared but not implemented in phase 1")]
-    ExecutorNotImplemented { kind: String },
+    ExecutorNotImplemented {
+        /// Executor kind.
+        kind: String,
+    },
 
+    /// An executor kind string is not recognized by Crossbow.
     #[error("crossbow: unknown executor `{kind}`")]
-    UnknownExecutor { kind: String },
+    UnknownExecutor {
+        /// Unknown executor kind.
+        kind: String,
+    },
 
+    /// A CLI argument was not recognized.
     #[error("crossbow: unknown argument `{argument}`\n{usage}")]
-    UnknownArgument { argument: String, usage: String },
+    UnknownArgument {
+        /// Unknown argument.
+        argument: String,
+        /// Usage text shown to the user.
+        usage: String,
+    },
 
+    /// A CLI option that requires a value was not followed by one.
     #[error("crossbow: {flag} requires a value; pass it as `{flag} <value>`")]
-    MissingArgumentValue { flag: String },
+    MissingArgumentValue {
+        /// CLI flag missing its value.
+        flag: String,
+    },
 
+    /// A required CLI option was absent.
     #[error("crossbow: missing {flag}; pass `{flag} <value>`")]
-    MissingRequiredArgument { flag: String },
+    MissingRequiredArgument {
+        /// Required CLI flag.
+        flag: String,
+    },
 
+    /// A rebuild action is not supported by the switch CLI.
     #[error("crossbow: unsupported nixos-rebuild action `{action}`")]
-    UnsupportedAction { action: String },
+    UnsupportedAction {
+        /// Unsupported rebuild action.
+        action: String,
+    },
 
+    /// Capture mode was requested without a publication command.
     #[error(
         "crossbow: --capture requires --publish-command; provide the cache publication command or use --no-capture"
     )]
     CaptureRequiresPublishCommand,
 
+    /// Runtime switch orchestration reached publish without a publisher.
     #[error("crossbow: no publisher configured; pass --publish-command when capture is enabled")]
     NoPublisherConfigured,
 
+    /// A shell command used for publish/verify could not be spawned.
     #[error("crossbow: failed to spawn shell command `{command}`")]
     CommandSpawn {
+        /// Shell command text.
         command: String,
+        /// Underlying spawn failure.
         #[source]
         source: std::io::Error,
     },
 
+    /// A shell command did not expose stdin for store paths.
     #[error("crossbow: shell command `{command}` did not open stdin for store paths")]
-    CommandStdinUnavailable { command: String },
+    CommandStdinUnavailable {
+        /// Shell command text.
+        command: String,
+    },
 
+    /// Writing store paths to a shell command failed.
     #[error("crossbow: failed to write store paths to shell command `{command}`")]
     CommandWriteStdin {
+        /// Shell command text.
         command: String,
+        /// Underlying write failure.
         #[source]
         source: std::io::Error,
     },
 
+    /// Waiting for a shell command failed.
     #[error("crossbow: failed to wait for shell command `{command}`")]
     CommandWait {
+        /// Shell command text.
         command: String,
+        /// Underlying wait failure.
         #[source]
         source: std::io::Error,
     },
 
+    /// A shell command exited unsuccessfully.
     #[error("crossbow: shell command `{command}` failed: {stderr}")]
-    CommandFailed { command: String, stderr: String },
-
-    #[error("crossbow: shell command `{command}` produced non-UTF-8 output")]
-    CommandUtf8 {
+    CommandFailed {
+        /// Shell command text.
         command: String,
-        #[source]
-        source: FromUtf8Error,
-    },
-
-    #[error("crossbow: failed to run `nix build --no-link --print-out-paths {attr}`")]
-    NixBuildRun {
-        attr: String,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` failed: {stderr}")]
-    NixBuildFailed { attr: String, stderr: String },
-
-    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` produced non-UTF-8 output")]
-    NixBuildUtf8 {
-        attr: String,
-        #[source]
-        source: FromUtf8Error,
-    },
-
-    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` printed no output path")]
-    NixBuildNoOutput { attr: String },
-
-    #[error("crossbow: failed to run `nix-store {args}`")]
-    NixStoreRun {
-        args: String,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("crossbow: `nix-store {args}` failed: {stderr}")]
-    NixStoreFailed { args: String, stderr: String },
-
-    #[error("crossbow: `nix-store {args}` produced non-UTF-8 output")]
-    NixStoreUtf8 {
-        args: String,
-        #[source]
-        source: FromUtf8Error,
-    },
-
-    #[error("crossbow: `nix-store --query --deriver {toplevel}` returned no deriver")]
-    NixStoreNoDeriver { toplevel: String },
-
-    #[error("crossbow: failed to run `nixos-rebuild {action} --flake {flake_attr}`")]
-    NixosRebuildRun {
-        action: String,
-        flake_attr: String,
-        #[source]
-        source: std::io::Error,
-    },
-
-    #[error("crossbow: `nixos-rebuild {action} --flake {flake_attr}` failed: {stderr}")]
-    NixosRebuildFailed {
-        action: String,
-        flake_attr: String,
+        /// Captured stderr.
         stderr: String,
     },
 
+    /// A shell command produced stdout that was not UTF-8.
+    #[error("crossbow: shell command `{command}` produced non-UTF-8 output")]
+    CommandUtf8 {
+        /// Shell command text.
+        command: String,
+        /// UTF-8 decoding failure.
+        #[source]
+        source: FromUtf8Error,
+    },
+
+    /// Spawning `nix build` failed.
+    #[error("crossbow: failed to run `nix build --no-link --print-out-paths {attr}`")]
+    NixBuildRun {
+        /// Nix attribute passed to `nix build`.
+        attr: String,
+        /// Underlying spawn failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `nix build` exited unsuccessfully.
+    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` failed: {stderr}")]
+    NixBuildFailed {
+        /// Nix attribute passed to `nix build`.
+        attr: String,
+        /// Captured stderr.
+        stderr: String,
+    },
+
+    /// `nix build` printed stdout that was not UTF-8.
+    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` produced non-UTF-8 output")]
+    NixBuildUtf8 {
+        /// Nix attribute passed to `nix build`.
+        attr: String,
+        /// UTF-8 decoding failure.
+        #[source]
+        source: FromUtf8Error,
+    },
+
+    /// `nix build --print-out-paths` printed no output path.
+    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` printed no output path")]
+    NixBuildNoOutput {
+        /// Nix attribute passed to `nix build`.
+        attr: String,
+    },
+
+    /// Spawning `nix-store` failed.
+    #[error("crossbow: failed to run `nix-store {args}`")]
+    NixStoreRun {
+        /// Arguments passed to `nix-store`.
+        args: String,
+        /// Underlying spawn failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `nix-store` exited unsuccessfully.
+    #[error("crossbow: `nix-store {args}` failed: {stderr}")]
+    NixStoreFailed {
+        /// Arguments passed to `nix-store`.
+        args: String,
+        /// Captured stderr.
+        stderr: String,
+    },
+
+    /// `nix-store` printed stdout that was not UTF-8.
+    #[error("crossbow: `nix-store {args}` produced non-UTF-8 output")]
+    NixStoreUtf8 {
+        /// Arguments passed to `nix-store`.
+        args: String,
+        /// UTF-8 decoding failure.
+        #[source]
+        source: FromUtf8Error,
+    },
+
+    /// `nix-store --query --deriver` returned no deriver path.
+    #[error("crossbow: `nix-store --query --deriver {toplevel}` returned no deriver")]
+    NixStoreNoDeriver {
+        /// Toplevel store path queried for its deriver.
+        toplevel: String,
+    },
+
+    /// Spawning `nixos-rebuild` failed.
+    #[error("crossbow: failed to run `nixos-rebuild {action} --flake {flake_attr}`")]
+    NixosRebuildRun {
+        /// Rebuild action.
+        action: String,
+        /// Flake reference passed to `nixos-rebuild`.
+        flake_attr: String,
+        /// Underlying spawn failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `nixos-rebuild` exited unsuccessfully.
+    #[error("crossbow: `nixos-rebuild {action} --flake {flake_attr}` failed: {stderr}")]
+    NixosRebuildFailed {
+        /// Rebuild action.
+        action: String,
+        /// Flake reference passed to `nixos-rebuild`.
+        flake_attr: String,
+        /// Captured stderr.
+        stderr: String,
+    },
+
+    /// Cache verification reported paths missing after publication.
     #[error(
         "crossbow: {count} paths are missing from cache after publish; first missing paths: {preview}"
     )]
-    MissingCachePaths { count: usize, preview: String },
+    MissingCachePaths {
+        /// Number of missing paths.
+        count: usize,
+        /// Preview of missing paths.
+        preview: String,
+    },
 
+    /// Embedded JSON metadata failed to deserialize.
     #[error("crossbow: embedded metadata JSON is invalid")]
     MetadataJson {
+        /// JSON parsing failure.
         #[from]
         source: serde_json::Error,
     },
 }
 
+/// Convenient result alias for Crossbow switch operations.
 pub type Result<T> = std::result::Result<T, Error>;
