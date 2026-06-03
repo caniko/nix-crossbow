@@ -41,15 +41,34 @@
       in {
         inherit formatter;
 
-        packages.tiny-c-aarch64-linux = inputs.self.lib.mkCross {
-          inherit pkgs;
-          build = system;
-          host = "aarch64-linux";
-          package = import ./examples/tiny-c.nix;
-          doCheck = false;
+        packages = {
+          crossbow-switch = pkgs.rustPlatform.buildRustPackage {
+            pname = "crossbow-switch";
+            version = "0.1.0";
+            src = ./.;
+            cargoLock.lockFile = ./Cargo.lock;
+            cargoBuildFlags = ["-p" "crossbow-switch"];
+            cargoTestFlags = ["-p" "crossbow-switch"];
+          };
+
+          tiny-c-aarch64-linux = inputs.self.lib.mkCross {
+            inherit pkgs;
+            build = system;
+            host = "aarch64-linux";
+            package = import ./examples/tiny-c.nix;
+            doCheck = false;
+          };
+        };
+
+        apps.crossbow-switch = {
+          type = "app";
+          program = "${inputs.self.packages.${system}.crossbow-switch}/bin/crossbow-switch";
+          meta.description = "Run cache-shaped Crossbow NixOS switch orchestration";
         };
 
         checks = {
+          crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
+
           platform-map = pkgs.runCommand "crossbow-platform-map" {} ''
             test "${inputs.self.lib.nixSystemToZigTarget "aarch64-linux"}" = "aarch64-linux-gnu"
             test "${inputs.self.lib.nixSystemToGnuConfig "aarch64-linux"}" = "aarch64-unknown-linux-gnu"
@@ -106,7 +125,11 @@
         devShells.default = pkgs.mkShell {
           packages = [
             pkgs.alejandra
+            pkgs.cargo
+            pkgs.clippy
             pkgs.nix
+            pkgs.rustc
+            pkgs.rustfmt
             pkgs.zig
           ];
         };

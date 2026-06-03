@@ -3,6 +3,10 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow, bail};
 
+pub mod cli;
+pub mod executor;
+pub mod metadata;
+
 /// Returns the canonical flags for a cache-shaped crossbow `nixos-rebuild`.
 ///
 /// The empty `--builders` and `extra-platforms` values keep activation from
