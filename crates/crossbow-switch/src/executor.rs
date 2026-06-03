@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use crate::{Error, Result};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExecutorDescriptor {
@@ -25,21 +25,21 @@ pub fn plan_executor_check(
         }),
         ExecutorDescriptor::NativeBuilder { .. } => {
             if host_system.is_empty() {
-                bail!(
-                    "crossbow: native-builder check `{check_name}` requires a non-empty host system"
-                );
+                return Err(Error::NativeBuilderMissingHost {
+                    check_name: check_name.to_owned(),
+                });
             }
 
             Ok(CheckPlan::NativeBuilder {
                 required_system: host_system.to_owned(),
             })
         }
-        ExecutorDescriptor::Wasmtime { .. } => {
-            bail!("crossbow: executor `wasmtime` is declared but not implemented in phase 1")
-        }
-        ExecutorDescriptor::Wine { .. } => {
-            bail!("crossbow: executor `wine` is declared but not implemented in phase 1")
-        }
+        ExecutorDescriptor::Wasmtime { .. } => Err(Error::ExecutorNotImplemented {
+            kind: "wasmtime".to_owned(),
+        }),
+        ExecutorDescriptor::Wine { .. } => Err(Error::ExecutorNotImplemented {
+            kind: "wine".to_owned(),
+        }),
     }
 }
 
@@ -53,7 +53,9 @@ pub fn parse_executor_kind(kind: &str) -> Result<ExecutorDescriptor> {
         }),
         "wasmtime" => Ok(ExecutorDescriptor::Wasmtime { configured: false }),
         "wine" => Ok(ExecutorDescriptor::Wine { configured: false }),
-        other => bail!("crossbow: unknown executor `{other}`"),
+        other => Err(Error::UnknownExecutor {
+            kind: other.to_owned(),
+        }),
     }
 }
 

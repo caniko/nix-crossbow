@@ -1,9 +1,9 @@
 use std::io::Write;
 use std::process::{Command, Stdio};
 
-use anyhow::{Context, Result, anyhow, bail};
-
-use crate::{Publisher, SwitchPlan, TrustPublish, Verifier, run_cache_shaped_switch};
+use crate::{
+    Error, Publisher, Result, SwitchPlan, TrustPublish, Verifier, run_cache_shaped_switch,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CliOptions {
@@ -70,26 +70,38 @@ where
                 index += 1;
                 verify_command = Some(required_value(&args, index, "--verify-command")?.to_owned());
             }
-            "-h" | "--help" => bail!("{}", usage()),
-            unknown => bail!("crossbow: unknown argument `{unknown}`\n{}", usage()),
+            "-h" | "--help" => {
+                return Err(Error::UnknownArgument {
+                    argument: args[index].clone(),
+                    usage: usage().to_owned(),
+                });
+            }
+            unknown => {
+                return Err(Error::UnknownArgument {
+                    argument: unknown.to_owned(),
+                    usage: usage().to_owned(),
+                });
+            }
         }
         index += 1;
     }
 
     if !matches!(action.as_str(), "switch" | "boot" | "test" | "build") {
-        bail!("crossbow: unsupported nixos-rebuild action `{action}`");
+        return Err(Error::UnsupportedAction { action });
     }
 
     if capture && publish_command.is_none() {
-        bail!(
-            "crossbow: --capture requires --publish-command; provide the cache publication command or use --no-capture"
-        );
+        return Err(Error::CaptureRequiresPublishCommand);
     }
 
     Ok(CliOptions {
         action,
-        flake_attr: flake_attr.ok_or_else(|| anyhow!("crossbow: missing --flake"))?,
-        toplevel_attr: toplevel_attr.ok_or_else(|| anyhow!("crossbow: missing --toplevel"))?,
+        flake_attr: flake_attr.ok_or_else(|| Error::MissingRequiredArgument {
+            flag: "--flake".to_owned(),
+        })?,
+        toplevel_attr: toplevel_attr.ok_or_else(|| Error::MissingRequiredArgument {
+            flag: "--toplevel".to_owned(),
+        })?,
         target_ssh,
         use_substitutes,
         capture,
@@ -146,7 +158,7 @@ struct NoopPublisher;
 
 impl Publisher for NoopPublisher {
     fn publish(&self, _paths: &[String]) -> Result<()> {
-        bail!("crossbow: no publisher configured")
+        Err(Error::NoPublisherConfigured)
     }
 }
 
@@ -184,42 +196,55 @@ fn run_path_command(command: &str, paths: &[String]) -> Result<String> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawning command `{command}`"))?;
+        .map_err(|source| Error::CommandSpawn {
+            command: command.to_owned(),
+            source,
+        })?;
 
     {
         let stdin = child
             .stdin
             .as_mut()
-            .ok_or_else(|| anyhow!("command `{command}` did not open stdin"))?;
+            .ok_or_else(|| Error::CommandStdinUnavailable {
+                command: command.to_owned(),
+            })?;
         for path in paths {
-            writeln!(stdin, "{path}")
-                .with_context(|| format!("writing store paths to command `{command}`"))?;
+            writeln!(stdin, "{path}").map_err(|source| Error::CommandWriteStdin {
+                command: command.to_owned(),
+                source,
+            })?;
         }
     }
 
     let output = child
         .wait_with_output()
-        .with_context(|| format!("waiting for command `{command}`"))?;
+        .map_err(|source| Error::CommandWait {
+            command: command.to_owned(),
+            source,
+        })?;
 
     if !output.status.success() {
-        bail!(
-            "command `{}` failed: {}",
-            command,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Err(Error::CommandFailed {
+            command: command.to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
     }
 
-    String::from_utf8(output.stdout)
-        .with_context(|| format!("command `{command}` produced non-UTF-8 output"))
+    String::from_utf8(output.stdout).map_err(|source| Error::CommandUtf8 {
+        command: command.to_owned(),
+        source,
+    })
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
-    let value = args
-        .get(index)
-        .ok_or_else(|| anyhow!("crossbow: {flag} requires a value"))?;
+    let value = args.get(index).ok_or_else(|| Error::MissingArgumentValue {
+        flag: flag.to_owned(),
+    })?;
 
     if value.starts_with("--") {
-        bail!("crossbow: {flag} requires a value");
+        return Err(Error::MissingArgumentValue {
+            flag: flag.to_owned(),
+        });
     }
 
     Ok(value)

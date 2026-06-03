@@ -1,11 +1,12 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use anyhow::{Context, Result, anyhow, bail};
-
 pub mod cli;
+pub mod error;
 pub mod executor;
 pub mod metadata;
+
+pub use error::{Error, Result};
 
 /// Returns the canonical flags for a cache-shaped crossbow `nixos-rebuild`.
 ///
@@ -42,16 +43,15 @@ pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
 /// closure with outputs included. Empty lines, derivation paths, and paths that
 /// are not present on the local filesystem are omitted from the result.
 pub fn closure_to_publish(toplevel: &Path) -> Result<Vec<String>> {
-    let deriver = run_nix_store(&["--query", "--deriver"], Some(toplevel))
-        .with_context(|| format!("querying deriver for {}", toplevel.display()))?;
-    let deriver = first_non_empty_line(&deriver)
-        .ok_or_else(|| anyhow!("nix-store returned no deriver for {}", toplevel.display()))?;
+    let deriver = run_nix_store(&["--query", "--deriver"], Some(toplevel))?;
+    let deriver = first_non_empty_line(&deriver).ok_or_else(|| Error::NixStoreNoDeriver {
+        toplevel: toplevel.to_path_buf(),
+    })?;
 
     let requisites = run_nix_store(
         &["--query", "--requisites", "--include-outputs"],
         Some(Path::new(&deriver)),
-    )
-    .with_context(|| format!("querying closure requisites for {deriver}"))?;
+    )?;
 
     Ok(filter_publish_paths(&requisites))
 }
@@ -128,19 +128,25 @@ impl Runner for ProcessRunner {
         let output = Command::new("nix")
             .args(["build", "--no-link", "--print-out-paths", attr])
             .output()
-            .with_context(|| format!("running nix build for {attr}"))?;
+            .map_err(|source| Error::NixBuildRun {
+                attr: attr.to_owned(),
+                source,
+            })?;
 
         if !output.status.success() {
-            bail!(
-                "nix build failed for {attr}: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            return Err(Error::NixBuildFailed {
+                attr: attr.to_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
         }
 
-        let stdout = String::from_utf8(output.stdout)
-            .with_context(|| format!("nix build produced non-UTF-8 output for {attr}"))?;
-        let path = first_non_empty_line(&stdout)
-            .ok_or_else(|| anyhow!("nix build printed no output path for {attr}"))?;
+        let stdout = String::from_utf8(output.stdout).map_err(|source| Error::NixBuildUtf8 {
+            attr: attr.to_owned(),
+            source,
+        })?;
+        let path = first_non_empty_line(&stdout).ok_or_else(|| Error::NixBuildNoOutput {
+            attr: attr.to_owned(),
+        })?;
 
         Ok(PathBuf::from(path))
     }
@@ -166,20 +172,18 @@ impl Runner for ProcessRunner {
 
         command.args(cache_shaped_switch_flags(plan.use_substitutes));
 
-        let output = command.output().with_context(|| {
-            format!(
-                "running nixos-rebuild {} for {}",
-                plan.action, plan.flake_attr
-            )
+        let output = command.output().map_err(|source| Error::NixosRebuildRun {
+            action: plan.action.to_owned(),
+            flake_attr: plan.flake_attr.to_owned(),
+            source,
         })?;
 
         if !output.status.success() {
-            bail!(
-                "nixos-rebuild {} failed for {}: {}",
-                plan.action,
-                plan.flake_attr,
-                String::from_utf8_lossy(&output.stderr).trim()
-            );
+            return Err(Error::NixosRebuildFailed {
+                action: plan.action.to_owned(),
+                flake_attr: plan.flake_attr.to_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
         }
 
         Ok(())
@@ -206,11 +210,10 @@ fn run_cache_shaped_switch_with_runner(
                 .map(String::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
-            bail!(
-                "{} paths missing from cache after publish: {}",
-                missing.len(),
-                preview
-            );
+            return Err(Error::MissingCachePaths {
+                count: missing.len(),
+                preview,
+            });
         }
     }
 
@@ -229,17 +232,18 @@ fn run_nix_store(args: &[&str], path: Option<&Path>) -> Result<String> {
         command.arg(path);
     }
 
-    let output = command.output().context("running nix-store")?;
+    let output = command
+        .output()
+        .map_err(|source| Error::NixStoreRun { source })?;
 
     if !output.status.success() {
-        bail!(
-            "nix-store {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        return Err(Error::NixStoreFailed {
+            args: args.join(" "),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
     }
 
-    String::from_utf8(output.stdout).context("nix-store produced non-UTF-8 output")
+    String::from_utf8(output.stdout).map_err(|source| Error::NixStoreUtf8 { source })
 }
 
 fn first_non_empty_line(output: &str) -> Option<String> {
@@ -269,29 +273,38 @@ mod tests {
     use std::rc::Rc;
 
     struct FakePublisher {
-        result: Result<()>,
+        error: Option<&'static str>,
         seen_paths: Rc<Cell<bool>>,
     }
 
     impl Publisher for FakePublisher {
         fn publish(&self, paths: &[String]) -> Result<()> {
             self.seen_paths.set(!paths.is_empty());
-            match &self.result {
-                Ok(()) => Ok(()),
-                Err(error) => bail!("{error}"),
+            if let Some(stderr) = self.error {
+                Err(Error::CommandFailed {
+                    command: "publish".to_owned(),
+                    stderr: stderr.to_owned(),
+                })
+            } else {
+                Ok(())
             }
         }
     }
 
     struct FakeVerifier {
-        result: Result<Vec<String>>,
+        missing: Vec<String>,
+        error: Option<&'static str>,
     }
 
     impl Verifier for FakeVerifier {
         fn verify_present(&self, _paths: &[String]) -> Result<Vec<String>> {
-            match &self.result {
-                Ok(paths) => Ok(paths.clone()),
-                Err(error) => bail!("{error}"),
+            if let Some(stderr) = self.error {
+                Err(Error::CommandFailed {
+                    command: "verify".to_owned(),
+                    stderr: stderr.to_owned(),
+                })
+            } else {
+                Ok(self.missing.clone())
             }
         }
     }
@@ -364,7 +377,8 @@ mod tests {
     }
 
     #[test]
-    fn filter_publish_paths_drops_blank_derivation_and_missing_paths() -> Result<()> {
+    fn filter_publish_paths_drops_blank_derivation_and_missing_paths()
+    -> std::result::Result<(), Box<dyn std::error::Error>> {
         let base =
             std::env::temp_dir().join(format!("crossbow-switch-test-{}", std::process::id()));
         fs::create_dir_all(&base)?;
@@ -404,10 +418,13 @@ mod tests {
             activated: Rc::clone(&activated),
         };
         let publisher = FakePublisher {
-            result: Err(anyhow!("publish failed")),
+            error: Some("publish failed"),
             seen_paths: Rc::clone(&seen_paths),
         };
-        let verifier = FakeVerifier { result: Ok(vec![]) };
+        let verifier = FakeVerifier {
+            missing: Vec::new(),
+            error: None,
+        };
 
         let error = run_cache_shaped_switch_with_runner(
             &switch_plan("switch"),
@@ -430,11 +447,12 @@ mod tests {
             activated: Rc::clone(&activated),
         };
         let publisher = FakePublisher {
-            result: Ok(()),
+            error: None,
             seen_paths: Rc::new(Cell::new(false)),
         };
         let verifier = FakeVerifier {
-            result: Err(anyhow!("verify failed")),
+            missing: Vec::new(),
+            error: Some("verify failed"),
         };
 
         let error = run_cache_shaped_switch_with_runner(
@@ -457,11 +475,12 @@ mod tests {
             activated: Rc::clone(&activated),
         };
         let publisher = FakePublisher {
-            result: Ok(()),
+            error: None,
             seen_paths: Rc::new(Cell::new(false)),
         };
         let verifier = FakeVerifier {
-            result: Ok(vec!["/nix/store/missing".to_string()]),
+            missing: vec!["/nix/store/missing".to_string()],
+            error: None,
         };
 
         let error = run_cache_shaped_switch_with_runner(
@@ -484,10 +503,13 @@ mod tests {
             activated: Rc::clone(&activated),
         };
         let publisher = FakePublisher {
-            result: Ok(()),
+            error: None,
             seen_paths: Rc::new(Cell::new(false)),
         };
-        let verifier = FakeVerifier { result: Ok(vec![]) };
+        let verifier = FakeVerifier {
+            missing: Vec::new(),
+            error: None,
+        };
 
         run_cache_shaped_switch_with_runner(&switch_plan("build"), &publisher, &verifier, &runner)?;
 

@@ -1,7 +1,8 @@
 use std::collections::BTreeMap;
 
-use anyhow::{Result, anyhow, bail};
 use serde::Deserialize;
+
+use crate::{Error, Result};
 
 const METADATA_JSON: &str = include_str!("../../../data/crossbow-metadata.json");
 
@@ -89,11 +90,12 @@ pub fn metadata() -> Result<Metadata> {
 }
 
 pub fn target_for<'a>(metadata: &'a Metadata, system: &str) -> Result<&'a TargetDescriptor> {
-    metadata.targets.get(system).ok_or_else(|| {
-        anyhow!(
-            "crossbow: unsupported host platform `{system}`; add it to lib/targets.nix and lib/platform-map.nix first"
-        )
-    })
+    metadata
+        .targets
+        .get(system)
+        .ok_or_else(|| Error::UnsupportedHostPlatform {
+            system: system.to_owned(),
+        })
 }
 
 pub fn nix_system_to_zig_target(metadata: &Metadata, system: &str) -> Result<String> {
@@ -113,17 +115,18 @@ pub fn nix_system_to_gnu_config(metadata: &Metadata, system: &str) -> Result<Str
 }
 
 pub fn cache_mode_for<'a>(metadata: &'a Metadata, mode: &str) -> Result<&'a CacheMode> {
-    metadata.cache_modes.get(mode).ok_or_else(|| {
-        anyhow!(
-            "crossbow: unsupported cache mode `{mode}`; expected one of {}",
-            metadata
+    metadata
+        .cache_modes
+        .get(mode)
+        .ok_or_else(|| Error::UnsupportedCacheMode {
+            mode: mode.to_owned(),
+            expected: metadata
                 .cache_modes
                 .keys()
                 .cloned()
                 .collect::<Vec<_>>()
-                .join(", ")
-        )
-    })
+                .join(", "),
+        })
 }
 
 pub fn hardware_profile_for<'a>(
@@ -133,24 +136,20 @@ pub fn hardware_profile_for<'a>(
     match hardware_optimization {
         None => Ok(None),
         Some(HardwareOptimization::Custom(profile)) => Ok(Some(profile)),
-        Some(HardwareOptimization::Named(name)) => {
-            metadata
-                .hardware_profiles
-                .get(name)
-                .cloned()
-                .map(Some)
-                .ok_or_else(|| {
-                    anyhow!(
-                        "crossbow: unsupported hardware optimization profile `{name}`; expected one of {}",
-                        metadata
-                            .hardware_profiles
-                            .keys()
-                            .cloned()
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    )
-                })
-        }
+        Some(HardwareOptimization::Named(name)) => metadata
+            .hardware_profiles
+            .get(name)
+            .cloned()
+            .map(Some)
+            .ok_or_else(|| Error::UnsupportedHardwareProfile {
+                profile: name.to_owned(),
+                expected: metadata
+                    .hardware_profiles
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            }),
     }
 }
 
@@ -176,11 +175,11 @@ pub fn optimized_host_platform(
     };
 
     if profile.system.as_deref().unwrap_or(host) != host {
-        bail!(
-            "crossbow: hardware optimization profile `{}` is for `{}` but host is `{host}`",
-            profile.name,
-            profile.system.as_deref().unwrap_or("<unknown>")
-        );
+        return Err(Error::HardwareProfileHostMismatch {
+            profile: profile.name,
+            profile_system: profile.system.unwrap_or_else(|| "<unknown>".to_owned()),
+            host: host.to_owned(),
+        });
     }
 
     Ok(OptimizedHostPlatform {
@@ -198,16 +197,14 @@ pub fn build_optimization_profile_for<'a>(
     metadata
         .build_optimization_profiles
         .get(name)
-        .ok_or_else(|| {
-            anyhow!(
-                "crossbow: unsupported build optimization profile `{name}`; expected one of {}",
-                metadata
-                    .build_optimization_profiles
-                    .keys()
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            )
+        .ok_or_else(|| Error::UnsupportedBuildOptimizationProfile {
+            profile: name.to_owned(),
+            expected: metadata
+                .build_optimization_profiles
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", "),
         })
 }
 
@@ -253,7 +250,10 @@ fn lookup_platform_mapping(
     table
         .get(system)
         .cloned()
-        .ok_or_else(|| anyhow!("crossbow: no {name} mapping for `{system}`"))
+        .ok_or_else(|| Error::MissingPlatformMapping {
+            name: name.to_owned(),
+            system: system.to_owned(),
+        })
 }
 
 #[cfg(test)]
