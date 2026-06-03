@@ -336,6 +336,36 @@ mod tests {
     }
 
     #[test]
+    fn parser_rejects_missing_required_flake() {
+        let error = parse_args(["--toplevel", ".#top"]).unwrap_err();
+
+        assert!(error.to_string().contains("missing --flake"));
+    }
+
+    #[test]
+    fn parser_rejects_flag_without_value() {
+        let error =
+            parse_args(["--flake", ".#host", "--toplevel", ".#top", "--action"]).unwrap_err();
+
+        assert!(error.to_string().contains("--action requires a value"));
+    }
+
+    #[test]
+    fn parser_no_capture_overrides_capture() -> Result<()> {
+        let options = parse_args([
+            "--flake",
+            ".#host",
+            "--toplevel",
+            ".#top",
+            "--capture",
+            "--no-capture",
+        ])?;
+
+        assert!(!options.capture);
+        Ok(())
+    }
+
+    #[test]
     fn parser_rejects_unknown_action() {
         let error = parse_args([
             "--flake",

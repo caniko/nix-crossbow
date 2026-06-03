@@ -153,6 +153,38 @@ mod tests {
     }
 
     #[test]
+    fn parse_executor_kind_accepts_known_kinds() -> Result<()> {
+        assert_eq!(
+            parse_executor_kind("native-builder")?,
+            ExecutorDescriptor::NativeBuilder {
+                builders: Vec::new(),
+            }
+        );
+        assert_eq!(
+            parse_executor_kind("skip")?,
+            ExecutorDescriptor::Skip {
+                reason: "crossbow check skipped".to_owned(),
+            }
+        );
+        assert_eq!(
+            parse_executor_kind("wasmtime")?,
+            ExecutorDescriptor::Wasmtime { configured: false }
+        );
+        assert_eq!(
+            parse_executor_kind("wine")?,
+            ExecutorDescriptor::Wine { configured: false }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parse_executor_kind_rejects_unknown_kind() {
+        let error = parse_executor_kind("qemu").unwrap_err();
+
+        assert!(error.to_string().contains("unknown executor `qemu`"));
+    }
+
+    #[test]
     fn declared_stub_executors_report_phase_1_error() {
         let wasmtime = plan_executor_check(
             &ExecutorDescriptor::Wasmtime { configured: false },

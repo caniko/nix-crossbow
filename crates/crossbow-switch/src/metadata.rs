@@ -409,6 +409,54 @@ mod tests {
     }
 
     #[test]
+    fn metadata_lookup_errors_include_offending_value() -> Result<()> {
+        let metadata = metadata()?;
+
+        let target = target_for(&metadata, "mips-linux").unwrap_err();
+        let zig = nix_system_to_zig_target(&metadata, "mips-linux").unwrap_err();
+        let cache_mode = cache_mode_for(&metadata, "mystery-cache").unwrap_err();
+
+        assert!(target.to_string().contains("mips-linux"));
+        assert!(zig.to_string().contains("mips-linux"));
+        assert!(cache_mode.to_string().contains("mystery-cache"));
+        assert!(cache_mode.to_string().contains("strict-cross"));
+        Ok(())
+    }
+
+    #[test]
+    fn build_optimization_profile_defaults_to_cache_first() -> Result<()> {
+        let metadata = metadata()?;
+
+        assert_eq!(
+            build_optimization_profile_for(&metadata, None)?.name,
+            "cache-first"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hardware_optimization_name_handles_absent_and_named_profiles() -> Result<()> {
+        let metadata = metadata()?;
+
+        assert_eq!(hardware_optimization_name(&metadata, None)?, None);
+        assert_eq!(
+            hardware_optimization_name(&metadata, Some(HardwareOptimization::Named("rockpro64")))?,
+            Some("rockpro64".to_owned())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn system_classifiers_follow_nix_system_suffixes() {
+        assert_eq!(os_of("x86_64-linux"), Some("linux"));
+        assert!(is_linux("x86_64-linux"));
+        assert!(is_darwin("aarch64-darwin"));
+        assert!(is_windows("x86_64-windows"));
+        assert!(is_wasm("wasm32-wasi"));
+        assert!(!is_linux("wasm32-wasi"));
+    }
+
+    #[test]
     fn incompatible_hardware_profile_reports_host_mismatch() -> Result<()> {
         let metadata = metadata()?;
         let error = optimized_host_platform(
