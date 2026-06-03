@@ -1,0 +1,493 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use anyhow::{Context, Result, anyhow, bail};
+
+/// Returns the canonical flags for a cache-shaped crossbow `nixos-rebuild`.
+///
+/// The empty `--builders` and `extra-platforms` values keep activation from
+/// falling back to remote builders or binfmt when a host-system path is missing
+/// from substituters. `always-allow-substitutes` lets the target substitute
+/// paths even when individual derivations set `allowSubstitutes = false`.
+/// `use_substitutes` adds `--use-substitutes`, which shifts transfer to the
+/// target's own substituters and is only appropriate when the target trusts the
+/// cache that has been populated before activation.
+pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
+    let mut flags = vec![
+        "--builders".to_string(),
+        String::new(),
+        "--option".to_string(),
+        "extra-platforms".to_string(),
+        String::new(),
+        "--option".to_string(),
+        "always-allow-substitutes".to_string(),
+        "true".to_string(),
+    ];
+
+    if use_substitutes {
+        flags.push("--use-substitutes".to_string());
+    }
+
+    flags
+}
+
+/// Returns the realised, non-derivation store paths that must be published for
+/// `toplevel`.
+///
+/// This first asks Nix for the deriver of `toplevel`, then queries the complete
+/// closure with outputs included. Empty lines, derivation paths, and paths that
+/// are not present on the local filesystem are omitted from the result.
+pub fn closure_to_publish(toplevel: &Path) -> Result<Vec<String>> {
+    let deriver = run_nix_store(&["--query", "--deriver"], Some(toplevel))
+        .with_context(|| format!("querying deriver for {}", toplevel.display()))?;
+    let deriver = first_non_empty_line(&deriver)
+        .ok_or_else(|| anyhow!("nix-store returned no deriver for {}", toplevel.display()))?;
+
+    let requisites = run_nix_store(
+        &["--query", "--requisites", "--include-outputs"],
+        Some(Path::new(&deriver)),
+    )
+    .with_context(|| format!("querying closure requisites for {deriver}"))?;
+
+    Ok(filter_publish_paths(&requisites))
+}
+
+/// Publishes store paths to a shared cache before activation.
+pub trait Publisher {
+    /// Makes every path present on the shared cache.
+    ///
+    /// Implementations should be effectively idempotent: paths already present
+    /// on the cache should be treated as a successful no-op. Returning `Err`
+    /// aborts before activation.
+    fn publish(&self, paths: &[String]) -> Result<()>;
+}
+
+/// Verifies that store paths are available from a shared cache before activation.
+pub trait Verifier {
+    /// Confirms every path is queryable on the cache.
+    ///
+    /// Return the paths that are still missing. Returning `Err`, or returning a
+    /// non-empty missing set, aborts before activation.
+    fn verify_present(&self, paths: &[String]) -> Result<Vec<String>>;
+}
+
+/// A verifier for callers that treat a successful publish as sufficient proof.
+pub struct TrustPublish;
+
+impl Verifier for TrustPublish {
+    fn verify_present(&self, _paths: &[String]) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+}
+
+/// Inputs for one cache-shaped NixOS rebuild.
+pub struct SwitchPlan<'a> {
+    /// Rebuild action, such as `switch`, `boot`, `test`, or `build`.
+    pub action: &'a str,
+    /// Flake reference passed to `nixos-rebuild --flake`.
+    pub flake_attr: &'a str,
+    /// Attribute built first to realise the system toplevel.
+    pub toplevel_attr: &'a str,
+    /// Optional SSH target passed to `nixos-rebuild --target-host`.
+    pub target_ssh: Option<&'a str>,
+    /// Adds `--use-substitutes` to the activation command.
+    pub use_substitutes: bool,
+    /// When false, skips publish and verify while keeping cache-shaped flags.
+    pub capture: bool,
+    /// Lets the caller decide when local activation should run under sudo.
+    pub sudo: bool,
+}
+
+/// Builds, optionally publishes and verifies, then runs a cache-shaped rebuild.
+///
+/// Build, publish, and verify failures all return `Err` before activation is
+/// attempted. The `build` action stops after capture, matching
+/// `nixos-rebuild build` semantics.
+pub fn run_cache_shaped_switch(
+    plan: &SwitchPlan<'_>,
+    publisher: &dyn Publisher,
+    verifier: &dyn Verifier,
+) -> Result<()> {
+    run_cache_shaped_switch_with_runner(plan, publisher, verifier, &ProcessRunner)
+}
+
+trait Runner {
+    fn build_toplevel(&self, attr: &str) -> Result<PathBuf>;
+    fn closure_to_publish(&self, toplevel: &Path) -> Result<Vec<String>>;
+    fn activate(&self, plan: &SwitchPlan<'_>) -> Result<()>;
+}
+
+struct ProcessRunner;
+
+impl Runner for ProcessRunner {
+    fn build_toplevel(&self, attr: &str) -> Result<PathBuf> {
+        let output = Command::new("nix")
+            .args(["build", "--no-link", "--print-out-paths", attr])
+            .output()
+            .with_context(|| format!("running nix build for {attr}"))?;
+
+        if !output.status.success() {
+            bail!(
+                "nix build failed for {attr}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        let stdout = String::from_utf8(output.stdout)
+            .with_context(|| format!("nix build produced non-UTF-8 output for {attr}"))?;
+        let path = first_non_empty_line(&stdout)
+            .ok_or_else(|| anyhow!("nix build printed no output path for {attr}"))?;
+
+        Ok(PathBuf::from(path))
+    }
+
+    fn closure_to_publish(&self, toplevel: &Path) -> Result<Vec<String>> {
+        closure_to_publish(toplevel)
+    }
+
+    fn activate(&self, plan: &SwitchPlan<'_>) -> Result<()> {
+        let mut command = if plan.sudo {
+            let mut command = Command::new("sudo");
+            command.arg("nixos-rebuild");
+            command
+        } else {
+            Command::new("nixos-rebuild")
+        };
+
+        command.arg(plan.action).arg("--flake").arg(plan.flake_attr);
+
+        if let Some(target_ssh) = plan.target_ssh {
+            command.arg("--target-host").arg(target_ssh);
+        }
+
+        command.args(cache_shaped_switch_flags(plan.use_substitutes));
+
+        let output = command.output().with_context(|| {
+            format!(
+                "running nixos-rebuild {} for {}",
+                plan.action, plan.flake_attr
+            )
+        })?;
+
+        if !output.status.success() {
+            bail!(
+                "nixos-rebuild {} failed for {}: {}",
+                plan.action,
+                plan.flake_attr,
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+
+        Ok(())
+    }
+}
+
+fn run_cache_shaped_switch_with_runner(
+    plan: &SwitchPlan<'_>,
+    publisher: &dyn Publisher,
+    verifier: &dyn Verifier,
+    runner: &dyn Runner,
+) -> Result<()> {
+    let toplevel = runner.build_toplevel(plan.toplevel_attr)?;
+
+    if plan.capture {
+        let paths = runner.closure_to_publish(&toplevel)?;
+        publisher.publish(&paths)?;
+        let missing = verifier.verify_present(&paths)?;
+
+        if !missing.is_empty() {
+            let preview = missing
+                .iter()
+                .take(5)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            bail!(
+                "{} paths missing from cache after publish: {}",
+                missing.len(),
+                preview
+            );
+        }
+    }
+
+    if plan.action == "build" {
+        return Ok(());
+    }
+
+    runner.activate(plan)
+}
+
+fn run_nix_store(args: &[&str], path: Option<&Path>) -> Result<String> {
+    let mut command = Command::new("nix-store");
+    command.args(args);
+
+    if let Some(path) = path {
+        command.arg(path);
+    }
+
+    let output = command.output().context("running nix-store")?;
+
+    if !output.status.success() {
+        bail!(
+            "nix-store {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+
+    String::from_utf8(output.stdout).context("nix-store produced non-UTF-8 output")
+}
+
+fn first_non_empty_line(output: &str) -> Option<String> {
+    output
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn filter_publish_paths(requisites: &str) -> Vec<String> {
+    requisites
+        .lines()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .filter(|path| !path.ends_with(".drv"))
+        .filter(|path| Path::new(path).exists())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+    use std::fs;
+    use std::rc::Rc;
+
+    struct FakePublisher {
+        result: Result<()>,
+        seen_paths: Rc<Cell<bool>>,
+    }
+
+    impl Publisher for FakePublisher {
+        fn publish(&self, paths: &[String]) -> Result<()> {
+            self.seen_paths.set(!paths.is_empty());
+            match &self.result {
+                Ok(()) => Ok(()),
+                Err(error) => bail!("{error}"),
+            }
+        }
+    }
+
+    struct FakeVerifier {
+        result: Result<Vec<String>>,
+    }
+
+    impl Verifier for FakeVerifier {
+        fn verify_present(&self, _paths: &[String]) -> Result<Vec<String>> {
+            match &self.result {
+                Ok(paths) => Ok(paths.clone()),
+                Err(error) => bail!("{error}"),
+            }
+        }
+    }
+
+    struct FakeRunner {
+        publish_paths: Vec<String>,
+        activated: Rc<Cell<bool>>,
+    }
+
+    impl Runner for FakeRunner {
+        fn build_toplevel(&self, _attr: &str) -> Result<PathBuf> {
+            Ok(PathBuf::from("/nix/store/example-system"))
+        }
+
+        fn closure_to_publish(&self, _toplevel: &Path) -> Result<Vec<String>> {
+            Ok(self.publish_paths.clone())
+        }
+
+        fn activate(&self, _plan: &SwitchPlan<'_>) -> Result<()> {
+            self.activated.set(true);
+            Ok(())
+        }
+    }
+
+    fn switch_plan(action: &str) -> SwitchPlan<'_> {
+        SwitchPlan {
+            action,
+            flake_attr: ".#host-crossbow",
+            toplevel_attr: ".#nixosConfigurations.host.config.system.build.toplevel",
+            target_ssh: Some("root@example"),
+            use_substitutes: true,
+            capture: true,
+            sudo: false,
+        }
+    }
+
+    #[test]
+    fn cache_shaped_switch_flags_without_substitutes_are_exact() {
+        assert_eq!(
+            cache_shaped_switch_flags(false),
+            vec![
+                "--builders",
+                "",
+                "--option",
+                "extra-platforms",
+                "",
+                "--option",
+                "always-allow-substitutes",
+                "true",
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_shaped_switch_flags_with_substitutes_are_exact() {
+        assert_eq!(
+            cache_shaped_switch_flags(true),
+            vec![
+                "--builders",
+                "",
+                "--option",
+                "extra-platforms",
+                "",
+                "--option",
+                "always-allow-substitutes",
+                "true",
+                "--use-substitutes",
+            ]
+        );
+    }
+
+    #[test]
+    fn filter_publish_paths_drops_blank_derivation_and_missing_paths() -> Result<()> {
+        let base =
+            std::env::temp_dir().join(format!("crossbow-switch-test-{}", std::process::id()));
+        fs::create_dir_all(&base)?;
+        let keep = base.join("keep-path");
+        fs::write(&keep, "present")?;
+
+        let output = format!(
+            "\n{}\n/nix/store/source.drv\n{}\n   \n",
+            keep.display(),
+            base.join("missing-path").display()
+        );
+
+        assert_eq!(
+            filter_publish_paths(&output),
+            vec![keep.display().to_string()]
+        );
+        fs::remove_dir_all(base)?;
+        Ok(())
+    }
+
+    #[test]
+    fn trust_publish_reports_no_missing_paths() -> Result<()> {
+        assert!(
+            TrustPublish
+                .verify_present(&["/nix/store/path".to_string()])?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn publish_error_aborts_before_activation() {
+        let activated = Rc::new(Cell::new(false));
+        let seen_paths = Rc::new(Cell::new(false));
+        let runner = FakeRunner {
+            publish_paths: vec!["/nix/store/path".to_string()],
+            activated: Rc::clone(&activated),
+        };
+        let publisher = FakePublisher {
+            result: Err(anyhow!("publish failed")),
+            seen_paths: Rc::clone(&seen_paths),
+        };
+        let verifier = FakeVerifier { result: Ok(vec![]) };
+
+        let error = run_cache_shaped_switch_with_runner(
+            &switch_plan("switch"),
+            &publisher,
+            &verifier,
+            &runner,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("publish failed"));
+        assert!(seen_paths.get());
+        assert!(!activated.get());
+    }
+
+    #[test]
+    fn verifier_error_aborts_before_activation() {
+        let activated = Rc::new(Cell::new(false));
+        let runner = FakeRunner {
+            publish_paths: vec!["/nix/store/path".to_string()],
+            activated: Rc::clone(&activated),
+        };
+        let publisher = FakePublisher {
+            result: Ok(()),
+            seen_paths: Rc::new(Cell::new(false)),
+        };
+        let verifier = FakeVerifier {
+            result: Err(anyhow!("verify failed")),
+        };
+
+        let error = run_cache_shaped_switch_with_runner(
+            &switch_plan("switch"),
+            &publisher,
+            &verifier,
+            &runner,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("verify failed"));
+        assert!(!activated.get());
+    }
+
+    #[test]
+    fn missing_paths_abort_before_activation() {
+        let activated = Rc::new(Cell::new(false));
+        let runner = FakeRunner {
+            publish_paths: vec!["/nix/store/path".to_string()],
+            activated: Rc::clone(&activated),
+        };
+        let publisher = FakePublisher {
+            result: Ok(()),
+            seen_paths: Rc::new(Cell::new(false)),
+        };
+        let verifier = FakeVerifier {
+            result: Ok(vec!["/nix/store/missing".to_string()]),
+        };
+
+        let error = run_cache_shaped_switch_with_runner(
+            &switch_plan("switch"),
+            &publisher,
+            &verifier,
+            &runner,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("1 paths missing from cache"));
+        assert!(!activated.get());
+    }
+
+    #[test]
+    fn build_action_does_not_activate() -> Result<()> {
+        let activated = Rc::new(Cell::new(false));
+        let runner = FakeRunner {
+            publish_paths: vec!["/nix/store/path".to_string()],
+            activated: Rc::clone(&activated),
+        };
+        let publisher = FakePublisher {
+            result: Ok(()),
+            seen_paths: Rc::new(Cell::new(false)),
+        };
+        let verifier = FakeVerifier { result: Ok(vec![]) };
+
+        run_cache_shaped_switch_with_runner(&switch_plan("build"), &publisher, &verifier, &runner)?;
+
+        assert!(!activated.get());
+        Ok(())
+    }
+}

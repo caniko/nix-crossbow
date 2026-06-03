@@ -248,15 +248,14 @@
         # shebang and fails ENOEXEC at run time on the host.
         # The wrapProgram/makeWrapper class is handled separately by the
         # narrowed `buildPackages` shadow below.
-        hostShellTrivialBuilders =
-          import (buildPkgs.path + "/pkgs/build-support/trivial-builders") {
-            inherit lib;
-            inherit (buildPkgs) config;
-            stdenv = buildPkgs.stdenv;
-            stdenvNoCC = buildPlatformStdenvNoCC;
-            runtimeShell = "${hostPkgs.bash}${hostPkgs.bash.shellPath}";
-            inherit (buildPkgs.pkgsBuildHost) jq shellcheck-minimal lndir;
-          };
+        hostShellTrivialBuilders = import (buildPkgs.path + "/pkgs/build-support/trivial-builders") {
+          inherit lib;
+          inherit (buildPkgs) config;
+          stdenv = buildPkgs.stdenv;
+          stdenvNoCC = buildPlatformStdenvNoCC;
+          runtimeShell = "${hostPkgs.bash}${hostPkgs.bash.shellPath}";
+          inherit (buildPkgs.pkgsBuildHost) jq shellcheck-minimal lndir;
+        };
       in
         hostPkgs
         // builtins.intersectAttrs buildAssemblyAttrNames buildPkgs
@@ -266,7 +265,8 @@
           # (runCommand, symlinkJoin, linkFarm, writeText*, formats,
           # replaceVars*, concatText*, applyPatches) keep their
           # build-platform construction.
-          inherit (hostShellTrivialBuilders)
+          inherit
+            (hostShellTrivialBuilders)
             writeScript
             writeScriptBin
             writeShellScript
@@ -293,9 +293,11 @@
           # stdenv-splicing contract for makeWrapper/runtimeShell/cc and produces
           # build-arch shebangs in host-arch wrappers. See Phase-2 for the
           # permanent fix; this is the unblock.
-          buildPackages = hostPkgs.buildPackages // {
-            inherit (buildPkgs) gettext;
-          };
+          buildPackages =
+            hostPkgs.buildPackages
+            // {
+              inherit (buildPkgs) gettext;
+            };
         }
     );
   };
