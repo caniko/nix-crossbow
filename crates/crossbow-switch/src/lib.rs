@@ -45,7 +45,7 @@ pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
 pub fn closure_to_publish(toplevel: &Path) -> Result<Vec<String>> {
     let deriver = run_nix_store(&["--query", "--deriver"], Some(toplevel))?;
     let deriver = first_non_empty_line(&deriver).ok_or_else(|| Error::NixStoreNoDeriver {
-        toplevel: toplevel.to_path_buf(),
+        toplevel: toplevel.display().to_string(),
     })?;
 
     let requisites = run_nix_store(
@@ -232,18 +232,23 @@ fn run_nix_store(args: &[&str], path: Option<&Path>) -> Result<String> {
         command.arg(path);
     }
 
-    let output = command
-        .output()
-        .map_err(|source| Error::NixStoreRun { source })?;
+    let args_display = args.join(" ");
+    let output = command.output().map_err(|source| Error::NixStoreRun {
+        args: args_display.clone(),
+        source,
+    })?;
 
     if !output.status.success() {
         return Err(Error::NixStoreFailed {
-            args: args.join(" "),
+            args: args_display,
             stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         });
     }
 
-    String::from_utf8(output.stdout).map_err(|source| Error::NixStoreUtf8 { source })
+    String::from_utf8(output.stdout).map_err(|source| Error::NixStoreUtf8 {
+        args: args_display,
+        source,
+    })
 }
 
 fn first_non_empty_line(output: &str) -> Option<String> {
@@ -491,7 +496,7 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(error.to_string().contains("1 paths missing from cache"));
+        assert!(error.to_string().contains("1 paths are missing from cache"));
         assert!(!activated.get());
     }
 

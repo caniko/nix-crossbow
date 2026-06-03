@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::string::FromUtf8Error;
 
 #[derive(Debug, thiserror::Error)]
@@ -46,10 +45,10 @@ pub enum Error {
     #[error("crossbow: unknown argument `{argument}`\n{usage}")]
     UnknownArgument { argument: String, usage: String },
 
-    #[error("crossbow: {flag} requires a value")]
+    #[error("crossbow: {flag} requires a value; pass it as `{flag} <value>`")]
     MissingArgumentValue { flag: String },
 
-    #[error("crossbow: missing {flag}")]
+    #[error("crossbow: missing {flag}; pass `{flag} <value>`")]
     MissingRequiredArgument { flag: String },
 
     #[error("crossbow: unsupported nixos-rebuild action `{action}`")]
@@ -60,82 +59,84 @@ pub enum Error {
     )]
     CaptureRequiresPublishCommand,
 
-    #[error("crossbow: no publisher configured")]
+    #[error("crossbow: no publisher configured; pass --publish-command when capture is enabled")]
     NoPublisherConfigured,
 
-    #[error("spawning command `{command}`")]
+    #[error("crossbow: failed to spawn shell command `{command}`")]
     CommandSpawn {
         command: String,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("command `{command}` did not open stdin")]
+    #[error("crossbow: shell command `{command}` did not open stdin for store paths")]
     CommandStdinUnavailable { command: String },
 
-    #[error("writing store paths to command `{command}`")]
+    #[error("crossbow: failed to write store paths to shell command `{command}`")]
     CommandWriteStdin {
         command: String,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("waiting for command `{command}`")]
+    #[error("crossbow: failed to wait for shell command `{command}`")]
     CommandWait {
         command: String,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("command `{command}` failed: {stderr}")]
+    #[error("crossbow: shell command `{command}` failed: {stderr}")]
     CommandFailed { command: String, stderr: String },
 
-    #[error("command `{command}` produced non-UTF-8 output")]
+    #[error("crossbow: shell command `{command}` produced non-UTF-8 output")]
     CommandUtf8 {
         command: String,
         #[source]
         source: FromUtf8Error,
     },
 
-    #[error("running nix build for {attr}")]
+    #[error("crossbow: failed to run `nix build --no-link --print-out-paths {attr}`")]
     NixBuildRun {
         attr: String,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("nix build failed for {attr}: {stderr}")]
+    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` failed: {stderr}")]
     NixBuildFailed { attr: String, stderr: String },
 
-    #[error("nix build produced non-UTF-8 output for {attr}")]
+    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` produced non-UTF-8 output")]
     NixBuildUtf8 {
         attr: String,
         #[source]
         source: FromUtf8Error,
     },
 
-    #[error("nix build printed no output path for {attr}")]
+    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` printed no output path")]
     NixBuildNoOutput { attr: String },
 
-    #[error("running nix-store")]
+    #[error("crossbow: failed to run `nix-store {args}`")]
     NixStoreRun {
+        args: String,
         #[source]
         source: std::io::Error,
     },
 
-    #[error("nix-store {args} failed: {stderr}")]
+    #[error("crossbow: `nix-store {args}` failed: {stderr}")]
     NixStoreFailed { args: String, stderr: String },
 
-    #[error("nix-store produced non-UTF-8 output")]
+    #[error("crossbow: `nix-store {args}` produced non-UTF-8 output")]
     NixStoreUtf8 {
+        args: String,
         #[source]
         source: FromUtf8Error,
     },
 
-    #[error("nix-store returned no deriver for {toplevel}")]
-    NixStoreNoDeriver { toplevel: PathBuf },
+    #[error("crossbow: `nix-store --query --deriver {toplevel}` returned no deriver")]
+    NixStoreNoDeriver { toplevel: String },
 
-    #[error("running nixos-rebuild {action} for {flake_attr}")]
+    #[error("crossbow: failed to run `nixos-rebuild {action} --flake {flake_attr}`")]
     NixosRebuildRun {
         action: String,
         flake_attr: String,
@@ -143,17 +144,19 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    #[error("nixos-rebuild {action} failed for {flake_attr}: {stderr}")]
+    #[error("crossbow: `nixos-rebuild {action} --flake {flake_attr}` failed: {stderr}")]
     NixosRebuildFailed {
         action: String,
         flake_attr: String,
         stderr: String,
     },
 
-    #[error("{count} paths missing from cache after publish: {preview}")]
+    #[error(
+        "crossbow: {count} paths are missing from cache after publish; first missing paths: {preview}"
+    )]
     MissingCachePaths { count: usize, preview: String },
 
-    #[error("crossbow metadata is invalid")]
+    #[error("crossbow: embedded metadata JSON is invalid")]
     MetadataJson {
         #[from]
         source: serde_json::Error,
