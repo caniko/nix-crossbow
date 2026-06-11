@@ -20,12 +20,28 @@ pub mod metadata;
 
 pub use error::{Error, Result};
 
-/// Returns the canonical flags for a cache-shaped crossbow `nixos-rebuild`.
+/// Returns the canonical Nix flags for cache-shaped Crossbow realisation.
 ///
 /// The empty `--builders` and `extra-platforms` values keep activation from
 /// falling back to remote builders or binfmt when a host-system path is missing
 /// from substituters. `always-allow-substitutes` lets the target substitute
 /// paths even when individual derivations set `allowSubstitutes = false`.
+#[must_use]
+pub fn cache_shaped_nix_flags() -> Vec<String> {
+    vec![
+        "--builders".to_string(),
+        String::new(),
+        "--option".to_string(),
+        "extra-platforms".to_string(),
+        String::new(),
+        "--option".to_string(),
+        "always-allow-substitutes".to_string(),
+        "true".to_string(),
+    ]
+}
+
+/// Returns the canonical flags for a cache-shaped crossbow `nixos-rebuild`.
+///
 /// `--no-reexec` keeps the build-host `nixos-rebuild` process in charge instead
 /// of re-executing `config.system.build.nixos-rebuild` from the target flake;
 /// the latter is host-platform code in cache-shaped Crossbow configs and would
@@ -35,17 +51,8 @@ pub use error::{Error, Result};
 /// cache that has been populated before activation.
 #[must_use]
 pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
-    let mut flags = vec![
-        "--no-reexec".to_string(),
-        "--builders".to_string(),
-        String::new(),
-        "--option".to_string(),
-        "extra-platforms".to_string(),
-        String::new(),
-        "--option".to_string(),
-        "always-allow-substitutes".to_string(),
-        "true".to_string(),
-    ];
+    let mut flags = vec!["--no-reexec".to_string()];
+    flags.extend(cache_shaped_nix_flags());
 
     if use_substitutes {
         flags.push("--use-substitutes".to_string());
@@ -68,7 +75,7 @@ pub fn cache_shaped_build_args(attr: &str) -> Vec<String> {
         "--print-out-paths".to_string(),
         attr.to_string(),
     ];
-    args.extend(cache_shaped_switch_flags(false));
+    args.extend(cache_shaped_nix_flags());
     args
 }
 
@@ -387,6 +394,23 @@ mod tests {
     }
 
     #[test]
+    fn cache_shaped_nix_flags_are_exact() {
+        assert_eq!(
+            cache_shaped_nix_flags(),
+            vec![
+                "--builders",
+                "",
+                "--option",
+                "extra-platforms",
+                "",
+                "--option",
+                "always-allow-substitutes",
+                "true",
+            ]
+        );
+    }
+
+    #[test]
     fn cache_shaped_switch_flags_without_substitutes_are_exact() {
         assert_eq!(
             cache_shaped_switch_flags(false),
@@ -432,7 +456,6 @@ mod tests {
                 "--no-link",
                 "--print-out-paths",
                 ".#host",
-                "--no-reexec",
                 "--builders",
                 "",
                 "--option",
