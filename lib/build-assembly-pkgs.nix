@@ -79,13 +79,44 @@
   # scaffolding produced via the swapped helpers gets `system = build`.
   mkBuildAssemblyPkgsModule = {
     nixpkgs,
+    build,
     host,
     buildPkgs,
+    crossPackageAttrNames ? [],
   }: {
     config,
     lib,
     ...
-  }: {
+  }: let
+    crossPkgs = import nixpkgs {
+      localSystem = {system = build;};
+      crossSystem = {system = host;};
+      inherit (config.nixpkgs) config overlays;
+    };
+    existingCrossPackageAttrNames = lib.filter (name: builtins.hasAttr name crossPkgs) crossPackageAttrNames;
+    missingCrossPackageAttrNames = lib.subtractLists existingCrossPackageAttrNames crossPackageAttrNames;
+    invalidCrossPackageAttrNames =
+      lib.filter (
+        name: let
+          package = crossPkgs.${name};
+        in
+          !(package ? stdenv)
+          || package.stdenv.buildPlatform.system == package.stdenv.hostPlatform.system
+      )
+      existingCrossPackageAttrNames;
+    crossPackageShadow = lib.genAttrs existingCrossPackageAttrNames (name: crossPkgs.${name});
+  in {
+    assertions = [
+      {
+        assertion = missingCrossPackageAttrNames == [];
+        message = "crossbow: requested cross package attributes are missing from crossbowCrossPkgs: ${lib.concatStringsSep ", " missingCrossPackageAttrNames}";
+      }
+      {
+        assertion = invalidCrossPackageAttrNames == [];
+        message = "crossbow: requested cross package attributes must be derivations built by a real cross package set: ${lib.concatStringsSep ", " invalidCrossPackageAttrNames}";
+      }
+    ];
+
     # Construct host pkgs ourselves from `nixpkgs` (NixOS would otherwise do
     # the same import internally for `_module.args.pkgs`'s default; with our
     # `mkForce` override that default is never forced). Net cost: still one
@@ -276,6 +307,7 @@
             ;
         }
         // installerToolsShadow
+        // crossPackageShadow
         // {
           # `nixos/modules/system/activation/top-level.nix:58` builds
           # `system.build.toplevel` directly via `pkgs.stdenvNoCC.mkDerivation`,

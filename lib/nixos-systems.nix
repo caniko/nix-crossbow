@@ -64,6 +64,7 @@
     specialArgs ? {},
     hardwareOptimization ? null,
     buildOptimization ? buildOptimizationProfiles.cache-first,
+    crossPackageAttrNames ? [],
     # Pre-realised build-platform pkgs. Defaults to nixpkgs.legacyPackages, the
     # cached lazyAttrs flake-parts already builds — no second `import nixpkgs`.
     buildPkgs ? nixpkgs.legacyPackages.${build},
@@ -71,7 +72,7 @@
     cacheMode = cacheModeFor "cache-shaped-with-cross-overrides";
     buildProfile = buildOptimizationProfileFor buildOptimization;
     profileName = hardwareOptimizationName hardwareOptimization;
-    assemblyPkgsModule = mkBuildAssemblyPkgsModule {inherit nixpkgs host buildPkgs;};
+    assemblyPkgsModule = mkBuildAssemblyPkgsModule {inherit nixpkgs build host buildPkgs crossPackageAttrNames;};
   in
     nixpkgs.lib.nixosSystem {
       # Evaluate as a single-platform native host system: pkgs has cache-shape

@@ -38,6 +38,30 @@
             exec alejandra "$@"
           '';
         };
+        crossPackageProbeHost =
+          if system == "x86_64-linux"
+          then "aarch64-linux"
+          else "x86_64-linux";
+        crossPackageProbe = inputs.self.lib.mkNixosSwitchSystem {
+          build = system;
+          host = crossPackageProbeHost;
+          crossPackageAttrNames = ["hello"];
+          modules = [
+            ({
+              lib,
+              pkgs,
+              ...
+            }: {
+              options.crossbowProbe.package = lib.mkOption {
+                type = lib.types.raw;
+              };
+              config = {
+                system.stateVersion = "25.11";
+                crossbowProbe.package = pkgs.hello;
+              };
+            })
+          ];
+        };
       in {
         inherit formatter;
 
@@ -123,6 +147,8 @@
               then "1"
               else "0"
             }" = "0"
+            test "${crossPackageProbe.config.crossbowProbe.package.stdenv.buildPlatform.system}" = "${system}"
+            test "${crossPackageProbe.config.crossbowProbe.package.stdenv.hostPlatform.system}" = "${crossPackageProbeHost}"
             touch $out
           '';
 
