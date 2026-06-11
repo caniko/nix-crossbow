@@ -26,12 +26,17 @@ pub use error::{Error, Result};
 /// falling back to remote builders or binfmt when a host-system path is missing
 /// from substituters. `always-allow-substitutes` lets the target substitute
 /// paths even when individual derivations set `allowSubstitutes = false`.
+/// `--no-reexec` keeps the build-host `nixos-rebuild` process in charge instead
+/// of re-executing `config.system.build.nixos-rebuild` from the target flake;
+/// the latter is host-platform code in cache-shaped Crossbow configs and would
+/// run under binfmt on the build host.
 /// `use_substitutes` adds `--use-substitutes`, which shifts transfer to the
 /// target's own substituters and is only appropriate when the target trusts the
 /// cache that has been populated before activation.
 #[must_use]
 pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
     let mut flags = vec![
+        "--no-reexec".to_string(),
         "--builders".to_string(),
         String::new(),
         "--option".to_string(),
@@ -386,6 +391,7 @@ mod tests {
         assert_eq!(
             cache_shaped_switch_flags(false),
             vec![
+                "--no-reexec",
                 "--builders",
                 "",
                 "--option",
@@ -403,6 +409,7 @@ mod tests {
         assert_eq!(
             cache_shaped_switch_flags(true),
             vec![
+                "--no-reexec",
                 "--builders",
                 "",
                 "--option",
@@ -425,6 +432,7 @@ mod tests {
                 "--no-link",
                 "--print-out-paths",
                 ".#host",
+                "--no-reexec",
                 "--builders",
                 "",
                 "--option",
