@@ -100,6 +100,7 @@
               crossSystem = {system = host;};
               inherit (config.nixpkgs) config overlays;
             });
+            _module.args.crossbowBuildPkgs = lib.mkOverride 999 buildPkgs;
 
             nixpkgs.hostPlatform = lib.mkForce host;
 
