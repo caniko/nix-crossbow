@@ -4,7 +4,7 @@ use serde::Deserialize;
 
 use crate::{Error, Result};
 
-const METADATA_JSON: &str = include_str!("../../../data/crossbow-metadata.json");
+const METADATA_JSON: &str = include_str!("../data/crossbow-metadata.json");
 
 /// Complete Crossbow metadata loaded from `data/crossbow-metadata.json`.
 #[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
