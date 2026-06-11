@@ -145,6 +145,8 @@ pub struct SwitchPlan<'a> {
     pub capture: bool,
     /// Lets the caller decide when local activation should run under sudo.
     pub sudo: bool,
+    /// Lets the caller decide when remote activation should run under sudo.
+    pub remote_sudo: bool,
 }
 
 /// Builds, optionally publishes and verifies, then runs a cache-shaped rebuild.
@@ -215,6 +217,10 @@ impl Runner for ProcessRunner {
 
         if let Some(target_ssh) = plan.target_ssh {
             command.arg("--target-host").arg(target_ssh);
+        }
+
+        if plan.remote_sudo {
+            command.arg("--use-remote-sudo");
         }
 
         command.args(cache_shaped_switch_flags(plan.use_substitutes));
@@ -390,6 +396,7 @@ mod tests {
             use_substitutes: true,
             capture: true,
             sudo: false,
+            remote_sudo: false,
         }
     }
 

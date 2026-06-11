@@ -22,6 +22,8 @@ pub struct CliOptions {
     pub capture: bool,
     /// Whether local activation should run `nixos-rebuild` through `sudo`.
     pub sudo: bool,
+    /// Whether remote activation should run through sudo on the target host.
+    pub remote_sudo: bool,
     /// Shell command that receives store paths on stdin and publishes them.
     pub publish_command: Option<String>,
     /// Shell command that receives store paths on stdin and prints missing paths.
@@ -31,7 +33,7 @@ pub struct CliOptions {
 /// Returns the command-line usage string.
 #[must_use]
 pub fn usage() -> &'static str {
-    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--capture --publish-command <command>] [--verify-command <command>] [--sudo]"
+    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo]"
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -52,6 +54,7 @@ where
     let mut use_substitutes = false;
     let mut capture = false;
     let mut sudo = false;
+    let mut remote_sudo = false;
     let mut publish_command = None;
     let mut verify_command = None;
 
@@ -76,6 +79,7 @@ where
                 target_ssh = Some(required_value(&args, index, "--target-host")?.to_owned());
             }
             "--use-substitutes" => use_substitutes = true,
+            "--use-remote-sudo" => remote_sudo = true,
             "--capture" => capture = true,
             "--no-capture" => capture = false,
             "--sudo" => sudo = true,
@@ -124,6 +128,7 @@ where
         use_substitutes,
         capture,
         sudo,
+        remote_sudo,
         publish_command,
         verify_command,
     })
@@ -161,6 +166,7 @@ pub fn run_with_options(options: &CliOptions) -> Result<()> {
         use_substitutes: options.use_substitutes,
         capture: options.capture,
         sudo: options.sudo,
+        remote_sudo: options.remote_sudo,
     };
 
     let noop_publisher = NoopPublisher;
@@ -297,6 +303,7 @@ mod tests {
         assert_eq!(options.flake_attr, ".#host");
         assert!(!options.capture);
         assert!(!options.use_substitutes);
+        assert!(!options.remote_sudo);
         Ok(())
     }
 
@@ -312,6 +319,7 @@ mod tests {
             "--target-host",
             "root@example",
             "--use-substitutes",
+            "--use-remote-sudo",
             "--capture",
             "--publish-command",
             "cat >/tmp/paths",
@@ -322,6 +330,7 @@ mod tests {
         assert_eq!(options.action, "build");
         assert_eq!(options.target_ssh.as_deref(), Some("root@example"));
         assert!(options.use_substitutes);
+        assert!(options.remote_sudo);
         assert!(options.capture);
         assert_eq!(options.publish_command.as_deref(), Some("cat >/tmp/paths"));
         Ok(())
