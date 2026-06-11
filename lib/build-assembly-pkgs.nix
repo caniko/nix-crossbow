@@ -172,15 +172,16 @@
           # that calling convention while injecting build-platform helpers,
           # take the user's args at the call site and feed them through
           # callPackage merged with our overrides.
-          makeInitrdNG = userArgs:
-            hostPkgs.callPackage
-            (hostPkgs.path + "/pkgs/build-support/kernel/make-initrd-ng.nix")
-            ({
-                stdenvNoCC = buildPlatformStdenvNoCC;
-                inherit (buildPkgs) cpio ubootTools makeInitrdNGTool binutils;
-                pkgsBuildHost = buildPkgs;
-              }
-              // userArgs);
+          makeInitrdNG = userArgs: let
+            makeInitrdNGPath = hostPkgs.path + "/pkgs/build-support/kernel/make-initrd-ng.nix";
+            acceptedArgs = builtins.functionArgs (import makeInitrdNGPath);
+            overrides = lib.filterAttrs (name: _: builtins.hasAttr name acceptedArgs) {
+              stdenvNoCC = buildPlatformStdenvNoCC;
+              inherit (buildPkgs) cpio ubootTools makeInitrdNGTool binutils;
+              pkgsBuildHost = buildPkgs;
+            };
+          in
+            hostPkgs.callPackage makeInitrdNGPath (overrides // userArgs);
 
           # `makeModulesClosure` shrinks a kernel modules tree using `kmod`
           # (modprobe) and `nuke-refs`. `kmod` reads ELF metadata
