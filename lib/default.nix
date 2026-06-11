@@ -33,6 +33,7 @@
         (buildOptimization)
         buildOptimizationProfiles
         buildOptimizationProfileFor
+        selectOptimizedPkgs
         applyBuildOptimization
         ;
       inherit

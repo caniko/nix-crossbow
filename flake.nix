@@ -103,6 +103,22 @@
               hardwareOptimization = "rockpro64";
             }).gcc.tune}" = "cortex-a72.cortex-a53"
             test "${
+              (inputs.self.lib.selectOptimizedPkgs {
+                enable = false;
+                inherit pkgs;
+              }).pkgs.stdenv.hostPlatform.system
+            }" = "${pkgs.stdenv.hostPlatform.system}"
+            test "${
+              (inputs.self.lib.selectOptimizedPkgs {
+                enable = true;
+                inherit pkgs;
+                crossbowCrossPkgs = import inputs.nixpkgs {
+                  localSystem = {system = system;};
+                  crossSystem = {system = "aarch64-linux";};
+                };
+              }).pkgs.stdenv.hostPlatform.system
+            }" = "aarch64-linux"
+            test "${
               if inputs.self.lib.mkNixosStrictCrossSystem == inputs.self.lib.mkNixosSwitchSystem
               then "1"
               else "0"

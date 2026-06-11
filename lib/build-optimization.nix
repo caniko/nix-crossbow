@@ -64,6 +64,35 @@
 
   appendList = oldValue: values: oldValue ++ (lib.filter (v: !(lib.elem v oldValue)) values);
 
+  selectOptimizedPkgs = {
+    enable,
+    pkgs,
+    crossbowCrossPkgs ? null,
+    consumerName ? "crossbow optimized package selection",
+  }: let
+    useCrossPkgs = enable && crossbowCrossPkgs != null;
+    selectedPkgs =
+      if useCrossPkgs
+      then crossbowCrossPkgs
+      else pkgs;
+  in {
+    inherit selectedPkgs useCrossPkgs;
+    pkgs = selectedPkgs;
+    assertions = lib.optional useCrossPkgs {
+      assertion =
+        crossbowCrossPkgs.stdenv.buildPlatform.system
+        != crossbowCrossPkgs.stdenv.hostPlatform.system;
+      message = ''
+        ${consumerName}: crossbowCrossPkgs is configured natively
+        (buildPlatform == hostPlatform == ${crossbowCrossPkgs.stdenv.hostPlatform.system}).
+        Packages selected through crossbowCrossPkgs must be cross-compiled,
+        not emulated. Either disable the optimized package selection for this
+        consumer, or pass a crossbowCrossPkgs whose buildPlatform differs from
+        hostPlatform.
+      '';
+    };
+  };
+
   applyBuildOptimization = {
     pkgs,
     profile ? buildOptimizationProfiles.cache-first,
@@ -206,6 +235,7 @@ in {
   inherit
     buildOptimizationProfiles
     buildOptimizationProfileFor
+    selectOptimizedPkgs
     applyBuildOptimization
     ;
 }
