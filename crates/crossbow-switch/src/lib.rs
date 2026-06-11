@@ -49,6 +49,24 @@ pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
     flags
 }
 
+/// Returns the canonical flags for the initial toplevel realisation.
+///
+/// These mirror the cache-shaped switch flags that prevent activation from
+/// using remote builders or binfmt. The build phase needs the same guard:
+/// otherwise a cache miss on a binfmt-enabled build host silently becomes a
+/// local emulated build before Crossbow can publish or verify anything.
+#[must_use]
+pub fn cache_shaped_build_args(attr: &str) -> Vec<String> {
+    let mut args = vec![
+        "build".to_string(),
+        "--no-link".to_string(),
+        "--print-out-paths".to_string(),
+        attr.to_string(),
+    ];
+    args.extend(cache_shaped_switch_flags(false));
+    args
+}
+
 /// Returns the realised, non-derivation store paths that must be published for
 /// `toplevel`.
 ///
@@ -140,13 +158,15 @@ struct ProcessRunner;
 
 impl Runner for ProcessRunner {
     fn build_toplevel(&self, attr: &str) -> Result<PathBuf> {
-        let output = Command::new("nix")
-            .args(["build", "--no-link", "--print-out-paths", attr])
-            .output()
-            .map_err(|source| Error::NixBuildRun {
-                attr: attr.to_owned(),
-                source,
-            })?;
+        let args = cache_shaped_build_args(attr);
+        let output =
+            Command::new("nix")
+                .args(&args)
+                .output()
+                .map_err(|source| Error::NixBuildRun {
+                    attr: attr.to_owned(),
+                    source,
+                })?;
 
         if !output.status.success() {
             return Err(Error::NixBuildFailed {
@@ -392,6 +412,27 @@ mod tests {
                 "always-allow-substitutes",
                 "true",
                 "--use-substitutes",
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_shaped_build_args_disable_builders_and_extra_platforms() {
+        assert_eq!(
+            cache_shaped_build_args(".#host"),
+            vec![
+                "build",
+                "--no-link",
+                "--print-out-paths",
+                ".#host",
+                "--builders",
+                "",
+                "--option",
+                "extra-platforms",
+                "",
+                "--option",
+                "always-allow-substitutes",
+                "true",
             ]
         );
     }
