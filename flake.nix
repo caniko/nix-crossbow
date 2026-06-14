@@ -62,6 +62,29 @@
             })
           ];
         };
+        crossPackageProbeRequirements = inputs.self.lib.mkNixosSwitchRequirements {
+          buildPkgs = pkgs;
+          host = crossPackageProbeHost;
+          modules = [
+            {
+              boot.loader.grub.enable = false;
+              fileSystems."/".device = "nodev";
+              fileSystems."/".fsType = "tmpfs";
+              system.stateVersion = "25.11";
+            }
+          ];
+        };
+        crossPackageProbeNative = inputs.self.lib.mkNixosNativeSubstitutedSystem {
+          host = crossPackageProbeHost;
+          modules = [
+            {
+              boot.loader.grub.enable = false;
+              fileSystems."/".device = "nodev";
+              fileSystems."/".fsType = "tmpfs";
+              system.stateVersion = "25.11";
+            }
+          ];
+        };
       in {
         inherit formatter;
 
@@ -149,6 +172,12 @@
             }" = "0"
             test "${crossPackageProbe.config.crossbowProbe.package.stdenv.buildPlatform.system}" = "${system}"
             test "${crossPackageProbe.config.crossbowProbe.package.stdenv.hostPlatform.system}" = "${crossPackageProbeHost}"
+            test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/roots
+            test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/drvs
+            test -e ${crossPackageProbeRequirements}/roots
+            test -e ${crossPackageProbeRequirements}/drvs
+            grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel}" ${crossPackageProbeRequirements}/roots >/dev/null
+            grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel.drvPath}" ${crossPackageProbeRequirements}/drvs >/dev/null
             touch $out
           '';
 

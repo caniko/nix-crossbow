@@ -54,6 +54,7 @@
       inherit
         (nixosSystems)
         mkNixosSwitchSystem
+        mkNixosSwitchRequirements
         mkNixosStrictCrossSystem
         mkNixosNativeSubstitutedSystem
         mkNixosCrossSystem

@@ -56,6 +56,53 @@
     ];
   };
 
+  mkRequirementsArtifact = {
+    buildPkgs,
+    roots ? [],
+  }:
+    buildPkgs.runCommand "crossbow-switch-requirements" {} ''
+      mkdir -p "$out/nix-support"
+      cat > "$out/roots" <<'EOF'
+      ${lib.concatStringsSep "\n" (map builtins.unsafeDiscardStringContext roots)}
+      EOF
+      cat > "$out/drvs" <<'EOF'
+      ${lib.concatStringsSep "\n" (map (root: builtins.unsafeDiscardStringContext root.drvPath) roots)}
+      EOF
+      cp "$out/roots" "$out/nix-support/crossbow-requirements"
+      cp "$out/drvs" "$out/nix-support/crossbow-requirement-drvs"
+    '';
+
+  mkEmptyNixosSwitchRequirements = {buildPkgs}: mkRequirementsArtifact {inherit buildPkgs;};
+
+  mkNixosSwitchRequirements = {
+    nixpkgs ? inputs.nixpkgs,
+    host,
+    modules,
+    specialArgs ? {},
+    hardwareOptimization ? null,
+    buildOptimization ? buildOptimizationProfiles.cache-first,
+    buildPkgs ? null,
+  }: let
+    nativeSystem = mkNixosNativeSubstitutedSystem {
+      inherit
+        nixpkgs
+        host
+        modules
+        specialArgs
+        hardwareOptimization
+        buildOptimization
+        ;
+    };
+    artifactPkgs =
+      if buildPkgs != null
+      then buildPkgs
+      else nativeSystem.pkgs;
+  in
+    mkRequirementsArtifact {
+      buildPkgs = artifactPkgs;
+      roots = [nativeSystem.config.system.build.toplevel];
+    };
+
   mkNixosSwitchSystem = {
     nixpkgs ? inputs.nixpkgs,
     build,
@@ -103,6 +150,10 @@
             _module.args.crossbowBuildPkgs = lib.mkOverride 999 buildPkgs;
 
             nixpkgs.hostPlatform = lib.mkForce host;
+
+            system.build.crossbowRequirements = lib.mkDefault (
+              mkEmptyNixosSwitchRequirements {inherit buildPkgs;}
+            );
 
             system.systemBuilderCommands = mkCrossbowMetadataCommands {
               inherit cacheMode build buildProfile profileName;
@@ -207,6 +258,7 @@
 in {
   inherit
     mkNixosSwitchSystem
+    mkNixosSwitchRequirements
     mkNixosStrictCrossSystem
     mkNixosNativeSubstitutedSystem
     mkNixosCrossSystem
