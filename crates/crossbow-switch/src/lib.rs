@@ -91,15 +91,25 @@ pub fn cache_shaped_build_args(attr: &str) -> Vec<String> {
 /// This first asks Nix for the deriver of `toplevel`, then queries the complete
 /// closure with outputs included. Empty lines, derivation paths, and paths that
 /// are not present on the local filesystem are omitted from the result.
+///
+/// When the deriver has been garbage-collected (or the path was imported), Nix
+/// returns `"unknown-deriver"`. In that case the toplevel path is queried
+/// directly for its runtime closure instead.
 pub fn closure_to_publish(toplevel: &Path) -> Result<Vec<String>> {
     let deriver = run_nix_store(&["--query", "--deriver"], Some(toplevel))?;
     let deriver = first_non_empty_line(&deriver).ok_or_else(|| Error::NixStoreNoDeriver {
         toplevel: toplevel.display().to_string(),
     })?;
 
+    let query_target = if deriver == "unknown-deriver" {
+        toplevel
+    } else {
+        Path::new(&deriver)
+    };
+
     let requisites = run_nix_store(
         &["--query", "--requisites", "--include-outputs"],
-        Some(Path::new(&deriver)),
+        Some(query_target),
     )?;
 
     Ok(filter_publish_paths(&requisites))
