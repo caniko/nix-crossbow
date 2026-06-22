@@ -255,6 +255,16 @@ pub enum Error {
         toplevel: String,
     },
 
+    /// Reading a Nix store file (e.g. from a `crossbowRequirements` artifact) failed.
+    #[error("crossbow: failed to read `{file}`")]
+    NixStoreRead {
+        /// File path that failed to read.
+        file: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Spawning `nixos-rebuild` failed.
     #[error("crossbow: failed to run `nixos-rebuild {action} --flake {flake_attr}`")]
     NixosRebuildRun {

@@ -17,8 +17,11 @@ pub mod error;
 pub mod executor;
 /// Typed access to Crossbow's shared target/profile metadata.
 pub mod metadata;
+/// Parsed Crossbow requirements artifact (roots, drvs, fingerprint).
+pub mod requirements;
 
 pub use error::{Error, Result};
+pub use requirements::RequirementsArtifact;
 
 /// Returns the canonical Nix flags for cache-shaped Crossbow realisation.
 ///

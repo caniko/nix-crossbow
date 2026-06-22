@@ -59,7 +59,10 @@
   mkRequirementsArtifact = {
     buildPkgs,
     roots ? [],
-  }:
+  }: let
+    fingerprint = builtins.hashString "sha256"
+      (lib.concatStringsSep "\n" (map builtins.unsafeDiscardStringContext roots));
+  in
     buildPkgs.runCommand "crossbow-switch-requirements" {} ''
       mkdir -p "$out/nix-support"
       cat > "$out/roots" <<'EOF'
@@ -68,8 +71,12 @@
       cat > "$out/drvs" <<'EOF'
       ${lib.concatStringsSep "\n" (map (root: builtins.unsafeDiscardStringContext root.drvPath) roots)}
       EOF
+      cat > "$out/fingerprint" <<'EOF'
+      ${fingerprint}
+      EOF
       cp "$out/roots" "$out/nix-support/crossbow-requirements"
       cp "$out/drvs" "$out/nix-support/crossbow-requirement-drvs"
+      cp "$out/fingerprint" "$out/nix-support/crossbow-requirements-fingerprint"
     '';
 
   mkEmptyNixosSwitchRequirements = {buildPkgs}: mkRequirementsArtifact {inherit buildPkgs;};
