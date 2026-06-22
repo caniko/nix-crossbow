@@ -59,9 +59,14 @@
   mkRequirementsArtifact = {
     buildPkgs,
     roots ? [],
+    rootLabels ? [],
   }: let
     fingerprint = builtins.hashString "sha256"
       (lib.concatStringsSep "\n" (map builtins.unsafeDiscardStringContext roots));
+    rootFingerprints =
+      if roots == [] || rootLabels == []
+      then []
+      else map (root: builtins.hashString "sha256" (builtins.unsafeDiscardStringContext root)) roots;
   in
     buildPkgs.runCommand "crossbow-switch-requirements" {} ''
       mkdir -p "$out/nix-support"
@@ -74,6 +79,16 @@
       cat > "$out/fingerprint" <<'EOF'
       ${fingerprint}
       EOF
+      ${lib.optionalString (rootLabels != []) ''
+        cat > "$out/root-labels" <<'EOF'
+        ${lib.concatStringsSep "\n" rootLabels}
+        EOF
+      ''}
+      ${lib.optionalString (rootFingerprints != []) ''
+        cat > "$out/root-fingerprints" <<'EOF'
+        ${lib.concatStringsSep "\n" rootFingerprints}
+        EOF
+      ''}
       cp "$out/roots" "$out/nix-support/crossbow-requirements"
       cp "$out/drvs" "$out/nix-support/crossbow-requirement-drvs"
       cp "$out/fingerprint" "$out/nix-support/crossbow-requirements-fingerprint"
@@ -89,6 +104,7 @@
     hardwareOptimization ? null,
     buildOptimization ? buildOptimizationProfiles.cache-first,
     buildPkgs ? null,
+    crossPackageAttrNames ? [],
   }: let
     nativeSystem = mkNixosNativeSubstitutedSystem {
       inherit
@@ -104,10 +120,26 @@
       if buildPkgs != null
       then buildPkgs
       else nativeSystem.pkgs;
+    # Cross-compiled packages as additional roots. Only computed when
+    # buildPkgs is present (cross-compilation needs a build platform).
+    hasCrossPackages = buildPkgs != null && crossPackageAttrNames != [];
+    crossPkgs =
+      if hasCrossPackages
+      then import nixpkgs {
+        localSystem = {system = artifactPkgs.stdenv.buildPlatform.system;};
+        crossSystem = {system = host;};
+        inherit (nativeSystem.config.nixpkgs) config overlays;
+      }
+      else {};
+    crossPackageLabels = lib.filter (name: crossPkgs ? ${name}) crossPackageAttrNames;
+    crossPackageRoots = map (name: crossPkgs.${name}) crossPackageLabels;
+    allRoots = [nativeSystem.config.system.build.toplevel] ++ crossPackageRoots;
+    allLabels = ["system-toplevel"] ++ crossPackageLabels;
   in
     mkRequirementsArtifact {
       buildPkgs = artifactPkgs;
-      roots = [nativeSystem.config.system.build.toplevel];
+      roots = allRoots;
+      rootLabels = allLabels;
     };
 
   mkNixosSwitchSystem = {

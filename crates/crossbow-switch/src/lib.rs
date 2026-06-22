@@ -19,9 +19,12 @@ pub mod executor;
 pub mod metadata;
 /// Parsed Crossbow requirements artifact (roots, drvs, fingerprint).
 pub mod requirements;
+/// Generic prepared-state persistence for prerequisite roots.
+pub mod state;
 
 pub use error::{Error, Result};
-pub use requirements::RequirementsArtifact;
+pub use requirements::{RequirementsArtifact, LabeledRoot, RootDiff, diff_roots, label_roots};
+pub use state::{PreparedState, StateStatus, load_prepared_state, save_prepared_state, state_file_path, state_to_labeled_roots};
 
 /// Returns the canonical Nix flags for cache-shaped Crossbow realisation.
 ///
