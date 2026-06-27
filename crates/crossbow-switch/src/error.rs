@@ -117,6 +117,13 @@ pub enum Error {
         action: String,
     },
 
+    /// An invalid value was passed to `--max-jobs`.
+    #[error("crossbow: invalid --max-jobs value `{value}`; expected a positive integer")]
+    InvalidMaxJobs {
+        /// Invalid value passed to --max-jobs.
+        value: String,
+    },
+
     /// Capture mode was requested without a publication command.
     #[error(
         "crossbow: --capture requires --publish-command; provide the cache publication command or use --no-capture"

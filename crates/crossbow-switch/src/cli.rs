@@ -28,12 +28,14 @@ pub struct CliOptions {
     pub publish_command: Option<String>,
     /// Shell command that receives store paths on stdin and prints missing paths.
     pub verify_command: Option<String>,
+    /// --max-jobs value for nix build, caps build parallelism.
+    pub max_jobs: Option<u32>,
 }
 
 /// Returns the command-line usage string.
 #[must_use]
 pub fn usage() -> &'static str {
-    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo]"
+    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo] [--max-jobs <N>]"
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -57,6 +59,7 @@ where
     let mut remote_sudo = false;
     let mut publish_command = None;
     let mut verify_command = None;
+    let mut max_jobs = None;
 
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let mut index = 0;
@@ -91,6 +94,13 @@ where
             "--verify-command" => {
                 index += 1;
                 verify_command = Some(required_value(&args, index, "--verify-command")?.to_owned());
+            }
+            "--max-jobs" => {
+                index += 1;
+                let raw = required_value(&args, index, "--max-jobs")?;
+                max_jobs = Some(raw.parse::<u32>().map_err(|_| Error::InvalidMaxJobs {
+                    value: raw.to_owned(),
+                })?);
             }
             "-h" | "--help" => {
                 return Err(Error::UnknownArgument {
@@ -131,6 +141,7 @@ where
         remote_sudo,
         publish_command,
         verify_command,
+        max_jobs,
     })
 }
 
@@ -167,6 +178,7 @@ pub fn run_with_options(options: &CliOptions) -> Result<()> {
         capture: options.capture,
         sudo: options.sudo,
         remote_sudo: options.remote_sudo,
+        max_jobs: options.max_jobs,
     };
 
     let noop_publisher = NoopPublisher;
