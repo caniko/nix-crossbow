@@ -73,14 +73,20 @@ pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
 /// using remote builders or binfmt. The build phase needs the same guard:
 /// otherwise a cache miss on a binfmt-enabled build host silently becomes a
 /// local emulated build before Crossbow can publish or verify anything.
+/// `max_jobs`, when set, is passed as `--max-jobs N` to cap build parallelism
+/// on memory-constrained build hosts.
 #[must_use]
-pub fn cache_shaped_build_args(attr: &str) -> Vec<String> {
+pub fn cache_shaped_build_args(attr: &str, max_jobs: Option<u32>) -> Vec<String> {
     let mut args = vec![
         "build".to_string(),
         "--no-link".to_string(),
         "--print-out-paths".to_string(),
         attr.to_string(),
     ];
+    if let Some(jobs) = max_jobs {
+        args.push("--max-jobs".to_string());
+        args.push(jobs.to_string());
+    }
     args.extend(cache_shaped_nix_flags());
     args
 }
@@ -163,6 +169,10 @@ pub struct SwitchPlan<'a> {
     pub sudo: bool,
     /// Lets the caller decide when remote activation should run under sudo.
     pub remote_sudo: bool,
+    /// When set, passed to `nix build` as `--max-jobs` to cap build
+    /// parallelism — useful on memory-constrained build hosts where
+    /// cross-compilation of many packages in parallel causes OOM.
+    pub max_jobs: Option<u32>,
 }
 
 /// Builds, optionally publishes and verifies, then runs a cache-shaped rebuild.
@@ -179,7 +189,7 @@ pub fn run_cache_shaped_switch(
 }
 
 trait Runner {
-    fn build_toplevel(&self, attr: &str) -> Result<PathBuf>;
+    fn build_toplevel(&self, plan: &SwitchPlan<'_>) -> Result<PathBuf>;
     fn closure_to_publish(&self, toplevel: &Path) -> Result<Vec<String>>;
     fn activate(&self, plan: &SwitchPlan<'_>) -> Result<()>;
 }
@@ -187,8 +197,9 @@ trait Runner {
 struct ProcessRunner;
 
 impl Runner for ProcessRunner {
-    fn build_toplevel(&self, attr: &str) -> Result<PathBuf> {
-        let args = cache_shaped_build_args(attr);
+    fn build_toplevel(&self, plan: &SwitchPlan<'_>) -> Result<PathBuf> {
+        let attr = plan.toplevel_attr;
+        let args = cache_shaped_build_args(attr, plan.max_jobs);
         let output =
             Command::new("nix")
                 .args(&args)
@@ -265,7 +276,7 @@ fn run_cache_shaped_switch_with_runner(
     verifier: &dyn Verifier,
     runner: &dyn Runner,
 ) -> Result<()> {
-    let toplevel = runner.build_toplevel(plan.toplevel_attr)?;
+    let toplevel = runner.build_toplevel(plan)?;
 
     if plan.capture {
         let paths = runner.closure_to_publish(&toplevel)?;
@@ -389,7 +400,7 @@ mod tests {
     }
 
     impl Runner for FakeRunner {
-        fn build_toplevel(&self, _attr: &str) -> Result<PathBuf> {
+        fn build_toplevel(&self, _plan: &SwitchPlan<'_>) -> Result<PathBuf> {
             Ok(PathBuf::from("/nix/store/example-system"))
         }
 
@@ -413,6 +424,7 @@ mod tests {
             capture: true,
             sudo: false,
             remote_sudo: false,
+            max_jobs: None,
         }
     }
 
@@ -473,12 +485,35 @@ mod tests {
     #[test]
     fn cache_shaped_build_args_disable_builders_and_extra_platforms() {
         assert_eq!(
-            cache_shaped_build_args(".#host"),
+            cache_shaped_build_args(".#host", None),
             vec![
                 "build",
                 "--no-link",
                 "--print-out-paths",
                 ".#host",
+                "--builders",
+                "",
+                "--option",
+                "extra-platforms",
+                "",
+                "--option",
+                "always-allow-substitutes",
+                "true",
+            ]
+        );
+    }
+
+    #[test]
+    fn cache_shaped_build_args_with_max_jobs() {
+        assert_eq!(
+            cache_shaped_build_args(".#host", Some(4)),
+            vec![
+                "build",
+                "--no-link",
+                "--print-out-paths",
+                ".#host",
+                "--max-jobs",
+                "4",
                 "--builders",
                 "",
                 "--option",
