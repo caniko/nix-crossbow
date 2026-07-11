@@ -85,6 +85,38 @@
             }
           ];
         };
+        crossRustProbeCrossPkgs = import inputs.nixpkgs {
+          localSystem = {inherit system;};
+          crossSystem = {system = "aarch64-linux";};
+        };
+        crossRustProbeCargoArtifacts = pkgs.stdenv.mkDerivation {
+          pname = "cross-rust-probe-cargo-artifacts";
+          version = "0";
+          dontUnpack = true;
+          installPhase = "mkdir -p $out";
+          env.CARGO_ARTIFACTS_OLD_ENV = "preserved";
+        };
+        crossRustProbeBase = pkgs.stdenv.mkDerivation {
+          pname = "cross-rust-probe";
+          version = "0";
+          dontUnpack = true;
+          installPhase = "mkdir -p $out";
+          nativeBuildInputs = [pkgs.hello];
+          env.OLD_ENV = "preserved";
+          cargoArtifacts = crossRustProbeCargoArtifacts;
+        };
+        crossRustProbePackage = inputs.self.lib.withCrossRust {
+          crossbowCrossPkgs = crossRustProbeCrossPkgs;
+          package = crossRustProbeBase;
+          extraEnv.EXTRA_ENV = "merged";
+          extraNativeBuildInputs = [pkgs.coreutils];
+        };
+        crossRustProbeEnv = (crossRustProbePackage.drvAttrs.env or {}) // crossRustProbePackage.drvAttrs;
+        crossRustProbeNativeInputNames = map (input: input.pname or input.name or null) (crossRustProbePackage.drvAttrs.nativeBuildInputs or []);
+        crossRustProbeCargoArtifactsEnv =
+          if (crossRustProbePackage.drvAttrs ? cargoArtifacts) && (crossRustProbePackage.drvAttrs.cargoArtifacts ? drvAttrs)
+          then (crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs.env or {}) // crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs
+          else {};
       in {
         inherit formatter;
 
@@ -115,6 +147,28 @@
 
         checks = {
           crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
+
+          crossbow-metadata-pkl = pkgs.runCommand "crossbow-metadata-pkl" {
+            buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
+          } ''
+            pkl_json="$(mktemp)"
+            pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
+
+            for sidecar in \
+              ${./data/crossbow-metadata.json} \
+              ${./crates/crossbow-switch/data/crossbow-metadata.json}
+            do
+              sidecar_json="$(mktemp)"
+              jq -S -c . "$sidecar" > "$sidecar_json"
+              if ! diff -u "$pkl_json" "$sidecar_json"; then
+                echo "ERROR: $sidecar is out of sync with data/CrossbowMetadata.pkl" >&2
+                echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
+                exit 1
+              fi
+            done
+
+            touch "$out"
+          '';
 
           platform-map = pkgs.runCommand "crossbow-platform-map" {} ''
             test "${inputs.self.lib.nixSystemToZigTarget "aarch64-linux"}" = "aarch64-linux-gnu"
@@ -178,6 +232,22 @@
             test -e ${crossPackageProbeRequirements}/drvs
             grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel}" ${crossPackageProbeRequirements}/roots >/dev/null
             grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel.drvPath}" ${crossPackageProbeRequirements}/drvs >/dev/null
+            touch $out
+          '';
+
+          cross-rust-helper = pkgs.runCommand "cross-rust-helper" {} ''
+            test "${crossRustProbeEnv.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
+            test "${crossRustProbeEnv.HOST_CC or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
+            test "${crossRustProbeEnv.CC_FOR_BUILD or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
+            test "${crossRustProbeEnv.OLD_ENV or ""}" = "preserved"
+            test "${crossRustProbeEnv.EXTRA_ENV or ""}" = "merged"
+            test "${crossRustProbeCargoArtifactsEnv.CARGO_ARTIFACTS_OLD_ENV or ""}" = "preserved"
+            test "${crossRustProbeCargoArtifactsEnv.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
+            ${
+              if builtins.elem "hello" crossRustProbeNativeInputNames && builtins.elem "coreutils" crossRustProbeNativeInputNames
+              then "true"
+              else "echo 'cross-rust-helper nativeBuildInputs were not preserved and extended'; exit 1"
+            }
             touch $out
           '';
 

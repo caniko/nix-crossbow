@@ -254,11 +254,25 @@
     "fast-local": {
       "name": "fast-local",
       "changesHashes": true,
-      "cFlags": ["-flto=thin"],
-      "linkFlags": ["-fuse-ld=mold"],
-      "rustFlags": ["-C", "lto=thin", "-C", "link-arg=-fuse-ld=mold"],
-      "goFlags": ["-trimpath"],
-      "goLdflags": ["-s", "-w"],
+      "cFlags": [
+        "-flto=thin"
+      ],
+      "linkFlags": [
+        "-fuse-ld=mold"
+      ],
+      "rustFlags": [
+        "-C",
+        "lto=thin",
+        "-C",
+        "link-arg=-fuse-ld=mold"
+      ],
+      "goFlags": [
+        "-trimpath"
+      ],
+      "goLdflags": [
+        "-s",
+        "-w"
+      ],
       "goEnv": {
         "CGO_ENABLED": "0"
       },

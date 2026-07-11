@@ -1,0 +1,277 @@
+/// Crossbow platform, cache-mode, hardware, and optimization metadata.
+///
+/// Generated initially from data/crossbow-metadata.json. Edit this Pkl source,
+/// then regenerate JSON sidecars for Nix and Rust consumers.
+
+targets = new {
+  ["x86_64-linux"] = new {
+    ["system"] = "x86_64-linux"
+    ["config"] = "x86_64-unknown-linux-gnu"
+  }
+  ["aarch64-linux"] = new {
+    ["system"] = "aarch64-linux"
+    ["config"] = "aarch64-unknown-linux-gnu"
+  }
+  ["aarch64-musl"] = new {
+    ["system"] = "aarch64-linux"
+    ["config"] = "aarch64-unknown-linux-musl"
+  }
+  ["armv7l-linux"] = new {
+    ["system"] = "armv7l-linux"
+    ["config"] = "armv7l-unknown-linux-gnueabihf"
+  }
+  ["riscv64-linux"] = new {
+    ["system"] = "riscv64-linux"
+    ["config"] = "riscv64-unknown-linux-gnu"
+  }
+  ["powerpc64le"] = new {
+    ["system"] = "powerpc64le-linux"
+    ["config"] = "powerpc64le-unknown-linux-gnu"
+  }
+  ["s390x"] = new {
+    ["system"] = "s390x-linux"
+    ["config"] = "s390x-unknown-linux-gnu"
+  }
+  ["aarch64-darwin"] = new {
+    ["system"] = "aarch64-darwin"
+    ["config"] = "aarch64-apple-darwin"
+  }
+  ["x86_64-darwin"] = new {
+    ["system"] = "x86_64-darwin"
+    ["config"] = "x86_64-apple-darwin"
+  }
+  ["x86_64-windows"] = new {
+    ["system"] = "x86_64-windows"
+    ["config"] = "x86_64-pc-windows-gnu"
+  }
+  ["aarch64-windows"] = new {
+    ["system"] = "aarch64-windows"
+    ["config"] = "aarch64-pc-windows-gnullvm"
+  }
+  ["wasm32-wasi"] = new {
+    ["system"] = "wasm32-wasi"
+    ["config"] = "wasm32-wasi"
+  }
+  ["wasm32-unknown"] = new {
+    ["system"] = "wasm32-unknown"
+    ["config"] = "wasm32-unknown-unknown"
+  }
+}
+
+platformMappings = new {
+  ["zigTargets"] = new {
+    ["x86_64-linux"] = "x86_64-linux-gnu"
+    ["aarch64-linux"] = "aarch64-linux-gnu"
+    ["armv7l-linux"] = "arm-linux-gnueabihf"
+    ["riscv64-linux"] = "riscv64-linux-gnu"
+    ["powerpc64le-linux"] = "powerpc64le-linux-gnu"
+    ["s390x-linux"] = "s390x-linux-gnu"
+    ["x86_64-darwin"] = "x86_64-macos-none"
+    ["aarch64-darwin"] = "aarch64-macos-none"
+    ["x86_64-windows"] = "x86_64-windows-gnu"
+    ["aarch64-windows"] = "aarch64-windows-gnu"
+    ["wasm32-wasi"] = "wasm32-wasi-musl"
+  }
+  ["gnuConfigs"] = new {
+    ["x86_64-linux"] = "x86_64-unknown-linux-gnu"
+    ["aarch64-linux"] = "aarch64-unknown-linux-gnu"
+    ["armv7l-linux"] = "armv7l-unknown-linux-gnueabihf"
+    ["riscv64-linux"] = "riscv64-unknown-linux-gnu"
+    ["powerpc64le-linux"] = "powerpc64le-unknown-linux-gnu"
+    ["s390x-linux"] = "s390x-unknown-linux-gnu"
+    ["x86_64-darwin"] = "x86_64-apple-darwin"
+    ["aarch64-darwin"] = "aarch64-apple-darwin"
+    ["x86_64-windows"] = "x86_64-pc-windows-gnu"
+    ["aarch64-windows"] = "aarch64-pc-windows-gnu"
+    ["wasm32-wasi"] = "wasm32-unknown-wasi"
+  }
+}
+
+cacheModes = new {
+  ["strict-cross"] = new {
+    ["name"] = "strict-cross"
+    ["proves"] = "build machine compiles host artifacts without QEMU"
+    ["cacheExpectation"] = "low nixpkgs binary cache reuse because cross derivation paths differ from native paths"
+  }
+  ["native-substituted"] = new {
+    ["name"] = "native-substituted"
+    ["proves"] = "build machine can orchestrate and substitute host-system artifacts without QEMU"
+    ["cacheExpectation"] = "high nixpkgs binary cache reuse when host-system paths are available from substituters"
+  }
+  ["remote-native"] = new {
+    ["name"] = "remote-native"
+    ["proves"] = "build machine can route missing host-system builds to native hardware without QEMU"
+    ["cacheExpectation"] = "uses substitutes first, then a native remote builder for missing host-system paths"
+  }
+  ["cache-shaped-with-cross-overrides"] = new {
+    ["name"] = "cache-shaped-with-cross-overrides"
+    ["proves"] = "host-system closure keeps native cache shape while explicit packages may be cross-built"
+    ["cacheExpectation"] = "high nixpkgs binary cache reuse; only opt-in package overrides use cross derivation paths"
+  }
+}
+
+hardwareProfiles = new {
+  ["rockpro64"] = new {
+    ["name"] = "rockpro64"
+    ["system"] = "aarch64-linux"
+    ["vendor"] = "pine64"
+    ["soc"] = "rk3399"
+    ["description"] = "Pine64 RockPro64 / RK3399: Cortex-A72 + Cortex-A53 big.LITTLE ARMv8-A"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "armv8-a"
+        ["tune"] = "cortex-a72.cortex-a53"
+      }
+    }
+  }
+  ["znver2"] = new {
+    ["name"] = "znver2"
+    ["system"] = "x86_64-linux"
+    ["description"] = "AMD Zen 2 (Ryzen 3000 / EPYC Rome) (x86_64 -march=znver2)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "znver2"
+        ["tune"] = "znver2"
+      }
+    }
+  }
+  ["znver3"] = new {
+    ["name"] = "znver3"
+    ["system"] = "x86_64-linux"
+    ["description"] = "AMD Zen 3 (Ryzen 5000 / EPYC Milan) (x86_64 -march=znver3)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "znver3"
+        ["tune"] = "znver3"
+      }
+    }
+  }
+  ["znver4"] = new {
+    ["name"] = "znver4"
+    ["system"] = "x86_64-linux"
+    ["description"] = "AMD Zen 4 (Ryzen 7000 / EPYC Genoa) (x86_64 -march=znver4)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "znver4"
+        ["tune"] = "znver4"
+      }
+    }
+  }
+  ["znver5"] = new {
+    ["name"] = "znver5"
+    ["system"] = "x86_64-linux"
+    ["description"] = "AMD Zen 5 (Ryzen 9000 / EPYC Turin) (x86_64 -march=znver5)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "znver5"
+        ["tune"] = "znver5"
+      }
+    }
+  }
+  ["skylake"] = new {
+    ["name"] = "skylake"
+    ["system"] = "x86_64-linux"
+    ["description"] = "Intel Skylake (6th-gen Core / Skylake-X) (x86_64 -march=skylake)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "skylake"
+        ["tune"] = "skylake"
+      }
+    }
+  }
+  ["icelake-client"] = new {
+    ["name"] = "icelake-client"
+    ["system"] = "x86_64-linux"
+    ["description"] = "Intel Ice Lake (10th-gen mobile/desktop client) (x86_64 -march=icelake-client)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "icelake-client"
+        ["tune"] = "icelake-client"
+      }
+    }
+  }
+  ["icelake-server"] = new {
+    ["name"] = "icelake-server"
+    ["system"] = "x86_64-linux"
+    ["description"] = "Intel Ice Lake-SP server (x86_64 -march=icelake-server)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "icelake-server"
+        ["tune"] = "icelake-server"
+      }
+    }
+  }
+  ["tigerlake"] = new {
+    ["name"] = "tigerlake"
+    ["system"] = "x86_64-linux"
+    ["description"] = "Intel Tiger Lake (11th-gen mobile) (x86_64 -march=tigerlake)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "tigerlake"
+        ["tune"] = "tigerlake"
+      }
+    }
+  }
+  ["alderlake"] = new {
+    ["name"] = "alderlake"
+    ["system"] = "x86_64-linux"
+    ["description"] = "Intel Alder Lake (12th-gen) (x86_64 -march=alderlake)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "alderlake"
+        ["tune"] = "alderlake"
+      }
+    }
+  }
+  ["raptorlake"] = new {
+    ["name"] = "raptorlake"
+    ["system"] = "x86_64-linux"
+    ["description"] = "Intel Raptor Lake (13th/14th-gen) (x86_64 -march=raptorlake)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "raptorlake"
+        ["tune"] = "raptorlake"
+      }
+    }
+  }
+  ["sapphirerapids"] = new {
+    ["name"] = "sapphirerapids"
+    ["system"] = "x86_64-linux"
+    ["description"] = "Intel Sapphire Rapids server (x86_64 -march=sapphirerapids)"
+    ["platform"] = new {
+      ["gcc"] = new {
+        ["arch"] = "sapphirerapids"
+        ["tune"] = "sapphirerapids"
+      }
+    }
+  }
+}
+
+buildOptimizationProfiles = new {
+  ["cache-first"] = new {
+    ["name"] = "cache-first"
+    ["changesHashes"] = false
+    ["cFlags"] = new Listing {  }
+    ["linkFlags"] = new Listing {  }
+    ["rustFlags"] = new Listing {  }
+    ["goFlags"] = new Listing {  }
+    ["goLdflags"] = new Listing {  }
+    ["goEnv"] = new {
+    
+    }
+    ["description"] = "Preserve nixpkgs derivation hashes and maximize binary cache reuse."
+  }
+  ["fast-local"] = new {
+    ["name"] = "fast-local"
+    ["changesHashes"] = true
+    ["cFlags"] = new Listing { "-flto=thin" }
+    ["linkFlags"] = new Listing { "-fuse-ld=mold" }
+    ["rustFlags"] = new Listing { "-C"; "lto=thin"; "-C"; "link-arg=-fuse-ld=mold" }
+    ["goFlags"] = new Listing { "-trimpath" }
+    ["goLdflags"] = new Listing { "-s"; "-w" }
+    ["goEnv"] = new {
+      ["CGO_ENABLED"] = "0"
+    }
+    ["description"] = "Use local build accelerators for derivations that are not expected to substitute."
+  }
+}

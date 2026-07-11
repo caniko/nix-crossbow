@@ -22,6 +22,7 @@
     inherit (hardwareProfiles) hardwareProfileFor;
   };
   buildAssemblyPkgs = import ./build-assembly-pkgs.nix {inherit lib;};
+  crossRust = import ./cross-rust.nix {inherit lib self;};
   toplevelOverride = import ./toplevel-override.nix {};
 
   self =
@@ -45,6 +46,7 @@
         ;
       inherit (toolchain) unsupportedToolchainMessage selectToolchain;
       inherit (crossPackage) mkCross mkCrossCheck;
+      inherit (crossRust) withCrossRust;
       inherit
         (buildAssemblyPkgs)
         mkBuildAssemblyOverlay
