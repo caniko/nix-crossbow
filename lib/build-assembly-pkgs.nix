@@ -88,10 +88,16 @@
     lib,
     ...
   }: let
+    # Module-provided overlays for packages that are deliberately cross-built.
+    # These are kept separate from config.nixpkgs.overlays so cache-shaped host
+    # packages retain their native nixpkgs hashes. The `or []` keeps the seam
+    # backwards-compatible for callers that do not provide an overlay.
+    crossbowCrossOverlays = config._module.args.crossbowCrossOverlays or [];
     crossPkgs = import nixpkgs {
       localSystem = {system = build;};
       crossSystem = {system = host;};
-      inherit (config.nixpkgs) config overlays;
+      inherit (config.nixpkgs) config;
+      overlays = (config.nixpkgs.overlays or []) ++ crossbowCrossOverlays;
     };
     existingCrossPackageAttrNames = lib.filter (name: builtins.hasAttr name crossPkgs) crossPackageAttrNames;
     missingCrossPackageAttrNames = lib.subtractLists existingCrossPackageAttrNames crossPackageAttrNames;
