@@ -42,10 +42,17 @@
           if system == "x86_64-linux"
           then "aarch64-linux"
           else "x86_64-linux";
+        crossPackageProbeOverrides = {
+          hello = (import inputs.nixpkgs {
+            localSystem = {inherit system;};
+            crossSystem = {system = crossPackageProbeHost;};
+          }).hello;
+        };
         crossPackageProbe = inputs.self.lib.mkNixosSwitchSystem {
           build = system;
           host = crossPackageProbeHost;
           crossPackageAttrNames = ["hello"];
+          crossPackageOverrides = crossPackageProbeOverrides;
           modules = [
             ({
               lib,

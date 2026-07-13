@@ -2,7 +2,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use crate::{
-    Error, Publisher, Result, SwitchPlan, TrustPublish, Verifier, run_cache_shaped_switch,
+    run_cache_shaped_switch, Error, Publisher, RealizationPolicy, Result, SwitchPlan, TrustPublish,
+    Verifier,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,12 +31,14 @@ pub struct CliOptions {
     pub verify_command: Option<String>,
     /// --max-jobs value for nix build, caps build parallelism.
     pub max_jobs: Option<u32>,
+    /// Explicit policy for realizing missing host-system derivations.
+    pub realization_policy: RealizationPolicy,
 }
 
 /// Returns the command-line usage string.
 #[must_use]
 pub fn usage() -> &'static str {
-    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo] [--max-jobs <N>]"
+    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo] [--max-jobs <N>] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -60,6 +63,8 @@ where
     let mut publish_command = None;
     let mut verify_command = None;
     let mut max_jobs = None;
+    let mut realization_policy = "substitute-only".to_owned();
+    let mut remote_builders = Vec::new();
 
     let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
     let mut index = 0;
@@ -102,6 +107,15 @@ where
                     value: raw.to_owned(),
                 })?);
             }
+            "--realization-policy" => {
+                index += 1;
+                realization_policy =
+                    required_value(&args, index, "--realization-policy")?.to_owned();
+            }
+            "--remote-builder" => {
+                index += 1;
+                remote_builders.push(required_value(&args, index, "--remote-builder")?.to_owned());
+            }
             "-h" | "--help" => {
                 return Err(Error::UnknownArgument {
                     argument: args[index].clone(),
@@ -126,6 +140,18 @@ where
         return Err(Error::CaptureRequiresPublishCommand);
     }
 
+    let realization_policy = match realization_policy.as_str() {
+        "substitute-only" if remote_builders.is_empty() => RealizationPolicy::SubstituteOnly,
+        "remote-native" => RealizationPolicy::RemoteNative {
+            builders: remote_builders,
+        },
+        value => {
+            return Err(Error::InvalidRealizationPolicy {
+                value: value.to_owned(),
+            })
+        }
+    };
+
     Ok(CliOptions {
         action,
         flake_attr: flake_attr.ok_or_else(|| Error::MissingRequiredArgument {
@@ -142,6 +168,7 @@ where
         publish_command,
         verify_command,
         max_jobs,
+        realization_policy,
     })
 }
 
@@ -179,6 +206,7 @@ pub fn run_with_options(options: &CliOptions) -> Result<()> {
         sudo: options.sudo,
         remote_sudo: options.remote_sudo,
         max_jobs: options.max_jobs,
+        realization_policy: options.realization_policy.clone(),
     };
 
     let noop_publisher = NoopPublisher;
@@ -316,6 +344,32 @@ mod tests {
         assert!(!options.capture);
         assert!(!options.use_substitutes);
         assert!(!options.remote_sudo);
+        assert_eq!(
+            options.realization_policy,
+            RealizationPolicy::SubstituteOnly
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parser_accepts_explicit_remote_native_builder() -> Result<()> {
+        let options = parse_args([
+            "--flake",
+            ".#host",
+            "--toplevel",
+            ".#top",
+            "--realization-policy",
+            "remote-native",
+            "--remote-builder",
+            "ssh-ng://arm aarch64-linux - 1 1",
+        ])?;
+
+        assert_eq!(
+            options.realization_policy,
+            RealizationPolicy::RemoteNative {
+                builders: vec!["ssh-ng://arm aarch64-linux - 1 1".to_string()]
+            }
+        );
         Ok(())
     }
 

@@ -105,6 +105,7 @@
     buildOptimization ? buildOptimizationProfiles.cache-first,
     buildPkgs ? null,
     crossPackageAttrNames ? [],
+    crossPackageOverrides ? {},
   }: let
     nativeSystem = mkNixosNativeSubstitutedSystem {
       inherit
@@ -131,8 +132,16 @@
         inherit (nativeSystem.config.nixpkgs) config overlays;
       }
       else {};
-    crossPackageLabels = lib.filter (name: crossPkgs ? ${name}) crossPackageAttrNames;
-    crossPackageRoots = map (name: crossPkgs.${name}) crossPackageLabels;
+    crossPackageLabels = lib.unique (
+      (lib.filter (name: crossPkgs ? ${name}) crossPackageAttrNames)
+      ++ builtins.attrNames crossPackageOverrides
+    );
+    crossPackageRoots = map (
+      name:
+        if crossPackageOverrides ? ${name}
+        then crossPackageOverrides.${name}
+        else crossPkgs.${name}
+    ) crossPackageLabels;
     allRoots = [nativeSystem.config.system.build.toplevel] ++ crossPackageRoots;
     allLabels = ["system-toplevel"] ++ crossPackageLabels;
   in
@@ -151,6 +160,7 @@
     hardwareOptimization ? null,
     buildOptimization ? buildOptimizationProfiles.cache-first,
     crossPackageAttrNames ? [],
+    crossPackageOverrides ? {},
     # Pre-realised build-platform pkgs. Defaults to nixpkgs.legacyPackages, the
     # cached lazyAttrs flake-parts already builds — no second `import nixpkgs`.
     buildPkgs ? nixpkgs.legacyPackages.${build},
@@ -158,7 +168,9 @@
     cacheMode = cacheModeFor "cache-shaped-with-cross-overrides";
     buildProfile = buildOptimizationProfileFor buildOptimization;
     profileName = hardwareOptimizationName hardwareOptimization;
-    assemblyPkgsModule = mkBuildAssemblyPkgsModule {inherit nixpkgs build host buildPkgs crossPackageAttrNames;};
+    assemblyPkgsModule = mkBuildAssemblyPkgsModule {
+      inherit nixpkgs build host buildPkgs crossPackageAttrNames crossPackageOverrides;
+    };
   in
     nixpkgs.lib.nixosSystem {
       # Evaluate as a single-platform native host system: pkgs has cache-shape

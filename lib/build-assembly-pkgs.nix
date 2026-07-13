@@ -83,6 +83,7 @@
     host,
     buildPkgs,
     crossPackageAttrNames ? [],
+    crossPackageOverrides ? {},
   }: {
     config,
     lib,
@@ -110,7 +111,19 @@
           || package.stdenv.buildPlatform.system == package.stdenv.hostPlatform.system
       )
       existingCrossPackageAttrNames;
-    crossPackageShadow = lib.genAttrs existingCrossPackageAttrNames (name: crossPkgs.${name});
+    invalidCrossPackageOverrideNames =
+      lib.filter (
+        name: let
+          package = crossPackageOverrides.${name};
+        in
+          !(lib.isDerivation package)
+          || !(package ? stdenv)
+          || package.stdenv.buildPlatform.system == package.stdenv.hostPlatform.system
+      )
+      (builtins.attrNames crossPackageOverrides);
+    crossPackageShadow =
+      (lib.genAttrs existingCrossPackageAttrNames (name: crossPkgs.${name}))
+      // crossPackageOverrides;
   in {
     assertions = [
       {
@@ -120,6 +133,10 @@
       {
         assertion = invalidCrossPackageAttrNames == [];
         message = "crossbow: requested cross package attributes must be derivations built by a real cross package set: ${lib.concatStringsSep ", " invalidCrossPackageAttrNames}";
+      }
+      {
+        assertion = invalidCrossPackageOverrideNames == [];
+        message = "crossbow: concrete cross package overrides must be real cross derivations: ${lib.concatStringsSep ", " invalidCrossPackageOverrideNames}";
       }
     ];
 

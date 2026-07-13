@@ -9,6 +9,8 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 /// Command-line entry points for the `crossbow-switch` binary.
 pub mod cli;
 /// Error and result types shared by the library and binary.
@@ -17,14 +19,48 @@ pub mod error;
 pub mod executor;
 /// Typed access to Crossbow's shared target/profile metadata.
 pub mod metadata;
+/// Structured dry-run planning for cache-shaped realizations.
+pub mod planner;
 /// Parsed Crossbow requirements artifact (roots, drvs, fingerprint).
 pub mod requirements;
 /// Generic prepared-state persistence for prerequisite roots.
 pub mod state;
 
 pub use error::{Error, Result};
-pub use requirements::{RequirementsArtifact, LabeledRoot, RootDiff, diff_roots, label_roots};
-pub use state::{PreparedState, StateStatus, load_prepared_state, save_prepared_state, state_file_path, state_to_labeled_roots};
+pub use planner::{plan_closure, ClosurePlan, DerivationClass, DerivationPlan, PlanCounts};
+pub use requirements::{diff_roots, label_roots, LabeledRoot, RequirementsArtifact, RootDiff};
+pub use state::{
+    load_prepared_state, save_prepared_state, state_file_path, state_to_labeled_roots,
+    PreparedState, StateStatus,
+};
+
+/// Controls which builders may realize missing derivations before activation.
+///
+/// `SubstituteOnly` is the safe default. `RemoteNative` is explicit opt-in and
+/// accepts only the builder specifications supplied by the caller.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum RealizationPolicy {
+    /// Use configured substituters and no builders.
+    #[default]
+    SubstituteOnly,
+    /// Use only these explicitly declared Nix builder specifications.
+    RemoteNative {
+        /// Nix builder specifications, one per entry.
+        builders: Vec<String>,
+    },
+}
+
+impl RealizationPolicy {
+    fn builders_value(&self) -> Result<String> {
+        match self {
+            Self::SubstituteOnly => Ok(String::new()),
+            Self::RemoteNative { builders } if builders.is_empty() => {
+                Err(Error::RemoteNativeRequiresBuilder)
+            }
+            Self::RemoteNative { builders } => Ok(builders.join("\n")),
+        }
+    }
+}
 
 /// Returns the canonical Nix flags for cache-shaped Crossbow realisation.
 ///
@@ -34,16 +70,24 @@ pub use state::{PreparedState, StateStatus, load_prepared_state, save_prepared_s
 /// paths even when individual derivations set `allowSubstitutes = false`.
 #[must_use]
 pub fn cache_shaped_nix_flags() -> Vec<String> {
-    vec![
+    realization_nix_flags(&RealizationPolicy::SubstituteOnly).expect("substitute-only is valid")
+}
+
+/// Returns Nix flags for an explicit realization policy.
+///
+/// All policies keep `extra-platforms` empty. The policy is intentionally not
+/// used by activation, which remains substitution-only.
+pub fn realization_nix_flags(policy: &RealizationPolicy) -> Result<Vec<String>> {
+    Ok(vec![
         "--builders".to_string(),
-        String::new(),
+        policy.builders_value()?,
         "--option".to_string(),
         "extra-platforms".to_string(),
         String::new(),
         "--option".to_string(),
         "always-allow-substitutes".to_string(),
         "true".to_string(),
-    ]
+    ])
 }
 
 /// Returns the canonical flags for a cache-shaped crossbow `nixos-rebuild`.
@@ -77,6 +121,16 @@ pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
 /// on memory-constrained build hosts.
 #[must_use]
 pub fn cache_shaped_build_args(attr: &str, max_jobs: Option<u32>) -> Vec<String> {
+    cache_shaped_build_args_with_policy(attr, max_jobs, &RealizationPolicy::SubstituteOnly)
+        .expect("substitute-only is valid")
+}
+
+/// Returns `nix build` arguments for an explicit realization policy.
+pub fn cache_shaped_build_args_with_policy(
+    attr: &str,
+    max_jobs: Option<u32>,
+    policy: &RealizationPolicy,
+) -> Result<Vec<String>> {
     let mut args = vec![
         "build".to_string(),
         "--no-link".to_string(),
@@ -87,8 +141,8 @@ pub fn cache_shaped_build_args(attr: &str, max_jobs: Option<u32>) -> Vec<String>
         args.push("--max-jobs".to_string());
         args.push(jobs.to_string());
     }
-    args.extend(cache_shaped_nix_flags());
-    args
+    args.extend(realization_nix_flags(policy)?);
+    Ok(args)
 }
 
 /// Returns the realised, non-derivation store paths that must be published for
@@ -150,6 +204,22 @@ impl Verifier for TrustPublish {
     }
 }
 
+/// The exact realization passed through build, publication, verification, and
+/// activation for one switch attempt.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PreparedSwitch {
+    /// Frozen flake reference used for the realization.
+    pub frozen_flake: String,
+    /// Toplevel attribute realized from the frozen flake.
+    pub toplevel_attr: String,
+    /// Realized system toplevel path.
+    pub toplevel: PathBuf,
+    /// Complete runtime closure selected for publication.
+    pub closure: Vec<String>,
+    /// Stable fingerprint of the exact toplevel and closure.
+    pub fingerprint: String,
+}
+
 /// Inputs for one cache-shaped NixOS rebuild.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SwitchPlan<'a> {
@@ -173,6 +243,8 @@ pub struct SwitchPlan<'a> {
     /// parallelism — useful on memory-constrained build hosts where
     /// cross-compilation of many packages in parallel causes OOM.
     pub max_jobs: Option<u32>,
+    /// Builder policy used only for the initial toplevel realization.
+    pub realization_policy: RealizationPolicy,
 }
 
 /// Builds, optionally publishes and verifies, then runs a cache-shaped rebuild.
@@ -188,6 +260,11 @@ pub fn run_cache_shaped_switch(
     run_cache_shaped_switch_with_runner(plan, publisher, verifier, &ProcessRunner)
 }
 
+/// Realizes one switch toplevel and captures its exact closure.
+pub fn prepare_switch(plan: &SwitchPlan<'_>) -> Result<PreparedSwitch> {
+    prepare_switch_with_runner(plan, &ProcessRunner)
+}
+
 trait Runner {
     fn build_toplevel(&self, plan: &SwitchPlan<'_>) -> Result<PathBuf>;
     fn closure_to_publish(&self, toplevel: &Path) -> Result<Vec<String>>;
@@ -199,7 +276,8 @@ struct ProcessRunner;
 impl Runner for ProcessRunner {
     fn build_toplevel(&self, plan: &SwitchPlan<'_>) -> Result<PathBuf> {
         let attr = plan.toplevel_attr;
-        let args = cache_shaped_build_args(attr, plan.max_jobs);
+        let args =
+            cache_shaped_build_args_with_policy(attr, plan.max_jobs, &plan.realization_policy)?;
         let output =
             Command::new("nix")
                 .args(&args)
@@ -276,12 +354,12 @@ fn run_cache_shaped_switch_with_runner(
     verifier: &dyn Verifier,
     runner: &dyn Runner,
 ) -> Result<()> {
-    let toplevel = runner.build_toplevel(plan)?;
+    let prepared = prepare_switch_with_runner(plan, runner)?;
 
     if plan.capture {
-        let paths = runner.closure_to_publish(&toplevel)?;
-        publisher.publish(&paths)?;
-        let missing = verifier.verify_present(&paths)?;
+        let paths = &prepared.closure;
+        publisher.publish(paths)?;
+        let missing = verifier.verify_present(paths)?;
 
         if !missing.is_empty() {
             let preview = missing
@@ -302,6 +380,37 @@ fn run_cache_shaped_switch_with_runner(
     }
 
     runner.activate(plan)
+}
+
+fn prepare_switch_with_runner(
+    plan: &SwitchPlan<'_>,
+    runner: &dyn Runner,
+) -> Result<PreparedSwitch> {
+    let toplevel = runner.build_toplevel(plan)?;
+    let closure = if plan.capture {
+        runner.closure_to_publish(&toplevel)?
+    } else {
+        Vec::new()
+    };
+    let mut hasher = Sha256::new();
+    hasher.update(plan.flake_attr.as_bytes());
+    hasher.update([0]);
+    hasher.update(plan.toplevel_attr.as_bytes());
+    hasher.update([0]);
+    hasher.update(toplevel.as_os_str().as_encoded_bytes());
+    for path in &closure {
+        hasher.update([0]);
+        hasher.update(path.as_bytes());
+    }
+    let fingerprint = format!("sha256-{:x}", hasher.finalize());
+
+    Ok(PreparedSwitch {
+        frozen_flake: plan.flake_attr.to_owned(),
+        toplevel_attr: plan.toplevel_attr.to_owned(),
+        toplevel,
+        closure,
+        fingerprint,
+    })
 }
 
 fn run_nix_store(args: &[&str], path: Option<&Path>) -> Result<String> {
@@ -425,6 +534,7 @@ mod tests {
             sudo: false,
             remote_sudo: false,
             max_jobs: None,
+            realization_policy: RealizationPolicy::SubstituteOnly,
         }
     }
 
@@ -443,6 +553,26 @@ mod tests {
                 "true",
             ]
         );
+    }
+
+    #[test]
+    fn remote_native_flags_use_only_explicit_builders() {
+        let flags = realization_nix_flags(&RealizationPolicy::RemoteNative {
+            builders: vec!["ssh-ng://arm aarch64-linux - 1 1".to_string()],
+        })
+        .unwrap();
+        assert_eq!(flags[0], "--builders");
+        assert_eq!(flags[1], "ssh-ng://arm aarch64-linux - 1 1");
+        assert_eq!(flags[4], "");
+    }
+
+    #[test]
+    fn remote_native_requires_a_builder() {
+        let error = realization_nix_flags(&RealizationPolicy::RemoteNative {
+            builders: Vec::new(),
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("requires at least one"));
     }
 
     #[test]
@@ -547,6 +677,24 @@ mod tests {
         );
         fs::remove_dir_all(base)?;
         Ok(())
+    }
+
+    #[test]
+    fn prepared_switch_carries_one_exact_closure() {
+        let activated = Rc::new(Cell::new(false));
+        let runner = FakeRunner {
+            publish_paths: vec!["/nix/store/path".to_string()],
+            activated,
+        };
+        let prepared = prepare_switch_with_runner(&switch_plan("build"), &runner).unwrap();
+
+        assert_eq!(prepared.frozen_flake, ".#host-crossbow");
+        assert_eq!(
+            prepared.toplevel,
+            PathBuf::from("/nix/store/example-system")
+        );
+        assert_eq!(prepared.closure, vec!["/nix/store/path"]);
+        assert!(!prepared.fingerprint.is_empty());
     }
 
     #[test]

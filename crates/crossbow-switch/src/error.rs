@@ -124,6 +124,63 @@ pub enum Error {
         value: String,
     },
 
+    /// A remote-native realization was requested without a builder.
+    #[error("crossbow: remote-native realization requires at least one explicit builder")]
+    RemoteNativeRequiresBuilder,
+
+    /// An unknown realization policy name was supplied.
+    #[error(
+        "crossbow: invalid realization policy `{value}`; expected substitute-only or remote-native"
+    )]
+    InvalidRealizationPolicy {
+        /// Policy name supplied by the caller.
+        value: String,
+    },
+
+    /// A machine-readable planner command could not be spawned.
+    #[error("crossbow: failed to run planner command `{command}`")]
+    PlannerCommand {
+        /// Command text.
+        command: String,
+        /// Underlying spawn failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A machine-readable planner command failed.
+    #[error("crossbow: planner command `{command}` failed: {stderr}")]
+    PlannerCommandFailed {
+        /// Command text.
+        command: String,
+        /// Captured stderr.
+        stderr: String,
+    },
+
+    /// A planner command emitted invalid UTF-8.
+    #[error("crossbow: planner command `{command}` emitted non-UTF-8 output")]
+    PlannerUtf8 {
+        /// Command text.
+        command: String,
+        /// Underlying UTF-8 error.
+        #[source]
+        source: FromUtf8Error,
+    },
+
+    /// Nix planner JSON was invalid.
+    #[error("crossbow: planner JSON is invalid")]
+    PlannerJson {
+        /// JSON parsing failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Nix omitted one requested derivation from `nix derivation show`.
+    #[error("crossbow: planner could not find derivation `{drv}` in nix derivation show output")]
+    PlannerMissingDerivation {
+        /// Missing derivation path.
+        drv: String,
+    },
+
     /// Capture mode was requested without a publication command.
     #[error(
         "crossbow: --capture requires --publish-command; provide the cache publication command or use --no-capture"
