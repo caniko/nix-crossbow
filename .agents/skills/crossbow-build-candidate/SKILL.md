@@ -3,7 +3,7 @@ name: crossbow-build-candidate
 description: Evaluate whether a package should be optimized or cross-built with Crossbow, including cases where precompiled binaries exist. Use when deciding whether applyBuildOptimization, crossbowCrossPkgs, package-level cross overrides, or cache-miss optimizations are appropriate.
 ---
 
-**Cross-repository work:** As soon as work is known to span more than one Git repository, invoke `$graphify` before further discovery, planning, or edits. Query a relevant existing graph first; build or update a merged graph if none exists, it is stale, or it does not cover every repository in scope. Reuse a current graph already produced for the same repository set.
+**Cross-repository work:** If scope spans repositories, invoke `$graphify` before discovery, planning, or edits. Query an existing graph; build/update a merged graph when missing, stale, or incomplete. Reuse a current graph for the same repository set.
 
 # Crossbow Build Candidate
 
