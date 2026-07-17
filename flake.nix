@@ -2,7 +2,8 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+    nixpkgs.follows = "rs-harbor/nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
@@ -124,17 +125,27 @@
           if (crossRustProbePackage.drvAttrs ? cargoArtifacts) && (crossRustProbePackage.drvAttrs.cargoArtifacts ? drvAttrs)
           then (crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs.env or {}) // crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs
           else {};
+        buildCache = inputs.rs-harbor.lib.mkBuildCachePolicy {
+          inherit pkgs;
+          buildPackageSet = pkgs.buildPackages;
+          sccachePackage = pkgs.buildPackages.sccache;
+          cacheRoot = null;
+          namespaceScope = "canix-rust";
+          namespaceGeneration = 5;
+        };
       in {
         inherit formatter;
 
         packages = {
-          crossbow-switch = pkgs.rustPlatform.buildRustPackage {
-            pname = "crossbow-switch";
-            version = "0.1.0";
-            src = ./.;
-            cargoLock.lockFile = ./Cargo.lock;
-            cargoBuildFlags = ["-p" "crossbow-switch"];
-            cargoTestFlags = ["-p" "crossbow-switch"];
+          crossbow-switch = buildCache.withRustCache {
+            package = pkgs.rustPlatform.buildRustPackage {
+              pname = "crossbow-switch";
+              version = "0.1.0";
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
+              cargoBuildFlags = ["-p" "crossbow-switch"];
+              cargoTestFlags = ["-p" "crossbow-switch"];
+            };
           };
 
           tiny-c-aarch64-linux = inputs.self.lib.mkCross {
