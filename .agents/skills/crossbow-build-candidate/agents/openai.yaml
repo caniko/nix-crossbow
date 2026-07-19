@@ -1,7 +1,0 @@
-interface:
-  display_name: "Crossbow Build Candidate"
-  short_description: "Judge packages for Crossbow optimization"
-  default_prompt: "Use $crossbow-build-candidate to decide whether this package should be optimized with Crossbow."
-
-policy:
-  allow_implicit_invocation: true
