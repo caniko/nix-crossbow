@@ -1,5 +1,11 @@
 # Crossbow
 
+<!-- simit:badges:start -->
+
+[![CI](https://img.shields.io/badge/CI-managed-2088ff)](.forgejo/workflows/ci.yaml) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/crossbow-switch)
+
+<!-- simit:badges:end -->
+
 Crossbow is a Nix flake for QEMU-free cross-compilation. It models compilation and execution separately: a toolchain builds a host artifact, and an executor describes how checks run.
 
 Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and exposes NixOS helpers for cache-shaped single-switch deployments and strict cross-system proofs. WASM, Windows, and Darwin targets are present in the public platform map, but their backends intentionally fail until their sysroot and executor stories are implemented.

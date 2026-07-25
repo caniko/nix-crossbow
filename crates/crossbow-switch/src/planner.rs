@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::process::Command;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{Error, RealizationPolicy, Result};
 
@@ -119,6 +120,7 @@ pub fn plan_closure(
 
     let mut derivations = Vec::with_capacity(entries.len());
     let mut counts = PlanCounts::default();
+    let mut availability = BTreeMap::new();
     for entry in entries {
         let key = entry
             .drv_path
@@ -131,10 +133,22 @@ pub fn plan_closure(
             .ok_or_else(|| Error::PlannerMissingDerivation {
                 drv: entry.drv_path.clone(),
             })?;
-        let outputs = entry.outputs.into_values().collect::<Vec<_>>();
-        let substitutable = outputs
-            .iter()
-            .all(|output| output_available(substituter, output));
+        let mut outputs = entry.outputs.into_values().collect::<Vec<_>>();
+        outputs.sort();
+        let mut substitutable = true;
+        for output in &outputs {
+            let available = if let Some(available) = availability.get(output) {
+                *available
+            } else {
+                let available = output_available(substituter, output)?;
+                availability.insert(output.clone(), available);
+                available
+            };
+            if !available {
+                substitutable = false;
+                break;
+            }
+        }
         let class = if substitutable {
             DerivationClass::HostSubstituted
         } else if system == build_system {
@@ -165,6 +179,8 @@ pub fn plan_closure(
         });
     }
 
+    derivations.sort_by(|left, right| left.drv.cmp(&right.drv));
+
     Ok(ClosurePlan {
         build_system: build_system.to_owned(),
         host_system: host_system.to_owned(),
@@ -192,11 +208,43 @@ fn run_nix(args: &[String]) -> Result<String> {
     String::from_utf8(output.stdout).map_err(|source| Error::PlannerUtf8 { command, source })
 }
 
-fn output_available(substituter: &str, output: &str) -> bool {
-    Command::new("nix")
+fn output_available(substituter: &str, output: &str) -> Result<bool> {
+    let result = Command::new("nix")
         .args(["path-info", "--json", "--store", substituter, output])
         .output()
-        .is_ok_and(|result| result.status.success())
+        .map_err(|source| Error::PlannerCacheProbe {
+            substituter: substituter.to_owned(),
+            output: output.to_owned(),
+            source,
+        })?;
+
+    // Nix returns a JSON object containing a null value for a genuine cache
+    // miss. Transport and cache configuration failures emit no such object;
+    // do not turn those failures into a misleading build miss.
+    if let Ok(values) = serde_json::from_slice::<Value>(&result.stdout) {
+        let Some(value) = values.get(output) else {
+            return Err(Error::PlannerCacheProbeJson {
+                substituter: substituter.to_owned(),
+                output: output.to_owned(),
+                reason: "response did not contain the queried output".to_owned(),
+            });
+        };
+        return Ok(!value.is_null());
+    }
+
+    if !result.status.success() {
+        return Err(Error::PlannerCacheProbeFailed {
+            substituter: substituter.to_owned(),
+            output: output.to_owned(),
+            stderr: String::from_utf8_lossy(&result.stderr).trim().to_owned(),
+        });
+    }
+
+    Err(Error::PlannerCacheProbeJson {
+        substituter: substituter.to_owned(),
+        output: output.to_owned(),
+        reason: "response was not valid JSON".to_owned(),
+    })
 }
 
 #[cfg(test)]

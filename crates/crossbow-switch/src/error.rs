@@ -181,6 +181,40 @@ pub enum Error {
         drv: String,
     },
 
+    /// A cache probe could not be spawned.
+    #[error("crossbow: failed to probe `{output}` in substituter `{substituter}`")]
+    PlannerCacheProbe {
+        /// Substituter store URL.
+        substituter: String,
+        /// Output path being queried.
+        output: String,
+        /// Underlying spawn failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A cache probe failed without returning a per-path JSON answer.
+    #[error("crossbow: cache probe for `{output}` in `{substituter}` failed: {stderr}")]
+    PlannerCacheProbeFailed {
+        /// Substituter store URL.
+        substituter: String,
+        /// Output path being queried.
+        output: String,
+        /// Captured stderr.
+        stderr: String,
+    },
+
+    /// A cache probe returned malformed or incomplete JSON.
+    #[error("crossbow: cache probe JSON for `{output}` in `{substituter}` is invalid: {reason}")]
+    PlannerCacheProbeJson {
+        /// Substituter store URL.
+        substituter: String,
+        /// Output path being queried.
+        output: String,
+        /// Why the response could not be used.
+        reason: String,
+    },
+
     /// Capture mode was requested without a publication command.
     #[error(
         "crossbow: --capture requires --publish-command; provide the cache publication command or use --no-capture"

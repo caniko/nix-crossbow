@@ -2,8 +2,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use crate::{
-    run_cache_shaped_switch, Error, Publisher, RealizationPolicy, Result, SwitchPlan, TrustPublish,
-    Verifier,
+    ClosurePlan, DerivationClass, Error, Publisher, RealizationPolicy, Result, SwitchPlan,
+    TrustPublish, Verifier, plan_closure, run_cache_shaped_switch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -35,10 +35,33 @@ pub struct CliOptions {
     pub realization_policy: RealizationPolicy,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed options for the read-only structured planner.
+pub struct PlanOptions {
+    /// Toplevel installable passed to `nix build --dry-run`.
+    pub toplevel_attr: String,
+    /// Crossbow build-host system.
+    pub build_system: String,
+    /// Target host system.
+    pub host_system: String,
+    /// Store URL used for read-only cache probes.
+    pub substituter: String,
+    /// Whether to emit the complete machine-readable report.
+    pub json: bool,
+    /// Explicit policy for missing derivations.
+    pub realization_policy: RealizationPolicy,
+}
+
 /// Returns the command-line usage string.
 #[must_use]
 pub fn usage() -> &'static str {
     "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo] [--max-jobs <N>] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
+}
+
+/// Returns the usage string for the read-only planner.
+#[must_use]
+pub fn plan_usage() -> &'static str {
+    "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -148,7 +171,7 @@ where
         value => {
             return Err(Error::InvalidRealizationPolicy {
                 value: value.to_owned(),
-            })
+            });
         }
     };
 
@@ -172,6 +195,96 @@ where
     })
 }
 
+/// Parses arguments for the read-only structured planner.
+pub fn parse_plan_args<I, S>(args: I) -> Result<PlanOptions>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let mut toplevel_attr = None;
+    let mut build_system = None;
+    let mut host_system = None;
+    let mut substituter = None;
+    let mut json = false;
+    let mut realization_policy = "substitute-only".to_owned();
+    let mut remote_builders = Vec::new();
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--toplevel" => {
+                index += 1;
+                toplevel_attr = Some(required_value(&args, index, "--toplevel")?.to_owned());
+            }
+            "--build-system" => {
+                index += 1;
+                build_system = Some(required_value(&args, index, "--build-system")?.to_owned());
+            }
+            "--host-system" => {
+                index += 1;
+                host_system = Some(required_value(&args, index, "--host-system")?.to_owned());
+            }
+            "--substituter" => {
+                index += 1;
+                substituter = Some(required_value(&args, index, "--substituter")?.to_owned());
+            }
+            "--json" => json = true,
+            "--realization-policy" => {
+                index += 1;
+                realization_policy =
+                    required_value(&args, index, "--realization-policy")?.to_owned();
+            }
+            "--remote-builder" => {
+                index += 1;
+                remote_builders.push(required_value(&args, index, "--remote-builder")?.to_owned());
+            }
+            "-h" | "--help" => {
+                return Err(Error::UnknownArgument {
+                    argument: args[index].clone(),
+                    usage: plan_usage().to_owned(),
+                });
+            }
+            unknown => {
+                return Err(Error::UnknownArgument {
+                    argument: unknown.to_owned(),
+                    usage: plan_usage().to_owned(),
+                });
+            }
+        }
+        index += 1;
+    }
+
+    let realization_policy = match realization_policy.as_str() {
+        "substitute-only" if remote_builders.is_empty() => RealizationPolicy::SubstituteOnly,
+        "remote-native" => RealizationPolicy::RemoteNative {
+            builders: remote_builders,
+        },
+        value => {
+            return Err(Error::InvalidRealizationPolicy {
+                value: value.to_owned(),
+            });
+        }
+    };
+
+    Ok(PlanOptions {
+        toplevel_attr: toplevel_attr.ok_or_else(|| Error::MissingRequiredArgument {
+            flag: "--toplevel".to_owned(),
+        })?,
+        build_system: build_system.ok_or_else(|| Error::MissingRequiredArgument {
+            flag: "--build-system".to_owned(),
+        })?,
+        host_system: host_system.ok_or_else(|| Error::MissingRequiredArgument {
+            flag: "--host-system".to_owned(),
+        })?,
+        substituter: substituter.ok_or_else(|| Error::MissingRequiredArgument {
+            flag: "--substituter".to_owned(),
+        })?,
+        json,
+        realization_policy,
+    })
+}
+
 /// Parses process arguments and runs the switch plan.
 ///
 /// # Errors
@@ -180,6 +293,22 @@ where
 /// activation commands fail, or when publish/verify reports missing cache paths.
 pub fn run_from_env() -> Result<()> {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
+    if args.first().is_some_and(|arg| arg == "plan") {
+        let plan_args = &args[1..];
+        if plan_args.iter().any(|arg| arg == "-h" || arg == "--help") {
+            println!("{}", plan_usage());
+            return Ok(());
+        }
+        let options = parse_plan_args(plan_args.iter().cloned())?;
+        let plan = plan_closure(
+            &options.toplevel_attr,
+            &options.build_system,
+            &options.host_system,
+            &options.substituter,
+            &options.realization_policy,
+        )?;
+        return print_plan(&plan, options.json);
+    }
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         println!("{}", usage());
         return Ok(());
@@ -187,6 +316,44 @@ pub fn run_from_env() -> Result<()> {
 
     let options = parse_args(args)?;
     run_with_options(&options)
+}
+
+fn print_plan(plan: &ClosurePlan, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(plan).map_err(|source| Error::PlannerJson { source })?
+        );
+        return Ok(());
+    }
+
+    println!("build-system={}", plan.build_system);
+    println!("host-system={}", plan.host_system);
+    println!("host-substituted={}", plan.counts.host_substituted);
+    println!("build-local={}", plan.counts.build_local);
+    println!("host-remote={}", plan.counts.host_remote);
+    println!("unhandled={}", plan.counts.unhandled);
+
+    for class in [
+        DerivationClass::BuildLocal,
+        DerivationClass::HostRemote,
+        DerivationClass::Unhandled,
+    ] {
+        let paths = plan
+            .derivations
+            .iter()
+            .filter(|derivation| derivation.class == class)
+            .map(|derivation| derivation.drv.as_str())
+            .collect::<Vec<_>>();
+        if paths.is_empty() {
+            continue;
+        }
+        println!("{class:?}:");
+        for path in paths {
+            println!("  {path}");
+        }
+    }
+    Ok(())
 }
 
 /// Runs one CLI switch invocation from already-parsed options.
@@ -344,6 +511,34 @@ mod tests {
         assert!(!options.capture);
         assert!(!options.use_substitutes);
         assert!(!options.remote_sudo);
+        assert_eq!(
+            options.realization_policy,
+            RealizationPolicy::SubstituteOnly
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_parser_requires_read_only_inputs() {
+        let error = parse_plan_args(["--toplevel", ".#top"]).unwrap_err();
+        assert!(error.to_string().contains("--build-system"));
+    }
+
+    #[test]
+    fn planner_parser_accepts_machine_readable_substitute_only_plan() -> Result<()> {
+        let options = parse_plan_args([
+            "--toplevel",
+            ".#top",
+            "--build-system",
+            "x86_64-linux",
+            "--host-system",
+            "aarch64-linux",
+            "--substituter",
+            "https://cache.example",
+            "--json",
+        ])?;
+
+        assert!(options.json);
         assert_eq!(
             options.realization_policy,
             RealizationPolicy::SubstituteOnly
