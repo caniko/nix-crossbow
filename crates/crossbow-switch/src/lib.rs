@@ -6,8 +6,9 @@
 
 #![warn(missing_docs)]
 
+use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 use sha2::{Digest, Sha256};
 
@@ -19,7 +20,7 @@ pub mod error;
 pub mod executor;
 /// Typed access to Crossbow's shared target/profile metadata.
 pub mod metadata;
-/// Structured dry-run planning for cache-shaped realizations.
+/// Structured derivation-closure planning for cache-shaped realizations.
 pub mod planner;
 /// Parsed Crossbow requirements artifact (roots, drvs, fingerprint).
 pub mod requirements;
@@ -278,23 +279,42 @@ impl Runner for ProcessRunner {
         let attr = plan.toplevel_attr;
         let args =
             cache_shaped_build_args_with_policy(attr, plan.max_jobs, &plan.realization_policy)?;
-        let output =
-            Command::new("nix")
-                .args(&args)
-                .output()
-                .map_err(|source| Error::NixBuildRun {
-                    attr: attr.to_owned(),
-                    source,
-                })?;
+        eprintln!("crossbow: stage=realize attr={attr}");
+        let mut child = Command::new("nix")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|source| Error::NixBuildRun {
+                attr: attr.to_owned(),
+                source,
+            })?;
+        let mut stdout = Vec::new();
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::NixBuildFailed {
+                attr: attr.to_owned(),
+                stderr: "nix build stdout was not captured".to_owned(),
+            })?
+            .read_to_end(&mut stdout)
+            .map_err(|source| Error::NixBuildFailed {
+                attr: attr.to_owned(),
+                stderr: format!("failed to read nix build output: {source}"),
+            })?;
+        let status = child.wait().map_err(|source| Error::NixBuildRun {
+            attr: attr.to_owned(),
+            source,
+        })?;
 
-        if !output.status.success() {
+        if !status.success() {
             return Err(Error::NixBuildFailed {
                 attr: attr.to_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                stderr: "see streamed nix build stderr".to_owned(),
             });
         }
 
-        let stdout = String::from_utf8(output.stdout).map_err(|source| Error::NixBuildUtf8 {
+        let stdout = String::from_utf8(stdout).map_err(|source| Error::NixBuildUtf8 {
             attr: attr.to_owned(),
             source,
         })?;
@@ -330,17 +350,25 @@ impl Runner for ProcessRunner {
 
         command.args(cache_shaped_switch_flags(plan.use_substitutes));
 
-        let output = command.output().map_err(|source| Error::NixosRebuildRun {
-            action: plan.action.to_owned(),
-            flake_attr: plan.flake_attr.to_owned(),
-            source,
-        })?;
+        eprintln!(
+            "crossbow: stage=activate action={} flake={}",
+            plan.action, plan.flake_attr
+        );
+        let status = command
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()
+            .map_err(|source| Error::NixosRebuildRun {
+                action: plan.action.to_owned(),
+                flake_attr: plan.flake_attr.to_owned(),
+                source,
+            })?;
 
-        if !output.status.success() {
+        if !status.success() {
             return Err(Error::NixosRebuildFailed {
                 action: plan.action.to_owned(),
                 flake_attr: plan.flake_attr.to_owned(),
-                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+                stderr: "see streamed nixos-rebuild stderr".to_owned(),
             });
         }
 
@@ -354,11 +382,17 @@ fn run_cache_shaped_switch_with_runner(
     verifier: &dyn Verifier,
     runner: &dyn Runner,
 ) -> Result<()> {
+    eprintln!(
+        "crossbow: stage=prepare action={} flake={}",
+        plan.action, plan.flake_attr
+    );
     let prepared = prepare_switch_with_runner(plan, runner)?;
 
     if plan.capture {
         let paths = &prepared.closure;
+        eprintln!("crossbow: stage=publish paths={}", paths.len());
         publisher.publish(paths)?;
+        eprintln!("crossbow: stage=verify paths={}", paths.len());
         let missing = verifier.verify_present(paths)?;
 
         if !missing.is_empty() {

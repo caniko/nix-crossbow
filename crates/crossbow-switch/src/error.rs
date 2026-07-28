@@ -181,6 +181,15 @@ pub enum Error {
         drv: String,
     },
 
+    /// Nix omitted one requested output while resolving a derivation output.
+    #[error("crossbow: planner could not resolve output `{output}` of `{drv}`")]
+    PlannerMissingOutput {
+        /// Derivation path.
+        drv: String,
+        /// Output name.
+        output: String,
+    },
+
     /// A cache probe could not be spawned.
     #[error("crossbow: failed to probe `{output}` in substituter `{substituter}`")]
     PlannerCacheProbe {

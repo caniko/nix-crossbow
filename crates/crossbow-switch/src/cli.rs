@@ -38,7 +38,7 @@ pub struct CliOptions {
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Parsed options for the read-only structured planner.
 pub struct PlanOptions {
-    /// Toplevel installable passed to `nix build --dry-run`.
+    /// Toplevel installable whose complete derivation closure is planned.
     pub toplevel_attr: String,
     /// Crossbow build-host system.
     pub build_system: String,
