@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 
 use crate::{
     ClosurePlan, DerivationClass, Error, Publisher, RealizationPolicy, Result, SwitchPlan,
-    TrustPublish, Verifier, plan_closure, run_cache_shaped_switch,
+    TrustPublish, Verifier, run_cache_shaped_switch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,8 +44,8 @@ pub struct PlanOptions {
     pub build_system: String,
     /// Target host system.
     pub host_system: String,
-    /// Store URL used for read-only cache probes.
-    pub substituter: String,
+    /// Store URLs used for read-only cache probes.
+    pub substituters: Vec<String>,
     /// Whether to emit the complete machine-readable report.
     pub json: bool,
     /// Explicit policy for missing derivations.
@@ -61,7 +61,7 @@ pub fn usage() -> &'static str {
 /// Returns the usage string for the read-only planner.
 #[must_use]
 pub fn plan_usage() -> &'static str {
-    "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
+    "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--substituter <store> ...] [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -205,7 +205,7 @@ where
     let mut toplevel_attr = None;
     let mut build_system = None;
     let mut host_system = None;
-    let mut substituter = None;
+    let mut substituters = Vec::new();
     let mut json = false;
     let mut realization_policy = "substitute-only".to_owned();
     let mut remote_builders = Vec::new();
@@ -227,7 +227,7 @@ where
             }
             "--substituter" => {
                 index += 1;
-                substituter = Some(required_value(&args, index, "--substituter")?.to_owned());
+                substituters.push(required_value(&args, index, "--substituter")?.to_owned());
             }
             "--json" => json = true,
             "--realization-policy" => {
@@ -277,9 +277,13 @@ where
         host_system: host_system.ok_or_else(|| Error::MissingRequiredArgument {
             flag: "--host-system".to_owned(),
         })?,
-        substituter: substituter.ok_or_else(|| Error::MissingRequiredArgument {
-            flag: "--substituter".to_owned(),
-        })?,
+        substituters: if substituters.is_empty() {
+            return Err(Error::MissingRequiredArgument {
+                flag: "--substituter".to_owned(),
+            });
+        } else {
+            substituters
+        },
         json,
         realization_policy,
     })
@@ -300,11 +304,11 @@ pub fn run_from_env() -> Result<()> {
             return Ok(());
         }
         let options = parse_plan_args(plan_args.iter().cloned())?;
-        let plan = plan_closure(
+        let plan = crate::plan_closure_with_substituters(
             &options.toplevel_attr,
             &options.build_system,
             &options.host_system,
-            &options.substituter,
+            &options.substituters,
             &options.realization_policy,
         )?;
         return print_plan(&plan, options.json);
@@ -539,9 +543,35 @@ mod tests {
         ])?;
 
         assert!(options.json);
+        assert_eq!(options.substituters, vec!["https://cache.example"]);
         assert_eq!(
             options.realization_policy,
             RealizationPolicy::SubstituteOnly
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn planner_parser_accepts_repeated_substituters() -> Result<()> {
+        let options = parse_plan_args([
+            "--toplevel",
+            ".#top",
+            "--build-system",
+            "x86_64-linux",
+            "--host-system",
+            "aarch64-linux",
+            "--substituter",
+            "https://private.example",
+            "--substituter",
+            "https://cache.nixos.org",
+        ])?;
+
+        assert_eq!(
+            options.substituters,
+            vec![
+                "https://private.example".to_string(),
+                "https://cache.nixos.org".to_string()
+            ]
         );
         Ok(())
     }

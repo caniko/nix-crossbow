@@ -190,6 +190,10 @@ pub enum Error {
         output: String,
     },
 
+    /// The exact planner was invoked without any cache to probe.
+    #[error("crossbow: exact planner requires at least one configured substituter")]
+    PlannerNoSubstituters,
+
     /// A cache probe could not be spawned.
     #[error("crossbow: failed to probe `{output}` in substituter `{substituter}`")]
     PlannerCacheProbe {

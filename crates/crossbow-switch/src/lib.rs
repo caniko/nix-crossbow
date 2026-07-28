@@ -28,11 +28,14 @@ pub mod requirements;
 pub mod state;
 
 pub use error::{Error, Result};
-pub use planner::{plan_closure, ClosurePlan, DerivationClass, DerivationPlan, PlanCounts};
-pub use requirements::{diff_roots, label_roots, LabeledRoot, RequirementsArtifact, RootDiff};
+pub use planner::{
+    ClosurePlan, DerivationClass, DerivationPlan, PlanCounts, plan_closure,
+    plan_closure_with_substituters,
+};
+pub use requirements::{LabeledRoot, RequirementsArtifact, RootDiff, diff_roots, label_roots};
 pub use state::{
-    load_prepared_state, save_prepared_state, state_file_path, state_to_labeled_roots,
-    PreparedState, StateStatus,
+    PreparedState, StateStatus, load_prepared_state, save_prepared_state, state_file_path,
+    state_to_labeled_roots,
 };
 
 /// Controls which builders may realize missing derivations before activation.

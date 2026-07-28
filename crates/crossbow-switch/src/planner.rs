@@ -39,7 +39,7 @@ pub struct DerivationPlan {
 /// Counts for a structured closure plan.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanCounts {
-    /// Outputs already available from substituters.
+    /// Outputs already available from the configured substituters.
     pub host_substituted: usize,
     /// Derivations Nix will build on the build host.
     pub build_local: usize,
@@ -113,6 +113,28 @@ pub fn plan_closure(
     substituter: &str,
     policy: &RealizationPolicy,
 ) -> Result<ClosurePlan> {
+    plan_closure_with_substituters(
+        attr,
+        build_system,
+        host_system,
+        &[substituter.to_owned()],
+        policy,
+    )
+}
+
+/// Computes a structured plan using the union of the supplied substituters.
+///
+/// The order is significant only for efficiency: each later substituter is
+/// queried for outputs still missing from the earlier ones. Duplicate URLs
+/// are ignored. At least one substituter is required so a failed configuration
+/// cannot be mistaken for a cache-shaped closure.
+pub fn plan_closure_with_substituters(
+    attr: &str,
+    build_system: &str,
+    host_system: &str,
+    substituters: &[String],
+    policy: &RealizationPolicy,
+) -> Result<ClosurePlan> {
     let root_args = ["derivation", "show", "--no-pretty", attr]
         .into_iter()
         .map(str::to_owned)
@@ -136,7 +158,7 @@ pub fn plan_closure(
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let availability = probe_outputs(substituter, &all_outputs)?;
+    let availability = probe_outputs(substituters, &all_outputs)?;
 
     let mut derivations = Vec::with_capacity(graph.derivations.len());
     let mut counts = PlanCounts::default();
@@ -420,7 +442,44 @@ fn run_command_with_stderr(
     String::from_utf8(stdout).map_err(|source| Error::PlannerUtf8 { command, source })
 }
 
-fn probe_outputs(substituter: &str, outputs: &[String]) -> Result<BTreeMap<String, bool>> {
+fn probe_outputs(substituters: &[String], outputs: &[String]) -> Result<BTreeMap<String, bool>> {
+    if substituters.is_empty() {
+        return Err(Error::PlannerNoSubstituters);
+    }
+
+    let mut availability = outputs
+        .iter()
+        .cloned()
+        .map(|output| (output, false))
+        .collect::<BTreeMap<_, _>>();
+    let mut pending = outputs.to_vec();
+    let mut queried = BTreeSet::new();
+
+    for substituter in substituters {
+        if !queried.insert(substituter) || pending.is_empty() {
+            continue;
+        }
+
+        let probed = probe_substituter_outputs(substituter, &pending)?;
+        merge_availability(&mut availability, probed);
+        pending.retain(|output| !availability.get(output).copied().unwrap_or(false));
+    }
+
+    Ok(availability)
+}
+
+fn merge_availability(availability: &mut BTreeMap<String, bool>, probed: BTreeMap<String, bool>) {
+    for (output, present) in probed {
+        if present {
+            availability.insert(output, true);
+        }
+    }
+}
+
+fn probe_substituter_outputs(
+    substituter: &str,
+    outputs: &[String],
+) -> Result<BTreeMap<String, bool>> {
     let mut availability = BTreeMap::new();
     for chunk in outputs.chunks(1024) {
         let mut args = vec![
@@ -527,5 +586,22 @@ mod tests {
                 "/nix/store/foo.drv".to_owned(),
             ])
         );
+    }
+
+    #[test]
+    fn union_probe_keeps_an_output_found_by_an_earlier_substituter() {
+        let mut availability = BTreeMap::from([
+            ("/nix/store/a".to_owned(), true),
+            ("/nix/store/b".to_owned(), false),
+        ]);
+        let later_probe = BTreeMap::from([
+            ("/nix/store/a".to_owned(), false),
+            ("/nix/store/b".to_owned(), true),
+        ]);
+
+        merge_availability(&mut availability, later_probe);
+
+        assert!(availability["/nix/store/a"]);
+        assert!(availability["/nix/store/b"]);
     }
 }
