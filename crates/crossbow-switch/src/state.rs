@@ -6,6 +6,7 @@
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,8 @@ pub enum StateStatus {
         old_flake_ref: String,
         /// Current frozen flake ref.
         new_flake_ref: String,
+        /// The previous state, retained for slow-path root diffing.
+        state: PreparedState,
     },
     /// All checks passed — the saved roots are still valid.
     Current(PreparedState),
@@ -62,26 +65,54 @@ pub fn save_prepared_state(path: &Path, state: &PreparedState) -> Result<()> {
             source: e,
         })?;
     }
-    let json = serde_json::to_string_pretty(state)
-        .map_err(|source| crate::Error::MetadataJson { source })?;
-    fs::write(path, json).map_err(|e| crate::Error::NixStoreRead {
-        file: path.display().to_string(),
-        source: e,
-    })?;
-    Ok(())
+    let json =
+        serde_json::to_vec_pretty(state).map_err(|source| crate::Error::MetadataJson { source })?;
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("crossbow-prepared-state.json");
+    let temporary = parent.join(format!(".{name}.tmp-{}", std::process::id()));
+
+    let result = (|| {
+        let mut file = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|e| crate::Error::NixStoreRead {
+                file: temporary.display().to_string(),
+                source: e,
+            })?;
+        file.write_all(&json)
+            .map_err(|e| crate::Error::NixStoreRead {
+                file: temporary.display().to_string(),
+                source: e,
+            })?;
+        file.sync_all().map_err(|e| crate::Error::NixStoreRead {
+            file: temporary.display().to_string(),
+            source: e,
+        })?;
+        fs::rename(&temporary, path).map_err(|e| crate::Error::NixStoreRead {
+            file: path.display().to_string(),
+            source: e,
+        })?;
+        Ok(())
+    })();
+
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 /// Load a prepared state from `path`, keyed by `frozen_flake_ref`.
 ///
 /// Returns:
 /// - `StateStatus::Missing` when the file does not exist.
-/// - `StateStatus::Stale` when the file exists but the ref has changed
-///   (the stale file is **deleted** before returning).
+/// - `StateStatus::Stale` when the file exists but the ref has changed.  The
+///   stale state remains on disk so a slow-path prepare can diff its old roots.
 /// - `StateStatus::Current(prepared_state)` when the ref matches.
-pub fn load_prepared_state(
-    path: &Path,
-    frozen_flake_ref: &str,
-) -> Result<StateStatus> {
+pub fn load_prepared_state(path: &Path, frozen_flake_ref: &str) -> Result<StateStatus> {
     let json = match fs::read_to_string(path) {
         Ok(json) => json,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -95,15 +126,15 @@ pub fn load_prepared_state(
         }
     };
 
-    let state: PreparedState = serde_json::from_str(&json)
-        .map_err(|source| crate::Error::MetadataJson { source })?;
+    let state: PreparedState =
+        serde_json::from_str(&json).map_err(|source| crate::Error::MetadataJson { source })?;
 
     if state.frozen_flake_ref != frozen_flake_ref {
         let old_ref = state.frozen_flake_ref.clone();
-        let _ = fs::remove_file(path);
         return Ok(StateStatus::Stale {
             old_flake_ref: old_ref,
             new_flake_ref: frozen_flake_ref.to_owned(),
+            state,
         });
     }
 
@@ -124,11 +155,7 @@ pub fn state_to_labeled_roots(state: &PreparedState) -> Vec<LabeledRoot> {
         .map(|(label, path)| LabeledRoot {
             label: label.clone(),
             path: path.clone(),
-            fingerprint: state
-                .fingerprints
-                .get(label)
-                .cloned()
-                .unwrap_or_default(),
+            fingerprint: state.fingerprints.get(label).cloned().unwrap_or_default(),
         })
         .collect()
 }
@@ -141,12 +168,8 @@ mod tests {
     fn simple_state() -> PreparedState {
         PreparedState {
             frozen_flake_ref: "/nix/store/abc#testhost-crossbow".into(),
-            roots: BTreeMap::from([
-                ("system-toplevel".into(), "/nix/store/root1".into()),
-            ]),
-            fingerprints: BTreeMap::from([
-                ("system-toplevel".into(), "fp1".into()),
-            ]),
+            roots: BTreeMap::from([("system-toplevel".into(), "/nix/store/root1".into())]),
+            fingerprints: BTreeMap::from([("system-toplevel".into(), "fp1".into())]),
             prepared_at: Some("2026-01-01T00:00:00Z".into()),
         }
     }
@@ -181,18 +204,18 @@ mod tests {
     }
 
     #[test]
-    fn load_returns_stale_when_ref_differs_and_deletes_file() {
+    fn load_returns_stale_when_ref_differs_and_retains_file() {
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("state.json");
         save_prepared_state(&path, &simple_state()).unwrap();
 
-        let status =
-            load_prepared_state(&path, "/nix/store/new#host-crossbow").unwrap();
+        let status = load_prepared_state(&path, "/nix/store/new#host-crossbow").unwrap();
 
         match status {
             StateStatus::Stale {
                 old_flake_ref,
                 new_flake_ref,
+                ..
             } => {
                 assert_eq!(old_flake_ref, "/nix/store/abc#testhost-crossbow");
                 assert_eq!(new_flake_ref, "/nix/store/new#host-crossbow");
@@ -200,8 +223,8 @@ mod tests {
             other => panic!("expected Stale, got {other:?}"),
         }
 
-        // State file should be deleted.
-        assert!(!path.exists(), "stale state file should be deleted");
+        // State file remains available for the slow-path root diff.
+        assert!(path.exists(), "stale state should be retained");
     }
 
     #[test]
@@ -212,9 +235,7 @@ mod tests {
                 ("system-toplevel".into(), "/nix/store/path1".into()),
                 ("identity-cli".into(), "/nix/store/path2".into()),
             ]),
-            fingerprints: BTreeMap::from([
-                ("system-toplevel".into(), "fp1".into()),
-            ]),
+            fingerprints: BTreeMap::from([("system-toplevel".into(), "fp1".into())]),
             prepared_at: None,
         };
 
@@ -241,7 +262,10 @@ mod tests {
         let status = load_prepared_state(&path, "/nix/store/abc#host-crossbow").unwrap();
         match status {
             StateStatus::Current(s) => {
-                assert_eq!(s.roots.get("root-0").map(String::as_str), Some("/nix/store/root1"));
+                assert_eq!(
+                    s.roots.get("root-0").map(String::as_str),
+                    Some("/nix/store/root1")
+                );
                 assert!(s.fingerprints.is_empty());
                 assert!(s.prepared_at.is_none());
             }
