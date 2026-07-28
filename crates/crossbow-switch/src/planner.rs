@@ -62,12 +62,12 @@ pub struct ClosurePlan {
     pub counts: PlanCounts,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DerivationGraph {
     derivations: BTreeMap<String, DerivationNode>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DerivationNode {
     system: String,
     outputs: BTreeMap<String, DerivationOutput>,
@@ -75,19 +75,19 @@ struct DerivationNode {
     inputs: DerivationInputs,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct DerivationInputs {
     #[serde(default)]
     drvs: BTreeMap<String, DerivationInput>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct DerivationInput {
     #[serde(default)]
     outputs: Vec<String>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Clone, Default, Deserialize)]
 struct DerivationOutput {
     #[serde(default)]
     path: Option<String>,
@@ -105,7 +105,9 @@ struct OutputEntry {
 /// `nix build --dry-run --json` reports only the requested installable, not its
 /// complete action set. Nix's local derivation closure is enumerated first and
 /// then shown in bounded batches; output paths and substituter availability are
-/// resolved in batches. Human stderr is never parsed.
+/// resolved in batches. The realization frontier stops at substituted nodes,
+/// matching Nix's behavior of not realizing the inputs of a cache hit. Human
+/// stderr is never parsed.
 pub fn plan_closure(
     attr: &str,
     build_system: &str,
@@ -159,16 +161,22 @@ pub fn plan_closure_with_substituters(
         .into_iter()
         .collect::<Vec<_>>();
     let availability = probe_outputs(substituters, &all_outputs)?;
+    let frontier = realization_frontier(&roots, &graph, &required, &output_paths, &availability);
 
-    let mut derivations = Vec::with_capacity(graph.derivations.len());
+    let mut derivations = Vec::with_capacity(frontier.len());
     let mut counts = PlanCounts::default();
-    for (key, node) in &graph.derivations {
+    for (key, names) in frontier {
+        let Some(node) = graph.derivations.get(&key) else {
+            continue;
+        };
         if node.system == "builtin" {
             continue;
         }
-        let Some(outputs) = output_paths.get(key) else {
-            continue;
-        };
+        let outputs = names
+            .iter()
+            .filter_map(|name| output_path_for_name(&required, &output_paths, &key, name))
+            .cloned()
+            .collect::<Vec<_>>();
         let substitutable = outputs
             .iter()
             .all(|output| availability.get(output).copied().unwrap_or(false));
@@ -196,7 +204,7 @@ pub fn plan_closure_with_substituters(
             DerivationClass::Unhandled => counts.unhandled += 1,
         }
         derivations.push(DerivationPlan {
-            drv: store_path(key),
+            drv: store_path(&key),
             outputs: outputs.clone(),
             system,
             class,
@@ -211,6 +219,70 @@ pub fn plan_closure_with_substituters(
         derivations,
         counts,
     })
+}
+
+/// Returns the derivations Nix may need to realize for the requested outputs.
+///
+/// A derivation whose requested outputs are all available from the configured
+/// substituter is a leaf in the realization graph: its inputs are only build
+/// inputs for the cached result and must not be treated as additional misses.
+fn realization_frontier(
+    roots: &DerivationGraph,
+    graph: &DerivationGraph,
+    required: &BTreeMap<String, BTreeSet<String>>,
+    output_paths: &BTreeMap<String, Vec<String>>,
+    availability: &BTreeMap<String, bool>,
+) -> BTreeMap<String, BTreeSet<String>> {
+    let mut frontier = BTreeMap::<String, BTreeSet<String>>::new();
+    let mut pending = Vec::<(String, BTreeSet<String>)>::new();
+
+    for key in roots.derivations.keys() {
+        if graph.derivations.contains_key(key) {
+            let key = derivation_key(key);
+            pending.push((key.clone(), required.get(&key).cloned().unwrap_or_default()));
+        }
+    }
+
+    while let Some((key, names)) = pending.pop() {
+        let entry = frontier.entry(key.clone()).or_default();
+        let changed = names.into_iter().any(|name| entry.insert(name));
+        if !changed {
+            continue;
+        }
+
+        let Some(node) = graph.derivations.get(&key) else {
+            continue;
+        };
+        let substitutable = entry.iter().all(|name| {
+            output_path_for_name(required, output_paths, &key, name)
+                .is_some_and(|path| availability.get(path).copied().unwrap_or(false))
+        });
+        if substitutable {
+            continue;
+        }
+
+        for (input_key, input) in &node.inputs.drvs {
+            pending.push((
+                derivation_key(input_key),
+                input.outputs.iter().cloned().collect(),
+            ));
+        }
+    }
+
+    frontier
+}
+
+fn output_path_for_name<'a>(
+    required: &BTreeMap<String, BTreeSet<String>>,
+    output_paths: &'a BTreeMap<String, Vec<String>>,
+    key: &str,
+    name: &str,
+) -> Option<&'a String> {
+    let index = required
+        .get(key)?
+        .iter()
+        .position(|required_name| required_name == name)?;
+    output_paths.get(key)?.get(index)
 }
 
 fn parse_graph(value: &str) -> Result<DerivationGraph> {
@@ -603,5 +675,59 @@ mod tests {
 
         assert!(availability["/nix/store/a"]);
         assert!(availability["/nix/store/b"]);
+    }
+
+    #[test]
+    fn realization_frontier_prunes_inputs_of_substituted_nodes() {
+        let graph_json = r#"
+        {"derivations": {
+          "root.drv": {
+            "system": "x86_64-linux",
+            "outputs": {"out": {"path": "root"}},
+            "inputs": {"drvs": {"cached.drv": {"outputs": ["out"]}}}
+          },
+          "cached.drv": {
+            "system": "aarch64-linux",
+            "outputs": {"out": {"path": "cached"}},
+            "inputs": {"drvs": {"missing.drv": {"outputs": ["out"]}}}
+          },
+          "missing.drv": {
+            "system": "aarch64-linux",
+            "outputs": {"out": {"path": "missing"}},
+            "inputs": {"drvs": {}}
+          }
+        }, "version": 4}
+        "#;
+        let graph = parse_graph(graph_json).unwrap();
+        let roots = DerivationGraph {
+            derivations: BTreeMap::from([(
+                "root.drv".to_owned(),
+                graph.derivations["root.drv"].clone(),
+            )]),
+        };
+        let required = required_outputs(&roots, &graph);
+        let output_paths = BTreeMap::from([
+            ("root.drv".to_owned(), vec!["/nix/store/root".to_owned()]),
+            (
+                "cached.drv".to_owned(),
+                vec!["/nix/store/cached".to_owned()],
+            ),
+            (
+                "missing.drv".to_owned(),
+                vec!["/nix/store/missing".to_owned()],
+            ),
+        ]);
+        let availability = BTreeMap::from([
+            ("/nix/store/root".to_owned(), false),
+            ("/nix/store/cached".to_owned(), true),
+            ("/nix/store/missing".to_owned(), false),
+        ]);
+
+        let frontier =
+            realization_frontier(&roots, &graph, &required, &output_paths, &availability);
+
+        assert!(frontier.contains_key("root.drv"));
+        assert!(frontier.contains_key("cached.drv"));
+        assert!(!frontier.contains_key("missing.drv"));
     }
 }
