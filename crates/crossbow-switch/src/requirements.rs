@@ -42,8 +42,7 @@ impl RequirementsArtifact {
         let drvs = read_lines(&artifact_path.join("drvs"))?;
         let fingerprint = read_file_optional(&artifact_path.join("fingerprint"))?;
         let root_labels = read_lines_optional(&artifact_path.join("root-labels"))?;
-        let root_fingerprints =
-            read_lines_optional(&artifact_path.join("root-fingerprints"))?;
+        let root_fingerprints = read_lines_optional(&artifact_path.join("root-fingerprints"))?;
         Ok(Self {
             roots,
             drvs,
@@ -82,12 +81,11 @@ pub fn label_roots(artifact: &RequirementsArtifact) -> Vec<LabeledRoot> {
             .map(|i| format!("root-{i}"))
             .collect()
     };
-    let fingerprints: Vec<String> =
-        if artifact.root_fingerprints.len() == artifact.roots.len() {
-            artifact.root_fingerprints.clone()
-        } else {
-            vec![String::new(); artifact.roots.len()]
-        };
+    let fingerprints: Vec<String> = if artifact.root_fingerprints.len() == artifact.roots.len() {
+        artifact.root_fingerprints.clone()
+    } else {
+        vec![String::new(); artifact.roots.len()]
+    };
     artifact
         .roots
         .iter()
@@ -131,8 +129,7 @@ pub fn diff_roots(old: &[LabeledRoot], new: &[LabeledRoot]) -> RootDiff {
                 added.push(new_root.clone());
             }
             Some(old_root) => {
-                if old_root.fingerprint == new_root.fingerprint
-                    && !new_root.fingerprint.is_empty()
+                if old_root.fingerprint == new_root.fingerprint && !new_root.fingerprint.is_empty()
                 {
                     unchanged.push(new_root.clone());
                 } else {
@@ -209,7 +206,11 @@ mod tests {
     #[test]
     fn reads_roots_drvs_and_fingerprint() {
         let dir = TempDir::new().unwrap();
-        write_file(&dir, "roots", "/nix/store/aaa-toplevel\n/nix/store/bbb-etc\n");
+        write_file(
+            &dir,
+            "roots",
+            "/nix/store/aaa-toplevel\n/nix/store/bbb-etc\n",
+        );
         write_file(&dir, "drvs", "/nix/store/aaa.drv\n/nix/store/bbb.drv\n");
         write_file(&dir, "fingerprint", "sha256-abc123\n");
 
@@ -218,7 +219,10 @@ mod tests {
             artifact.roots,
             vec!["/nix/store/aaa-toplevel", "/nix/store/bbb-etc"]
         );
-        assert_eq!(artifact.drvs, vec!["/nix/store/aaa.drv", "/nix/store/bbb.drv"]);
+        assert_eq!(
+            artifact.drvs,
+            vec!["/nix/store/aaa.drv", "/nix/store/bbb.drv"]
+        );
         assert_eq!(artifact.fingerprint.as_deref(), Some("sha256-abc123"));
     }
 
@@ -260,18 +264,14 @@ mod tests {
         write_file(&dir, "roots", "/nix/store/aaa\n/nix/store/bbb\n");
         write_file(&dir, "drvs", "/nix/store/aaa.drv\n/nix/store/bbb.drv\n");
         write_file(&dir, "root-labels", "system-toplevel\nidentity-cli\n");
-        write_file(
-            &dir,
-            "root-fingerprints",
-            "sha256-one\nsha256-two\n",
-        );
+        write_file(&dir, "root-fingerprints", "sha256-one\nsha256-two\n");
 
         let artifact = RequirementsArtifact::read(dir.path()).unwrap();
-        assert_eq!(artifact.root_labels, vec!["system-toplevel", "identity-cli"]);
         assert_eq!(
-            artifact.root_fingerprints,
-            vec!["sha256-one", "sha256-two"]
+            artifact.root_labels,
+            vec!["system-toplevel", "identity-cli"]
         );
+        assert_eq!(artifact.root_fingerprints, vec!["sha256-one", "sha256-two"]);
     }
 
     #[test]
@@ -392,8 +392,8 @@ mod tests {
         ];
         let new = vec![
             root("system-toplevel", "/nix/store/sys-new", "fp-sys-new"), // changed
-            root("identity-cli", "/nix/store/id-old", "fp-id"), // unchanged
-            root("new-pkg", "/nix/store/new", "fp-new"), // added
+            root("identity-cli", "/nix/store/id-old", "fp-id"),          // unchanged
+            root("new-pkg", "/nix/store/new", "fp-new"),                 // added
         ];
 
         let diff = diff_roots(&old, &new);

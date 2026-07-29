@@ -78,10 +78,7 @@ pub fn save_prepared_state(path: &Path, state: &PreparedState) -> Result<()> {
 /// - `StateStatus::Stale` when the file exists but the ref has changed
 ///   (the stale file is **deleted** before returning).
 /// - `StateStatus::Current(prepared_state)` when the ref matches.
-pub fn load_prepared_state(
-    path: &Path,
-    frozen_flake_ref: &str,
-) -> Result<StateStatus> {
+pub fn load_prepared_state(path: &Path, frozen_flake_ref: &str) -> Result<StateStatus> {
     let json = match fs::read_to_string(path) {
         Ok(json) => json,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -95,8 +92,8 @@ pub fn load_prepared_state(
         }
     };
 
-    let state: PreparedState = serde_json::from_str(&json)
-        .map_err(|source| crate::Error::MetadataJson { source })?;
+    let state: PreparedState =
+        serde_json::from_str(&json).map_err(|source| crate::Error::MetadataJson { source })?;
 
     if state.frozen_flake_ref != frozen_flake_ref {
         let old_ref = state.frozen_flake_ref.clone();
@@ -124,11 +121,7 @@ pub fn state_to_labeled_roots(state: &PreparedState) -> Vec<LabeledRoot> {
         .map(|(label, path)| LabeledRoot {
             label: label.clone(),
             path: path.clone(),
-            fingerprint: state
-                .fingerprints
-                .get(label)
-                .cloned()
-                .unwrap_or_default(),
+            fingerprint: state.fingerprints.get(label).cloned().unwrap_or_default(),
         })
         .collect()
 }
@@ -141,12 +134,8 @@ mod tests {
     fn simple_state() -> PreparedState {
         PreparedState {
             frozen_flake_ref: "/nix/store/abc#testhost-crossbow".into(),
-            roots: BTreeMap::from([
-                ("system-toplevel".into(), "/nix/store/root1".into()),
-            ]),
-            fingerprints: BTreeMap::from([
-                ("system-toplevel".into(), "fp1".into()),
-            ]),
+            roots: BTreeMap::from([("system-toplevel".into(), "/nix/store/root1".into())]),
+            fingerprints: BTreeMap::from([("system-toplevel".into(), "fp1".into())]),
             prepared_at: Some("2026-01-01T00:00:00Z".into()),
         }
     }
@@ -186,8 +175,7 @@ mod tests {
         let path = dir.path().join("state.json");
         save_prepared_state(&path, &simple_state()).unwrap();
 
-        let status =
-            load_prepared_state(&path, "/nix/store/new#host-crossbow").unwrap();
+        let status = load_prepared_state(&path, "/nix/store/new#host-crossbow").unwrap();
 
         match status {
             StateStatus::Stale {
@@ -212,9 +200,7 @@ mod tests {
                 ("system-toplevel".into(), "/nix/store/path1".into()),
                 ("identity-cli".into(), "/nix/store/path2".into()),
             ]),
-            fingerprints: BTreeMap::from([
-                ("system-toplevel".into(), "fp1".into()),
-            ]),
+            fingerprints: BTreeMap::from([("system-toplevel".into(), "fp1".into())]),
             prepared_at: None,
         };
 
@@ -241,7 +227,10 @@ mod tests {
         let status = load_prepared_state(&path, "/nix/store/abc#host-crossbow").unwrap();
         match status {
             StateStatus::Current(s) => {
-                assert_eq!(s.roots.get("root-0").map(String::as_str), Some("/nix/store/root1"));
+                assert_eq!(
+                    s.roots.get("root-0").map(String::as_str),
+                    Some("/nix/store/root1")
+                );
                 assert!(s.fingerprints.is_empty());
                 assert!(s.prepared_at.is_none());
             }
