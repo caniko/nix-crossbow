@@ -1,5 +1,6 @@
 [ci]
-provider = "crow"
-platform = "forgejo"
+provider = "actions"
+platform = "github"
 runtime = "nix"
-runner = "codefloe-global"
+runner = "ubuntu-24.04"
+workspace = true
