@@ -138,7 +138,10 @@
 
         packages = {
           crossbow-switch = buildCache.withRustCache {
-            package = pkgs.rustPlatform.buildRustPackage {
+            package = (pkgs.makeRustPlatform {
+              rustc = rs-harbor.lib.mkToolchain { toolchainProfile = "stable"; };
+              cargo = rs-harbor.lib.mkToolchain { toolchainProfile = "stable"; };
+            }).buildRustPackage {
               pname = "crossbow-switch";
               version = "0.1.0";
               src = ./.;

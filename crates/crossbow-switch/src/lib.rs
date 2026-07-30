@@ -6,9 +6,10 @@
 
 #![warn(missing_docs)]
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
 
 use sha2::{Digest, Sha256};
 
@@ -277,6 +278,35 @@ trait Runner {
 
 struct ProcessRunner;
 
+fn stream_stderr(stderr: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut stderr = stderr;
+        let mut captured = Vec::new();
+        let mut buffer = [0_u8; 8192];
+        let mut output = std::io::stderr().lock();
+
+        loop {
+            match stderr.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => {
+                    captured.extend_from_slice(&buffer[..read]);
+                    let _ = output.write_all(&buffer[..read]);
+                    let _ = output.flush();
+                }
+                Err(_) => break,
+            }
+        }
+
+        captured
+    })
+}
+
+fn join_stderr(handle: thread::JoinHandle<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&handle.join().unwrap_or_default())
+        .trim()
+        .to_owned()
+}
+
 impl Runner for ProcessRunner {
     fn build_toplevel(&self, plan: &SwitchPlan<'_>) -> Result<PathBuf> {
         let attr = plan.toplevel_attr;
@@ -286,34 +316,51 @@ impl Runner for ProcessRunner {
         let mut child = Command::new("nix")
             .args(&args)
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|source| Error::NixBuildRun {
                 attr: attr.to_owned(),
                 source,
             })?;
+        let stderr_thread = child.stderr.take().map(stream_stderr);
         let mut stdout = Vec::new();
-        child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::NixBuildFailed {
+        let stdout_result = child.stdout.take().ok_or_else(|| Error::RealizationFailed {
+            attr: attr.to_owned(),
+            status: None,
+            stderr: "nix build stdout was not captured".to_owned(),
+        });
+        let read_result = match stdout_result {
+            Ok(mut stdout_pipe) => stdout_pipe.read_to_end(&mut stdout),
+            Err(error) => {
+                if let Some(handle) = stderr_thread {
+                    let _ = handle.join();
+                }
+                return Err(error);
+            }
+        };
+        if let Err(source) = read_result {
+            let stderr = stderr_thread.map(join_stderr).unwrap_or_default();
+            return Err(Error::RealizationFailed {
                 attr: attr.to_owned(),
-                stderr: "nix build stdout was not captured".to_owned(),
-            })?
-            .read_to_end(&mut stdout)
-            .map_err(|source| Error::NixBuildFailed {
-                attr: attr.to_owned(),
-                stderr: format!("failed to read nix build output: {source}"),
-            })?;
+                status: None,
+                stderr: if stderr.is_empty() {
+                    format!("failed to read nix build output: {source}")
+                } else {
+                    format!("{stderr}\nfailed to read nix build output: {source}")
+                },
+            });
+        }
         let status = child.wait().map_err(|source| Error::NixBuildRun {
             attr: attr.to_owned(),
             source,
         })?;
+        let stderr = stderr_thread.map(join_stderr).unwrap_or_default();
 
         if !status.success() {
-            return Err(Error::NixBuildFailed {
+            return Err(Error::RealizationFailed {
                 attr: attr.to_owned(),
-                stderr: "see streamed nix build stderr".to_owned(),
+                status: status.code(),
+                stderr,
             });
         }
 
@@ -502,6 +549,18 @@ mod tests {
     use std::cell::Cell;
     use std::fs;
     use std::rc::Rc;
+
+    #[test]
+    fn realization_failure_retains_typed_context() {
+        let error = Error::RealizationFailed {
+            attr: ".#nixosConfigurations.thething".to_owned(),
+            status: Some(1),
+            stderr: "platform mismatch".to_owned(),
+        };
+
+        assert!(error.to_string().contains("thething"));
+        assert!(error.to_string().contains("platform mismatch"));
+    }
 
     struct FakePublisher {
         error: Option<&'static str>,

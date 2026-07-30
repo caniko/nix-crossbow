@@ -304,11 +304,13 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// `nix build` exited unsuccessfully.
-    #[error("crossbow: `nix build --no-link --print-out-paths {attr}` failed: {stderr}")]
-    NixBuildFailed {
+    /// The initial Crossbow toplevel realization failed.
+    #[error("crossbow: realization of `{attr}` failed (exit status {status:?}): {stderr}")]
+    RealizationFailed {
         /// Nix attribute passed to `nix build`.
         attr: String,
+        /// Process exit code, or `None` when the process ended without one.
+        status: Option<i32>,
         /// Captured stderr.
         stderr: String,
     },
