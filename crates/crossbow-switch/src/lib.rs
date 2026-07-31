@@ -28,7 +28,9 @@ pub mod requirements;
 /// Generic prepared-state persistence for prerequisite roots.
 pub mod state;
 
-pub use error::{Error, Result};
+pub use error::{
+    Error, MAX_REALIZATION_DIAGNOSTIC_BYTES, MissingPrerequisite, RealizationFailureKind, Result,
+};
 pub use planner::{
     ClosurePlan, DerivationClass, DerivationPlan, PlanCounts, plan_closure,
     plan_closure_with_substituters,
@@ -289,7 +291,7 @@ fn stream_stderr(stderr: impl Read + Send + 'static) -> thread::JoinHandle<Vec<u
             match stderr.read(&mut buffer) {
                 Ok(0) => break,
                 Ok(read) => {
-                    captured.extend_from_slice(&buffer[..read]);
+                    append_bounded(&mut captured, &buffer[..read]);
                     let _ = output.write_all(&buffer[..read]);
                     let _ = output.flush();
                 }
@@ -343,11 +345,11 @@ impl Runner for ProcessRunner {
             return Err(Error::RealizationFailed {
                 attr: attr.to_owned(),
                 status: None,
-                stderr: if stderr.is_empty() {
+                stderr: redact_diagnostic(&if stderr.is_empty() {
                     format!("failed to read nix build output: {source}")
                 } else {
                     format!("{stderr}\nfailed to read nix build output: {source}")
-                },
+                }),
             });
         }
         let status = child.wait().map_err(|source| Error::NixBuildRun {
@@ -357,11 +359,12 @@ impl Runner for ProcessRunner {
         let stderr = stderr_thread.map(join_stderr).unwrap_or_default();
 
         if !status.success() {
-            return Err(Error::RealizationFailed {
-                attr: attr.to_owned(),
-                status: status.code(),
-                stderr,
-            });
+            return Err(classify_nix_build_failure(
+                attr,
+                status.code(),
+                &stderr,
+                &plan.realization_policy,
+            ));
         }
 
         let stdout = String::from_utf8(stdout).map_err(|source| Error::NixBuildUtf8 {
@@ -532,6 +535,189 @@ fn first_non_empty_line(output: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn append_bounded(output: &mut Vec<u8>, chunk: &[u8]) {
+    if chunk.len() >= MAX_REALIZATION_DIAGNOSTIC_BYTES {
+        output.clear();
+        output.extend_from_slice(&chunk[chunk.len() - MAX_REALIZATION_DIAGNOSTIC_BYTES..]);
+        return;
+    }
+
+    let excess = output
+        .len()
+        .saturating_add(chunk.len())
+        .saturating_sub(MAX_REALIZATION_DIAGNOSTIC_BYTES);
+    if excess > 0 {
+        output.drain(..excess);
+    }
+    output.extend_from_slice(chunk);
+}
+
+fn classify_nix_build_failure(
+    attr: &str,
+    status: Option<i32>,
+    stderr: &str,
+    policy: &RealizationPolicy,
+) -> Error {
+    let kind = classify_realization_failure(stderr);
+    let diagnostic = redact_diagnostic(stderr);
+    let Some(kind) = kind else {
+        return Error::RealizationFailed {
+            attr: attr.to_owned(),
+            status,
+            stderr: diagnostic,
+        };
+    };
+
+    let prerequisite = MissingPrerequisite {
+        root: redact_identifier(attr),
+        system: affected_system(stderr),
+        cache_context: cache_context(&kind, policy),
+        recoverable_by_native_recovery: matches!(
+            kind,
+            RealizationFailureKind::MissingCacheRoot | RealizationFailureKind::WrongPlatform
+        ),
+        diagnostic,
+        kind,
+    };
+
+    Error::RealizationMissingPrerequisite {
+        attr: redact_identifier(attr),
+        status,
+        prerequisite: Box::new(prerequisite),
+    }
+}
+
+fn classify_realization_failure(stderr: &str) -> Option<RealizationFailureKind> {
+    let lower = stderr.to_ascii_lowercase();
+
+    if lower.contains("platform mismatch")
+        || (lower.contains("required") && lower.contains("but i am"))
+    {
+        return Some(RealizationFailureKind::WrongPlatform);
+    }
+
+    if lower.contains("remote builder")
+        || lower.contains("ssh-ng://")
+        || (lower.contains("builder for")
+            && (lower.contains("failed")
+                || lower.contains("unreachable")
+                || lower.contains("could not connect")))
+    {
+        return Some(RealizationFailureKind::RemoteBuilder);
+    }
+
+    if lower.contains("cache root")
+        || lower.contains("not available from any substituter")
+        || lower.contains("no substitute")
+        || lower.contains("cannot substitute")
+        || (lower.contains("substitut")
+            && (lower.contains("failed") || lower.contains("unavailable")))
+        || (lower.contains("required") && lower.contains("not available"))
+    {
+        return Some(RealizationFailureKind::MissingCacheRoot);
+    }
+
+    if lower.contains("realiz") || lower.contains("nix build") || lower.contains("build failed") {
+        return Some(RealizationFailureKind::NixRealization);
+    }
+
+    None
+}
+
+fn affected_system(stderr: &str) -> String {
+    [
+        "aarch64-linux",
+        "x86_64-linux",
+        "armv7l-linux",
+        "i686-linux",
+        "x86_64-darwin",
+        "aarch64-darwin",
+        "wasm32-wasi",
+    ]
+    .iter()
+    .find(|system| stderr.contains(**system))
+    .map_or_else(|| "unknown".to_owned(), |system| (*system).to_owned())
+}
+
+fn cache_context(kind: &RealizationFailureKind, policy: &RealizationPolicy) -> String {
+    match kind {
+        RealizationFailureKind::MissingCacheRoot => "configured substituters".to_owned(),
+        RealizationFailureKind::WrongPlatform => "host-platform cache".to_owned(),
+        RealizationFailureKind::RemoteBuilder => match policy {
+            RealizationPolicy::SubstituteOnly => "remote builders disabled".to_owned(),
+            RealizationPolicy::RemoteNative { .. } => "explicit remote builders".to_owned(),
+        },
+        RealizationFailureKind::NixRealization | RealizationFailureKind::Unknown => {
+            "nix realization".to_owned()
+        }
+    }
+}
+
+fn redact_identifier(value: &str) -> String {
+    redact_diagnostic(value)
+}
+
+fn redact_diagnostic(value: &str) -> String {
+    let mut diagnostic = value
+        .lines()
+        .filter(|line| {
+            let lower = line.to_ascii_lowercase();
+            ![
+                "authorization",
+                "bearer ",
+                "cookie",
+                "credential",
+                "password",
+                "secret",
+                "token",
+                "api_key",
+                "private_key",
+            ]
+            .iter()
+            .any(|marker| lower.contains(marker))
+        })
+        .map(|line| {
+            line.split_whitespace()
+                .map(|word| {
+                    let lower = word.to_ascii_lowercase();
+                    let path =
+                        word.trim_matches(|character: char| "'\"()[]{}<>,;:".contains(character));
+                    if lower.contains("ssh-ng://") {
+                        "<builder>".to_owned()
+                    } else if lower.contains("://") {
+                        "<endpoint>".to_owned()
+                    } else if path.starts_with('/') && !path.starts_with("/nix/store/") {
+                        "<path>".to_owned()
+                    } else {
+                        word.to_owned()
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        })
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    if diagnostic.is_empty() {
+        diagnostic.push_str("<no safe diagnostic>");
+    }
+    truncate_diagnostic(&diagnostic)
+}
+
+fn truncate_diagnostic(value: &str) -> String {
+    if value.len() <= MAX_REALIZATION_DIAGNOSTIC_BYTES {
+        return value.to_owned();
+    }
+
+    let suffix = "...";
+    let mut end = MAX_REALIZATION_DIAGNOSTIC_BYTES - suffix.len();
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}{}", &value[..end], suffix)
+}
+
 fn filter_publish_paths(requisites: &str) -> Vec<String> {
     requisites
         .lines()
@@ -560,6 +746,131 @@ mod tests {
 
         assert!(error.to_string().contains("thething"));
         assert!(error.to_string().contains("platform mismatch"));
+    }
+
+    #[test]
+    fn missing_cache_root_is_structured_and_recoverable() {
+        let error = classify_nix_build_failure(
+            ".#thething-crossbow",
+            Some(1),
+            "path '/nix/store/root' is required but is not available from any substituter",
+            &RealizationPolicy::SubstituteOnly,
+        );
+
+        let Error::RealizationMissingPrerequisite { prerequisite, .. } = error else {
+            panic!("missing cache root should be typed");
+        };
+        assert_eq!(prerequisite.kind, RealizationFailureKind::MissingCacheRoot);
+        assert_eq!(prerequisite.root, ".#thething-crossbow");
+        assert_eq!(prerequisite.system, "unknown");
+        assert_eq!(prerequisite.cache_context, "configured substituters");
+        assert!(prerequisite.recoverable_by_native_recovery);
+    }
+
+    #[test]
+    fn failed_substitution_is_a_missing_cache_root() {
+        let error = classify_nix_build_failure(
+            ".#thething-crossbow",
+            Some(1),
+            "failed substitution for the required output",
+            &RealizationPolicy::SubstituteOnly,
+        );
+
+        let Error::RealizationMissingPrerequisite { prerequisite, .. } = error else {
+            panic!("failed substitution should be typed");
+        };
+        assert_eq!(prerequisite.kind, RealizationFailureKind::MissingCacheRoot);
+    }
+
+    #[test]
+    fn wrong_platform_is_structured_and_recoverable() {
+        let error = classify_nix_build_failure(
+            ".#thething-crossbow",
+            Some(1),
+            "a 'aarch64-linux' with features is required, but I am a 'x86_64-linux'",
+            &RealizationPolicy::SubstituteOnly,
+        );
+
+        let Error::RealizationMissingPrerequisite { prerequisite, .. } = error else {
+            panic!("wrong platform should be typed");
+        };
+        assert_eq!(prerequisite.kind, RealizationFailureKind::WrongPlatform);
+        assert_eq!(prerequisite.system, "aarch64-linux");
+        assert!(prerequisite.recoverable_by_native_recovery);
+    }
+
+    #[test]
+    fn remote_builder_failure_is_structured_without_builder_details() {
+        let error = classify_nix_build_failure(
+            ".#thething-crossbow",
+            Some(1),
+            "remote builder ssh-ng://arm failed to realize the output",
+            &RealizationPolicy::RemoteNative {
+                builders: vec!["ssh-ng://arm aarch64-linux - 1 1".to_owned()],
+            },
+        );
+
+        let Error::RealizationMissingPrerequisite { prerequisite, .. } = error else {
+            panic!("remote builder failure should be typed");
+        };
+        assert_eq!(prerequisite.kind, RealizationFailureKind::RemoteBuilder);
+        assert_eq!(prerequisite.cache_context, "explicit remote builders");
+        assert!(!prerequisite.recoverable_by_native_recovery);
+        assert!(!prerequisite.diagnostic.contains("ssh-ng://arm"));
+    }
+
+    #[test]
+    fn realization_failure_is_structured_when_nix_names_the_failure() {
+        let error = classify_nix_build_failure(
+            ".#thething-crossbow",
+            Some(1),
+            "nix build failed while realizing the requested output",
+            &RealizationPolicy::SubstituteOnly,
+        );
+
+        let Error::RealizationMissingPrerequisite { prerequisite, .. } = error else {
+            panic!("named realization failure should be typed");
+        };
+        assert_eq!(prerequisite.kind, RealizationFailureKind::NixRealization);
+        assert!(!prerequisite.recoverable_by_native_recovery);
+    }
+
+    #[test]
+    fn unknown_failure_falls_back_to_bounded_redacted_error() {
+        let error = classify_nix_build_failure(
+            ".#thething-crossbow",
+            Some(1),
+            &format!(
+                "unexpected failure token=super-secret /home/can/private\n{}",
+                "x".repeat(MAX_REALIZATION_DIAGNOSTIC_BYTES * 2)
+            ),
+            &RealizationPolicy::SubstituteOnly,
+        );
+
+        let Error::RealizationFailed { stderr, .. } = error else {
+            panic!("unknown failure should retain the generic fallback");
+        };
+        assert!(stderr.len() <= MAX_REALIZATION_DIAGNOSTIC_BYTES);
+        assert!(!stderr.contains("super-secret"));
+        assert!(!stderr.contains("/home/can/private"));
+    }
+
+    #[test]
+    fn missing_prerequisite_round_trips_as_json() {
+        let prerequisite = MissingPrerequisite {
+            root: ".#thething-crossbow".to_owned(),
+            system: "aarch64-linux".to_owned(),
+            cache_context: "configured substituters".to_owned(),
+            recoverable_by_native_recovery: true,
+            diagnostic: "cache root unavailable".to_owned(),
+            kind: RealizationFailureKind::MissingCacheRoot,
+        };
+
+        let json = serde_json::to_string(&prerequisite).unwrap();
+        assert_eq!(
+            serde_json::from_str::<MissingPrerequisite>(&json).unwrap(),
+            prerequisite
+        );
     }
 
     struct FakePublisher {

@@ -1,4 +1,67 @@
-use std::string::FromUtf8Error;
+use std::{fmt, string::FromUtf8Error};
+
+/// Maximum diagnostic size retained for a failed realization.
+pub const MAX_REALIZATION_DIAGNOSTIC_BYTES: usize = 4096;
+
+/// The bounded class of prerequisite or realization failure reported by Nix.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealizationFailureKind {
+    /// A required output was not available from the configured substituters.
+    MissingCacheRoot,
+    /// A required output belongs to a platform unavailable on the build host.
+    WrongPlatform,
+    /// An explicitly selected remote builder failed or could not be reached.
+    RemoteBuilder,
+    /// Nix rejected or failed the realization without a more specific class.
+    NixRealization,
+    /// The failure did not match a known Nix diagnostic.
+    Unknown,
+}
+
+impl fmt::Display for RealizationFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingCacheRoot => "missing-cache-root",
+            Self::WrongPlatform => "wrong-platform",
+            Self::RemoteBuilder => "remote-builder",
+            Self::NixRealization => "nix-realization",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+/// Bounded, redacted context for a failed realization prerequisite.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MissingPrerequisite {
+    /// Failed requirement or realization root.
+    pub root: String,
+    /// Affected Nix system, or `unknown` when Nix did not identify one.
+    pub system: String,
+    /// Non-sensitive cache or builder context.
+    pub cache_context: String,
+    /// Whether explicit native recovery may satisfy this prerequisite.
+    pub recoverable_by_native_recovery: bool,
+    /// Bounded, redacted diagnostic preview.
+    pub diagnostic: String,
+    /// Stable failure classification.
+    pub kind: RealizationFailureKind,
+}
+
+impl fmt::Display for MissingPrerequisite {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} root={} system={} context={} recoverable_by_native_recovery={}: {}",
+            self.kind,
+            self.root,
+            self.system,
+            self.cache_context,
+            self.recoverable_by_native_recovery,
+            self.diagnostic
+        )
+    }
+}
 
 /// Errors produced by Crossbow switch planning, metadata lookup, and runtime commands.
 #[derive(Debug, thiserror::Error)]
@@ -313,6 +376,17 @@ pub enum Error {
         status: Option<i32>,
         /// Captured stderr.
         stderr: String,
+    },
+
+    /// The initial realization failed with a structured prerequisite context.
+    #[error("crossbow: realization of `{attr}` failed (exit status {status:?}): {prerequisite}")]
+    RealizationMissingPrerequisite {
+        /// Nix attribute passed to `nix build`.
+        attr: String,
+        /// Process exit code, or `None` when the process ended without one.
+        status: Option<i32>,
+        /// Bounded context for the failed prerequisite.
+        prerequisite: Box<MissingPrerequisite>,
     },
 
     /// `nix build` printed stdout that was not UTF-8.
