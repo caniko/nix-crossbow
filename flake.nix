@@ -2,7 +2,7 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+    rs-harbor.url = "github:caniko/rs-harbor/e2778ff3beca1bd4c1f5183313251d1fb5b46dd6";
     nixpkgs.follows = "rs-harbor/nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
@@ -133,15 +133,25 @@
           namespaceScope = "canix-rust";
           namespaceGeneration = 5;
         };
+        atticAdapter = inputs.rs-harbor.lib.mkAdapter {
+          attic = {
+            endpoint = "https://attic.candee.baby";
+            cache = "canix";
+          };
+        };
       in {
         inherit formatter;
 
         packages = {
-          crossbow-switch = buildCache.withRustCache {
-            package = (pkgs.makeRustPlatform {
-              rustc = rs-harbor.lib.mkToolchain { toolchainProfile = "stable"; };
-              cargo = rs-harbor.lib.mkToolchain { toolchainProfile = "stable"; };
-            }).buildRustPackage {
+          crossbow-switch = let
+            pkgsWithRust = import inputs.nixpkgs {
+              inherit system;
+              overlays = [(import inputs.rs-harbor.inputs.rust-overlay)];
+            };
+            toolchain = inputs.rs-harbor.lib.mkToolchain { pkgs = pkgsWithRust; toolchainProfile = "stable"; };
+            rustPlatform = pkgs.makeRustPlatform { rustc = toolchain.rustToolchain; cargo = toolchain.rustToolchain; };
+          in buildCache.withRustCache {
+            package = rustPlatform.buildRustPackage {
               pname = "crossbow-switch";
               version = "0.1.0";
               src = ./.;
@@ -164,6 +174,11 @@
           type = "app";
           program = "${inputs.self.packages.${system}.crossbow-switch}/bin/crossbow-switch";
           meta.description = "Run cache-shaped Crossbow NixOS switch orchestration";
+        };
+        apps.push-flake-inputs = inputs.rs-harbor.lib.mkAtticPush {
+          inherit pkgs;
+          adapter = atticAdapter;
+          flake = ".";
         };
 
         checks = {
