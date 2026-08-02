@@ -2,8 +2,9 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=c26b735eede8078f795651c4a9cbf0be8733b221";
     nixpkgs.follows = "rs-harbor/nixpkgs";
+    rust-overlay.follows = "rs-harbor/rust-overlay";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
@@ -44,10 +45,11 @@
           then "aarch64-linux"
           else "x86_64-linux";
         crossPackageProbeOverrides = {
-          hello = (import inputs.nixpkgs {
-            localSystem = {inherit system;};
-            crossSystem = {system = crossPackageProbeHost;};
-          }).hello;
+          hello =
+            (import inputs.nixpkgs {
+              localSystem = {inherit system;};
+              crossSystem = {system = crossPackageProbeHost;};
+            }).hello;
         };
         crossPackageProbe = inputs.self.lib.mkNixosSwitchSystem {
           build = system;
@@ -133,22 +135,32 @@
           namespaceScope = "canix-rust";
           namespaceGeneration = 5;
         };
+        rustPkgs = import inputs.nixpkgs {
+          localSystem = {inherit system;};
+          overlays = [(import inputs.rust-overlay)];
+        };
+        toolchain = inputs.rs-harbor.lib.mkToolchain {
+          pkgs = rustPkgs;
+          toolchainProfile = "stable";
+          cache.enable = false;
+        };
       in {
         inherit formatter;
 
         packages = {
           crossbow-switch = buildCache.withRustCache {
-            package = (pkgs.makeRustPlatform {
-              rustc = rs-harbor.lib.mkToolchain { toolchainProfile = "stable"; };
-              cargo = rs-harbor.lib.mkToolchain { toolchainProfile = "stable"; };
-            }).buildRustPackage {
-              pname = "crossbow-switch";
-              version = "0.1.0";
-              src = ./.;
-              cargoLock.lockFile = ./Cargo.lock;
-              cargoBuildFlags = ["-p" "crossbow-switch"];
-              cargoTestFlags = ["-p" "crossbow-switch"];
-            };
+            package =
+              (rustPkgs.makeRustPlatform {
+                rustc = toolchain.rustToolchain;
+                cargo = toolchain.rustToolchain;
+              }).buildRustPackage {
+                pname = "crossbow-switch";
+                version = "0.1.0";
+                src = ./.;
+                cargoLock.lockFile = ./Cargo.lock;
+                cargoBuildFlags = ["-p" "crossbow-switch"];
+                cargoTestFlags = ["-p" "crossbow-switch"];
+              };
           };
 
           tiny-c-aarch64-linux = inputs.self.lib.mkCross {
@@ -169,27 +181,28 @@
         checks = {
           crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
 
-          crossbow-metadata-pkl = pkgs.runCommand "crossbow-metadata-pkl" {
-            buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
-          } ''
-            pkl_json="$(mktemp)"
-            pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
+          crossbow-metadata-pkl =
+            pkgs.runCommand "crossbow-metadata-pkl" {
+              buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
+            } ''
+              pkl_json="$(mktemp)"
+              pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
 
-            for sidecar in \
-              ${./data/crossbow-metadata.json} \
-              ${./crates/crossbow-switch/data/crossbow-metadata.json}
-            do
-              sidecar_json="$(mktemp)"
-              jq -S -c . "$sidecar" > "$sidecar_json"
-              if ! diff -u "$pkl_json" "$sidecar_json"; then
-                echo "ERROR: $sidecar is out of sync with data/CrossbowMetadata.pkl" >&2
-                echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
-                exit 1
-              fi
-            done
+              for sidecar in \
+                ${./data/crossbow-metadata.json} \
+                ${./crates/crossbow-switch/data/crossbow-metadata.json}
+              do
+                sidecar_json="$(mktemp)"
+                jq -S -c . "$sidecar" > "$sidecar_json"
+                if ! diff -u "$pkl_json" "$sidecar_json"; then
+                  echo "ERROR: $sidecar is out of sync with data/CrossbowMetadata.pkl" >&2
+                  echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
+                  exit 1
+                fi
+              done
 
-            touch "$out"
-          '';
+              touch "$out"
+            '';
 
           platform-map = pkgs.runCommand "crossbow-platform-map" {} ''
             test "${inputs.self.lib.nixSystemToZigTarget "aarch64-linux"}" = "aarch64-linux-gnu"
