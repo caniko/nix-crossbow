@@ -61,7 +61,8 @@
     roots ? [],
     rootLabels ? [],
   }: let
-    fingerprint = builtins.hashString "sha256"
+    fingerprint =
+      builtins.hashString "sha256"
       (lib.concatStringsSep "\n" (map builtins.unsafeDiscardStringContext roots));
     rootFingerprints =
       if roots == [] || rootLabels == []
@@ -126,22 +127,25 @@
     hasCrossPackages = buildPkgs != null && crossPackageAttrNames != [];
     crossPkgs =
       if hasCrossPackages
-      then import nixpkgs {
-        localSystem = {system = artifactPkgs.stdenv.buildPlatform.system;};
-        crossSystem = {system = host;};
-        inherit (nativeSystem.config.nixpkgs) config overlays;
-      }
+      then
+        import nixpkgs {
+          localSystem = {system = artifactPkgs.stdenv.buildPlatform.system;};
+          crossSystem = {system = host;};
+          inherit (nativeSystem.config.nixpkgs) config overlays;
+        }
       else {};
     crossPackageLabels = lib.unique (
       (lib.filter (name: crossPkgs ? ${name}) crossPackageAttrNames)
       ++ builtins.attrNames crossPackageOverrides
     );
-    crossPackageRoots = map (
-      name:
-        if crossPackageOverrides ? ${name}
-        then crossPackageOverrides.${name}
-        else crossPkgs.${name}
-    ) crossPackageLabels;
+    crossPackageRoots =
+      map (
+        name:
+          if crossPackageOverrides ? ${name}
+          then crossPackageOverrides.${name}
+          else crossPkgs.${name}
+      )
+      crossPackageLabels;
     allRoots = [nativeSystem.config.system.build.toplevel] ++ crossPackageRoots;
     allLabels = ["system-toplevel"] ++ crossPackageLabels;
   in
