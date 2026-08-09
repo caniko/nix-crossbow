@@ -100,30 +100,6 @@ struct OutputEntry {
     outputs: BTreeMap<String, String>,
 }
 
-/// Computes a structured plan from Nix's derivation closure.
-///
-/// `nix build --dry-run --json` reports only the requested installable, not its
-/// complete action set. Nix's local derivation closure is enumerated first and
-/// then shown in bounded batches; output paths and substituter availability are
-/// resolved in batches. The realization frontier stops at substituted nodes,
-/// matching Nix's behavior of not realizing the inputs of a cache hit. Human
-/// stderr is never parsed.
-pub fn plan_closure(
-    attr: &str,
-    build_system: &str,
-    host_system: &str,
-    substituter: &str,
-    policy: &RealizationPolicy,
-) -> Result<ClosurePlan> {
-    plan_closure_with_substituters(
-        attr,
-        build_system,
-        host_system,
-        &[substituter.to_owned()],
-        policy,
-    )
-}
-
 /// Computes a structured plan using the union of the supplied substituters.
 ///
 /// The order is significant only for efficiency: each later substituter is

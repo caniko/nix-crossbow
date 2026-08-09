@@ -70,29 +70,6 @@
             })
           ];
         };
-        crossPackageProbeRequirements = inputs.self.lib.mkNixosSwitchRequirements {
-          buildPkgs = pkgs;
-          host = crossPackageProbeHost;
-          modules = [
-            {
-              boot.loader.grub.enable = false;
-              fileSystems."/".device = "nodev";
-              fileSystems."/".fsType = "tmpfs";
-              system.stateVersion = "25.11";
-            }
-          ];
-        };
-        crossPackageProbeNative = inputs.self.lib.mkNixosNativeSubstitutedSystem {
-          host = crossPackageProbeHost;
-          modules = [
-            {
-              boot.loader.grub.enable = false;
-              fileSystems."/".device = "nodev";
-              fileSystems."/".fsType = "tmpfs";
-              system.stateVersion = "25.11";
-            }
-          ];
-        };
         crossRustProbeCrossPkgs = import inputs.nixpkgs {
           localSystem = {inherit system;};
           crossSystem = {system = "aarch64-linux";};
@@ -175,18 +152,13 @@
             pkl_json="$(mktemp)"
             pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
 
-            for sidecar in \
-              ${./data/crossbow-metadata.json} \
-              ${./crates/crossbow-switch/data/crossbow-metadata.json}
-            do
-              sidecar_json="$(mktemp)"
-              jq -S -c . "$sidecar" > "$sidecar_json"
-              if ! diff -u "$pkl_json" "$sidecar_json"; then
-                echo "ERROR: $sidecar is out of sync with data/CrossbowMetadata.pkl" >&2
-                echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
-                exit 1
-              fi
-            done
+            sidecar_json="$(mktemp)"
+            jq -S -c . ${./data/crossbow-metadata.json} > "$sidecar_json"
+            if ! diff -u "$pkl_json" "$sidecar_json"; then
+              echo "ERROR: data/crossbow-metadata.json is out of sync with data/CrossbowMetadata.pkl" >&2
+              echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
+              exit 1
+            fi
 
             touch "$out"
           '';
@@ -247,12 +219,6 @@
             }" = "0"
             test "${crossPackageProbe.config.crossbowProbe.package.stdenv.buildPlatform.system}" = "${system}"
             test "${crossPackageProbe.config.crossbowProbe.package.stdenv.hostPlatform.system}" = "${crossPackageProbeHost}"
-            test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/roots
-            test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/drvs
-            test -e ${crossPackageProbeRequirements}/roots
-            test -e ${crossPackageProbeRequirements}/drvs
-            grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel}" ${crossPackageProbeRequirements}/roots >/dev/null
-            grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel.drvPath}" ${crossPackageProbeRequirements}/drvs >/dev/null
             touch $out
           '';
 

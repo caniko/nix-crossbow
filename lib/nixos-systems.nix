@@ -13,22 +13,16 @@
   # `system.systemBuilderCommands` block. Centralised so all three
   # constructors agree on the file format.
   #
-  # `crossbow-mode` and `crossbow-build-system` are skipped when their
-  # value is null (used by `mkNixosNativeSubstitutedSystem` to preserve
-  # its prior, narrower metadata surface).
+  # `crossbow-build-system` is skipped when its value is null (used by
+  # `mkNixosNativeSubstitutedSystem` to preserve its narrowed metadata
+  # surface).
   mkCrossbowMetadataCommands = {
     cacheMode,
     build ? null,
     buildProfile,
     profileName,
-    emitModeFile ? true,
   }: ''
     mkdir -p $out/nix-support
-    ${lib.optionalString emitModeFile ''
-      cat > $out/nix-support/crossbow-mode <<'EOF'
-      ${cacheMode.name}
-      EOF
-    ''}
     cat > $out/nix-support/crossbow-cache-mode <<'EOF'
     ${cacheMode.name}
     EOF
@@ -55,101 +49,6 @@
       }
     ];
   };
-
-  mkRequirementsArtifact = {
-    buildPkgs,
-    roots ? [],
-    rootLabels ? [],
-  }: let
-    fingerprint = builtins.hashString "sha256"
-      (lib.concatStringsSep "\n" (map builtins.unsafeDiscardStringContext roots));
-    rootFingerprints =
-      if roots == [] || rootLabels == []
-      then []
-      else map (root: builtins.hashString "sha256" (builtins.unsafeDiscardStringContext root)) roots;
-  in
-    buildPkgs.runCommand "crossbow-switch-requirements" {} ''
-      mkdir -p "$out/nix-support"
-      cat > "$out/roots" <<'EOF'
-      ${lib.concatStringsSep "\n" (map builtins.unsafeDiscardStringContext roots)}
-      EOF
-      cat > "$out/drvs" <<'EOF'
-      ${lib.concatStringsSep "\n" (map (root: builtins.unsafeDiscardStringContext root.drvPath) roots)}
-      EOF
-      cat > "$out/fingerprint" <<'EOF'
-      ${fingerprint}
-      EOF
-      ${lib.optionalString (rootLabels != []) ''
-        cat > "$out/root-labels" <<'EOF'
-        ${lib.concatStringsSep "\n" rootLabels}
-        EOF
-      ''}
-      ${lib.optionalString (rootFingerprints != []) ''
-        cat > "$out/root-fingerprints" <<'EOF'
-        ${lib.concatStringsSep "\n" rootFingerprints}
-        EOF
-      ''}
-      cp "$out/roots" "$out/nix-support/crossbow-requirements"
-      cp "$out/drvs" "$out/nix-support/crossbow-requirement-drvs"
-      cp "$out/fingerprint" "$out/nix-support/crossbow-requirements-fingerprint"
-    '';
-
-  mkEmptyNixosSwitchRequirements = {buildPkgs}: mkRequirementsArtifact {inherit buildPkgs;};
-
-  mkNixosSwitchRequirements = {
-    nixpkgs ? inputs.nixpkgs,
-    host,
-    modules,
-    specialArgs ? {},
-    hardwareOptimization ? null,
-    buildOptimization ? buildOptimizationProfiles.cache-first,
-    buildPkgs ? null,
-    crossPackageAttrNames ? [],
-    crossPackageOverrides ? {},
-  }: let
-    nativeSystem = mkNixosNativeSubstitutedSystem {
-      inherit
-        nixpkgs
-        host
-        modules
-        specialArgs
-        hardwareOptimization
-        buildOptimization
-        ;
-    };
-    artifactPkgs =
-      if buildPkgs != null
-      then buildPkgs
-      else nativeSystem.pkgs;
-    # Cross-compiled packages as additional roots. Only computed when
-    # buildPkgs is present (cross-compilation needs a build platform).
-    hasCrossPackages = buildPkgs != null && crossPackageAttrNames != [];
-    crossPkgs =
-      if hasCrossPackages
-      then import nixpkgs {
-        localSystem = {system = artifactPkgs.stdenv.buildPlatform.system;};
-        crossSystem = {system = host;};
-        inherit (nativeSystem.config.nixpkgs) config overlays;
-      }
-      else {};
-    crossPackageLabels = lib.unique (
-      (lib.filter (name: crossPkgs ? ${name}) crossPackageAttrNames)
-      ++ builtins.attrNames crossPackageOverrides
-    );
-    crossPackageRoots = map (
-      name:
-        if crossPackageOverrides ? ${name}
-        then crossPackageOverrides.${name}
-        else crossPkgs.${name}
-    ) crossPackageLabels;
-    allRoots = [nativeSystem.config.system.build.toplevel] ++ crossPackageRoots;
-    allLabels = ["system-toplevel"] ++ crossPackageLabels;
-  in
-    mkRequirementsArtifact {
-      buildPkgs = artifactPkgs;
-      roots = allRoots;
-      rootLabels = allLabels;
-    };
 
   mkNixosSwitchSystem = {
     nixpkgs ? inputs.nixpkgs,
@@ -201,10 +100,6 @@
             _module.args.crossbowBuildPkgs = lib.mkOverride 999 buildPkgs;
 
             nixpkgs.hostPlatform = lib.mkForce host;
-
-            system.build.crossbowRequirements = lib.mkDefault (
-              mkEmptyNixosSwitchRequirements {inherit buildPkgs;}
-            );
 
             system.systemBuilderCommands = mkCrossbowMetadataCommands {
               inherit cacheMode build buildProfile profileName;
@@ -268,9 +163,6 @@
 
             system.systemBuilderCommands = mkCrossbowMetadataCommands {
               inherit cacheMode buildProfile profileName;
-              # `crossbow-mode` is omitted to match the prior behaviour
-              # of this constructor (which only emitted `crossbow-cache-mode`).
-              emitModeFile = false;
             };
           }
         ];
@@ -309,7 +201,6 @@
 in {
   inherit
     mkNixosSwitchSystem
-    mkNixosSwitchRequirements
     mkNixosStrictCrossSystem
     mkNixosNativeSubstitutedSystem
     mkNixosCrossSystem

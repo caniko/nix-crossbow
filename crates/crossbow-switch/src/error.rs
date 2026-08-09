@@ -4,89 +4,6 @@ use std::string::FromUtf8Error;
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
-    /// A target system was not present in the shared metadata.
-    #[error(
-        "crossbow: unsupported host platform `{system}`; add it to lib/targets.nix and lib/platform-map.nix first"
-    )]
-    UnsupportedHostPlatform {
-        /// Unsupported Nix system string.
-        system: String,
-    },
-
-    /// A Nix system did not have the requested compiler target mapping.
-    #[error("crossbow: no {name} mapping for `{system}`")]
-    MissingPlatformMapping {
-        /// Mapping table name.
-        name: String,
-        /// Nix system string that was missing.
-        system: String,
-    },
-
-    /// A cache mode name was not present in the shared metadata.
-    #[error("crossbow: unsupported cache mode `{mode}`; expected one of {expected}")]
-    UnsupportedCacheMode {
-        /// Unsupported cache mode.
-        mode: String,
-        /// Comma-separated supported cache modes.
-        expected: String,
-    },
-
-    /// A hardware optimization profile name was not present in the shared metadata.
-    #[error(
-        "crossbow: unsupported hardware optimization profile `{profile}`; expected one of {expected}"
-    )]
-    UnsupportedHardwareProfile {
-        /// Unsupported profile name.
-        profile: String,
-        /// Comma-separated supported profile names.
-        expected: String,
-    },
-
-    /// A hardware optimization profile was used with the wrong host system.
-    #[error(
-        "crossbow: hardware optimization profile `{profile}` is for `{profile_system}` but host is `{host}`"
-    )]
-    HardwareProfileHostMismatch {
-        /// Profile name.
-        profile: String,
-        /// System the profile supports.
-        profile_system: String,
-        /// Host system requested by the caller.
-        host: String,
-    },
-
-    /// A build optimization profile name was not present in the shared metadata.
-    #[error(
-        "crossbow: unsupported build optimization profile `{profile}`; expected one of {expected}"
-    )]
-    UnsupportedBuildOptimizationProfile {
-        /// Unsupported profile name.
-        profile: String,
-        /// Comma-separated supported profile names.
-        expected: String,
-    },
-
-    /// A native-builder check was planned without a host system.
-    #[error("crossbow: native-builder check `{check_name}` requires a non-empty host system")]
-    NativeBuilderMissingHost {
-        /// Check derivation name.
-        check_name: String,
-    },
-
-    /// A declared executor exists in metadata but has no phase-1 implementation.
-    #[error("crossbow: executor `{kind}` is declared but not implemented in phase 1")]
-    ExecutorNotImplemented {
-        /// Executor kind.
-        kind: String,
-    },
-
-    /// An executor kind string is not recognized by Crossbow.
-    #[error("crossbow: unknown executor `{kind}`")]
-    UnknownExecutor {
-        /// Unknown executor kind.
-        kind: String,
-    },
-
     /// A CLI argument was not recognized.
     #[error("crossbow: unknown argument `{argument}`\n{usage}")]
     UnknownArgument {
@@ -368,16 +285,6 @@ pub enum Error {
         toplevel: String,
     },
 
-    /// Reading a Nix store file (e.g. from a `crossbowRequirements` artifact) failed.
-    #[error("crossbow: failed to read `{file}`")]
-    NixStoreRead {
-        /// File path that failed to read.
-        file: String,
-        /// Underlying I/O error.
-        #[source]
-        source: std::io::Error,
-    },
-
     /// Spawning `nixos-rebuild` failed.
     #[error("crossbow: failed to run `nixos-rebuild {action} --flake {flake_attr}`")]
     NixosRebuildRun {
@@ -410,14 +317,6 @@ pub enum Error {
         count: usize,
         /// Preview of missing paths.
         preview: String,
-    },
-
-    /// Embedded JSON metadata failed to deserialize.
-    #[error("crossbow: embedded metadata JSON is invalid")]
-    MetadataJson {
-        /// JSON parsing failure.
-        #[from]
-        source: serde_json::Error,
     },
 }
 

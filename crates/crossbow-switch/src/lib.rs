@@ -17,26 +17,12 @@ use sha2::{Digest, Sha256};
 pub mod cli;
 /// Error and result types shared by the library and binary.
 pub mod error;
-/// Executor descriptor validation for Crossbow check planning.
-pub mod executor;
-/// Typed access to Crossbow's shared target/profile metadata.
-pub mod metadata;
 /// Structured derivation-closure planning for cache-shaped realizations.
 pub mod planner;
-/// Parsed Crossbow requirements artifact (roots, drvs, fingerprint).
-pub mod requirements;
-/// Generic prepared-state persistence for prerequisite roots.
-pub mod state;
 
 pub use error::{Error, Result};
 pub use planner::{
-    ClosurePlan, DerivationClass, DerivationPlan, PlanCounts, plan_closure,
-    plan_closure_with_substituters,
-};
-pub use requirements::{LabeledRoot, RequirementsArtifact, RootDiff, diff_roots, label_roots};
-pub use state::{
-    PreparedState, StateStatus, load_prepared_state, save_prepared_state, state_file_path,
-    state_to_labeled_roots,
+    ClosurePlan, DerivationClass, DerivationPlan, PlanCounts, plan_closure_with_substituters,
 };
 
 /// Controls which builders may realize missing derivations before activation.
@@ -114,20 +100,6 @@ pub fn cache_shaped_switch_flags(use_substitutes: bool) -> Vec<String> {
     }
 
     flags
-}
-
-/// Returns the canonical flags for the initial toplevel realisation.
-///
-/// These mirror the cache-shaped switch flags that prevent activation from
-/// using remote builders or binfmt. The build phase needs the same guard:
-/// otherwise a cache miss on a binfmt-enabled build host silently becomes a
-/// local emulated build before Crossbow can publish or verify anything.
-/// `max_jobs`, when set, is passed as `--max-jobs N` to cap build parallelism
-/// on memory-constrained build hosts.
-#[must_use]
-pub fn cache_shaped_build_args(attr: &str, max_jobs: Option<u32>) -> Vec<String> {
-    cache_shaped_build_args_with_policy(attr, max_jobs, &RealizationPolicy::SubstituteOnly)
-        .expect("substitute-only is valid")
 }
 
 /// Returns `nix build` arguments for an explicit realization policy.
@@ -711,7 +683,8 @@ mod tests {
     #[test]
     fn cache_shaped_build_args_disable_builders_and_extra_platforms() {
         assert_eq!(
-            cache_shaped_build_args(".#host", None),
+            cache_shaped_build_args_with_policy(".#host", None, &RealizationPolicy::SubstituteOnly)
+                .unwrap(),
             vec![
                 "build",
                 "--no-link",
@@ -732,7 +705,12 @@ mod tests {
     #[test]
     fn cache_shaped_build_args_with_max_jobs() {
         assert_eq!(
-            cache_shaped_build_args(".#host", Some(4)),
+            cache_shaped_build_args_with_policy(
+                ".#host",
+                Some(4),
+                &RealizationPolicy::SubstituteOnly
+            )
+            .unwrap(),
             vec![
                 "build",
                 "--no-link",
