@@ -875,6 +875,19 @@ mod tests {
     }
 
     #[test]
+    fn local_presence_skips_substituter_probe() {
+        let output = tempfile::NamedTempFile::new().unwrap();
+        let path = output.path().to_string_lossy().into_owned();
+        let availability = probe_outputs(
+            &["https://unused.example".to_owned()],
+            std::slice::from_ref(&path),
+        )
+        .unwrap();
+
+        assert_eq!(availability[&path], OutputAvailability::LocalPresent);
+    }
+
+    #[test]
     fn classification_distinguishes_local_and_remote_presence() {
         let local = BTreeMap::from([(
             "/nix/store/output".to_owned(),
