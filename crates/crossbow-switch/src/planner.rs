@@ -51,6 +51,7 @@ pub struct PlanCounts {
     /// Outputs already available from the configured substituters.
     pub host_substituted: usize,
     /// Derivations whose requested outputs are already in the local store.
+    #[serde(default)]
     pub local_present: usize,
     /// Derivations Nix will build on the build host.
     pub build_local: usize,
@@ -755,6 +756,22 @@ mod tests {
 
         assert_eq!(plan.name, None);
         assert_eq!(plan.pname, None);
+
+        let old: ClosurePlan = serde_json::from_str(
+            r#"{
+                "build_system": "x86_64-linux",
+                "host_system": "aarch64-linux",
+                "derivations": [],
+                "counts": {
+                    "host_substituted": 1,
+                    "build_local": 2,
+                    "host_remote": 0,
+                    "unhandled": 0
+                }
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(old.counts.local_present, 0);
     }
 
     #[test]
