@@ -333,6 +333,7 @@ fn print_plan(plan: &ClosurePlan, json: bool) -> Result<()> {
 
     println!("build-system={}", plan.build_system);
     println!("host-system={}", plan.host_system);
+    println!("local-present={}", plan.counts.local_present);
     println!("host-substituted={}", plan.counts.host_substituted);
     println!("build-local={}", plan.counts.build_local);
     println!("host-remote={}", plan.counts.host_remote);
@@ -353,8 +354,12 @@ fn print_plan(plan: &ClosurePlan, json: bool) -> Result<()> {
             continue;
         }
         println!("{class:?}:");
-        for path in paths {
-            println!("  {path}");
+        for derivation in plan
+            .derivations
+            .iter()
+            .filter(|derivation| derivation.class == class)
+        {
+            println!("  {} [{}]", derivation.display_label(), derivation.drv);
         }
     }
     Ok(())
