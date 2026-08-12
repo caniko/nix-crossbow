@@ -2,7 +2,7 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=9bfa8bdb0ecb22d7bc11448665f7fbaebae7a759";
+    rs-harbor.url = "git+https://codefloe.com/caniko/rs-harbor.git?ref=trunk&rev=7fa1c2104dab4e1dbaa1aaa6df84bba815aa282d";
     nixpkgs.follows = "rs-harbor/nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
@@ -114,11 +114,15 @@
         inherit formatter;
 
         packages = {
-          crossbow-switch = buildCache.withRustCache {
-            package = (pkgs.makeRustPlatform {
-              rustc = rs-harbor.lib.mkToolchain { toolchainProfile = "stable"; };
-              cargo = rs-harbor.lib.mkToolchain { toolchainProfile = "stable"; };
-            }).buildRustPackage {
+          crossbow-switch = let
+            pkgsWithRust = import inputs.nixpkgs {
+              inherit system;
+              overlays = [(import inputs.rs-harbor.inputs.rust-overlay)];
+            };
+            toolchain = inputs.rs-harbor.lib.mkToolchain { pkgs = pkgsWithRust; toolchainProfile = "stable"; };
+            rustPlatform = pkgs.makeRustPlatform { rustc = toolchain.rustToolchain; cargo = toolchain.rustToolchain; };
+          in buildCache.withRustCache {
+            package = rustPlatform.buildRustPackage {
               pname = "crossbow-switch";
               version = "0.1.0";
               src = ./.;
