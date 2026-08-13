@@ -2,8 +2,9 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 
 use crate::{
-    ClosurePlan, DerivationClass, Error, Publisher, RealizationPolicy, Result, SwitchPlan,
-    TrustPublish, Verifier, run_cache_shaped_switch,
+    ClosurePlan, DerivationClass, Error, MissRoute, Publisher, RealizationPolicy, Result,
+    RouteHintSpec, SwitchPlan, TrustPublish, Verifier, plan_closure_with_hints,
+    run_cache_shaped_switch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +51,8 @@ pub struct PlanOptions {
     pub json: bool,
     /// Explicit policy for missing derivations.
     pub realization_policy: RealizationPolicy,
+    /// Runtime route hints binding installables to miss routes.
+    pub route_hints: Vec<RouteHintSpec>,
 }
 
 /// Returns the command-line usage string.
@@ -61,7 +64,7 @@ pub fn usage() -> &'static str {
 /// Returns the usage string for the read-only planner.
 #[must_use]
 pub fn plan_usage() -> &'static str {
-    "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--substituter <store> ...] [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
+    "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--substituter <store> ...] [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>] [--route-hint <label>@<installable>:<fail|build-local|remote-native>] [--skip-probe <label>]"
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -209,6 +212,7 @@ where
     let mut json = false;
     let mut realization_policy = "substitute-only".to_owned();
     let mut remote_builders = Vec::new();
+    let mut route_hints = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -230,6 +234,31 @@ where
                 substituters.push(required_value(&args, index, "--substituter")?.to_owned());
             }
             "--json" => json = true,
+            "--route-hint" => {
+                index += 1;
+                route_hints.push(parse_route_hint(required_value(
+                    &args,
+                    index,
+                    "--route-hint",
+                )?)?);
+            }
+            "--skip-probe" => {
+                index += 1;
+                let label = required_value(&args, index, "--skip-probe")?.to_owned();
+                let mut found = false;
+                for hint in &mut route_hints {
+                    if hint.label == label {
+                        hint.skip_probe = true;
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(Error::UnknownArgument {
+                        argument: format!("--skip-probe {label}"),
+                        usage: plan_usage().to_owned(),
+                    });
+                }
+            }
             "--realization-policy" => {
                 index += 1;
                 realization_policy =
@@ -286,6 +315,7 @@ where
         },
         json,
         realization_policy,
+        route_hints,
     })
 }
 
@@ -304,12 +334,13 @@ pub fn run_from_env() -> Result<()> {
             return Ok(());
         }
         let options = parse_plan_args(plan_args.iter().cloned())?;
-        let plan = crate::plan_closure_with_substituters(
+        let plan = plan_closure_with_hints(
             &options.toplevel_attr,
             &options.build_system,
             &options.host_system,
             &options.substituters,
             &options.realization_policy,
+            &options.route_hints,
         )?;
         return print_plan(&plan, options.json);
     }
@@ -488,6 +519,37 @@ fn run_path_command(command: &str, paths: &[String]) -> Result<String> {
     })
 }
 
+fn parse_route_hint(spec: &str) -> Result<RouteHintSpec> {
+    let (label_installable, route) = spec
+        .rsplit_once(':')
+        .ok_or_else(|| Error::MissingArgumentValue {
+            flag: "--route-hint".to_owned(),
+        })?;
+    let on_miss = match route {
+        "fail" => MissRoute::Fail,
+        "build-local" => MissRoute::BuildLocal,
+        "remote-native" => MissRoute::RemoteNative,
+        value => {
+            return Err(Error::UnknownArgument {
+                argument: format!("--route-hint route `{value}`"),
+                usage: plan_usage().to_owned(),
+            });
+        }
+    };
+    let (label, installable) = label_installable
+        .split_once('@')
+        .ok_or_else(|| Error::MissingArgumentValue {
+            flag: "--route-hint".to_owned(),
+        })?;
+    Ok(RouteHintSpec {
+        label: label.to_owned(),
+        installable: installable.to_owned(),
+        on_miss,
+        origin: None,
+        skip_probe: false,
+    })
+}
+
 fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
     let value = args.get(index).ok_or_else(|| Error::MissingArgumentValue {
         flag: flag.to_owned(),
@@ -579,6 +641,75 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn planner_parser_accepts_route_hints() -> Result<()> {
+        let options = parse_plan_args([
+            "--toplevel",
+            ".#top",
+            "--build-system",
+            "x86_64-linux",
+            "--host-system",
+            "aarch64-linux",
+            "--substituter",
+            "https://cache.example",
+            "--route-hint",
+            "grpc@.#packages.x86_64-linux.grpc:build-local",
+            "--route-hint",
+            "plugin@.#plugin:remote-native",
+            "--skip-probe",
+            "grpc",
+        ])?;
+
+        assert_eq!(options.route_hints.len(), 2);
+        assert_eq!(options.route_hints[0].label, "grpc");
+        assert_eq!(
+            options.route_hints[0].installable,
+            ".#packages.x86_64-linux.grpc"
+        );
+        assert_eq!(options.route_hints[0].on_miss, MissRoute::BuildLocal);
+        assert!(options.route_hints[0].skip_probe);
+        assert_eq!(options.route_hints[1].label, "plugin");
+        assert_eq!(options.route_hints[1].on_miss, MissRoute::RemoteNative);
+        assert!(!options.route_hints[1].skip_probe);
+        Ok(())
+    }
+
+    #[test]
+    fn planner_parser_rejects_unknown_route_hint_route() {
+        let error = parse_plan_args([
+            "--toplevel",
+            ".#top",
+            "--build-system",
+            "x86_64-linux",
+            "--host-system",
+            "aarch64-linux",
+            "--substituter",
+            "https://cache.example",
+            "--route-hint",
+            "x@.#x:substitute",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("route `substitute`"));
+    }
+
+    #[test]
+    fn planner_parser_rejects_unknown_skip_probe_label() {
+        let error = parse_plan_args([
+            "--toplevel",
+            ".#top",
+            "--build-system",
+            "x86_64-linux",
+            "--host-system",
+            "aarch64-linux",
+            "--substituter",
+            "https://cache.example",
+            "--skip-probe",
+            "nope",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("--skip-probe nope"));
     }
 
     #[test]
