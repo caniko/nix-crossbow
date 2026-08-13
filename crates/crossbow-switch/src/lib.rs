@@ -30,8 +30,8 @@ pub mod state;
 
 pub use error::{Error, Result};
 pub use planner::{
-    ClosurePlan, DerivationClass, DerivationPlan, PlanCounts, plan_closure,
-    plan_closure_with_substituters,
+    ClosurePlan, DerivationClass, DerivationPlan, MissRoute, PlanCounts, RouteHintSpec,
+    plan_closure, plan_closure_with_hints, plan_closure_with_substituters,
 };
 pub use requirements::{LabeledRoot, RequirementsArtifact, RootDiff, diff_roots, label_roots};
 pub use state::{

@@ -23,17 +23,124 @@ pub enum DerivationClass {
     Unhandled,
 }
 
+/// What to do with a derivation that is not available from any substituter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MissRoute {
+    /// Abort the plan; the derivation must substitute or the build is blocked.
+    Fail,
+    /// Build the derivation on the Crossbow build host.
+    BuildLocal,
+    /// Route the derivation to an explicitly declared native builder.
+    RemoteNative,
+}
+
+/// A stable label describing which cache answered a probe for one output path.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ProbeResult {
+    /// The output path is present in the named substituter.
+    Present {
+        /// Substituter store URL that served the path.
+        substituter: String,
+    },
+    /// No queried substituter reported the output path.
+    Missing,
+    /// At least one substituter could not be queried, and none reported a hit.
+    /// This must not be treated as a cache miss.
+    Indeterminate {
+        /// Store URLs whose probe failed.
+        errors: Vec<String>,
+    },
+    /// Probing was intentionally skipped for this known-local derivation.
+    SkippedKnownLocal,
+}
+
+/// Runtime routing policy binding a flake installable to a miss route.
+///
+/// Hints are exact: they bind to the derivation resolved from `installable`
+/// against the frozen flake, never to an attribute name or package name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RouteHintSpec {
+    /// Stable label surfaced in the plan and in diagnostics.
+    pub label: String,
+    /// Flake installable whose resolved derivation receives the hint.
+    pub installable: String,
+    /// Route applied when the hinted derivation misses every substituter.
+    pub on_miss: MissRoute,
+    /// Optional diagnostic provenance (e.g. the policy root that produced it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin: Option<String>,
+    /// When set, the hinted derivation's outputs are never probed and the
+    /// `on_miss` route is assumed. Dependency outputs are still probed.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub skip_probe: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
+/// How one derivation will be realized, decided at plan time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RealizationRoute {
+    /// Substitute from the named store.
+    Substitute {
+        /// Substituter store URL that serves the outputs.
+        substituter: String,
+    },
+    /// Build on the Crossbow build host.
+    BuildLocal,
+    /// Route to an explicitly declared native builder.
+    RemoteNative {
+        /// Nix builder specifications eligible for this derivation.
+        builders: Vec<String>,
+    },
+    /// The plan is blocked for this derivation.
+    Fail {
+        /// Why the derivation cannot be realized.
+        reason: String,
+    },
+}
+
+impl Default for RealizationRoute {
+    fn default() -> Self {
+        Self::Fail {
+            reason: String::new(),
+        }
+    }
+}
+
 /// One derivation discovered from Nix's derivation closure.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DerivationPlan {
     /// Full derivation store path.
     pub drv: String,
+    /// Requested output names (one per entry in `outputs`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_names: Vec<String>,
     /// Output store paths reported by Nix.
     pub outputs: Vec<String>,
     /// Nix's build system for the derivation.
     pub system: String,
     /// Classification under the selected realization policy.
     pub class: DerivationClass,
+    /// Concrete realization route selected at plan time.
+    #[serde(default, skip_serializing_if = "is_default_route")]
+    pub route: RealizationRoute,
+    /// Hint label that produced this route, when a hint bound to the derivation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hint: Option<String>,
+    /// Outcome of probing the requested outputs against the substituters.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeResult>,
+}
+
+fn is_default_route(route: &RealizationRoute) -> bool {
+    *route == RealizationRoute::Fail {
+        reason: String::new(),
+    }
 }
 
 /// Counts for a structured closure plan.
@@ -137,6 +244,32 @@ pub fn plan_closure_with_substituters(
     substituters: &[String],
     policy: &RealizationPolicy,
 ) -> Result<ClosurePlan> {
+    plan_closure_with_hints(
+        attr,
+        build_system,
+        host_system,
+        substituters,
+        policy,
+        &[],
+    )
+}
+
+/// Computes a structured plan using the union of the supplied substituters and
+/// explicit runtime route hints.
+///
+/// Hints bind to the exact derivation resolved from each hint's `installable`,
+/// selected the same way the toplevel is resolved (frozen flake attributes).
+/// `skip_probe` derivations are never queried against substituters; their
+/// `on_miss` route is assumed. In all cases the dependency subtree shaped by
+/// `realization_frontier` is still probed normally.
+pub fn plan_closure_with_hints(
+    attr: &str,
+    build_system: &str,
+    host_system: &str,
+    substituters: &[String],
+    policy: &RealizationPolicy,
+    hints: &[RouteHintSpec],
+) -> Result<ClosurePlan> {
     let root_args = ["derivation", "show", "--no-pretty", attr]
         .into_iter()
         .map(str::to_owned)
@@ -151,16 +284,35 @@ pub fn plan_closure_with_substituters(
         });
     }
 
+    let hint_drvs = resolve_hint_drvs(hints)?;
     let graph = load_derivation_graph(&roots)?;
     let required = required_outputs(&roots, &graph);
     let output_paths = resolve_output_paths(&graph, &required, policy)?;
+    let skip_probe_paths = hint_skip_probe_paths(&hint_drvs, &output_paths);
     let all_outputs = output_paths
         .values()
         .flat_map(|paths| paths.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
-    let availability = probe_outputs(substituters, &all_outputs)?;
+    let probed = all_outputs
+        .iter()
+        .filter(|path| !skip_probe_paths.contains(*path))
+        .cloned()
+        .collect::<Vec<_>>();
+    let probe_results = probe_outputs(substituters, &probed)?;
+    let availability = all_outputs
+        .iter()
+        .map(|path| {
+            (
+                path.clone(),
+                matches!(
+                    probe_results.get(path),
+                    Some(ProbeResult::Present { .. })
+                ),
+            )
+        })
+        .collect::<BTreeMap<_, _>>();
     let frontier = realization_frontier(&roots, &graph, &required, &output_paths, &availability);
 
     let mut derivations = Vec::with_capacity(frontier.len());
@@ -172,30 +324,25 @@ pub fn plan_closure_with_substituters(
         if node.system == "builtin" {
             continue;
         }
-        let outputs = names
+        let output_names = names.iter().cloned().collect::<Vec<_>>();
+        let outputs = output_names
             .iter()
             .filter_map(|name| output_path_for_name(&required, &output_paths, &key, name))
             .cloned()
             .collect::<Vec<_>>();
-        let substitutable = outputs
-            .iter()
-            .all(|output| availability.get(output).copied().unwrap_or(false));
         let system = node.system.clone();
-        let class = if substitutable {
-            DerivationClass::HostSubstituted
-        } else if system == build_system {
-            DerivationClass::BuildLocal
-        } else if system == host_system {
-            match policy {
-                RealizationPolicy::RemoteNative { builders } if !builders.is_empty() => {
-                    DerivationClass::HostRemote
-                }
-                RealizationPolicy::SubstituteOnly
-                | RealizationPolicy::RemoteNative { builders: _ } => DerivationClass::Unhandled,
-            }
-        } else {
-            DerivationClass::Unhandled
-        };
+        let probe = derive_probe_result(&key, &hint_drvs, &outputs, &probe_results);
+        let route = select_route(
+            &key,
+            &probe,
+            hints,
+            &hint_drvs,
+            &system,
+            build_system,
+            host_system,
+            policy,
+        );
+        let class = route_class(&route);
 
         match class {
             DerivationClass::HostSubstituted => counts.host_substituted += 1,
@@ -203,11 +350,16 @@ pub fn plan_closure_with_substituters(
             DerivationClass::HostRemote => counts.host_remote += 1,
             DerivationClass::Unhandled => counts.unhandled += 1,
         }
+        let hint = hint_drvs.get(&key).map(|spec| spec.label.clone());
         derivations.push(DerivationPlan {
             drv: store_path(&key),
+            output_names,
             outputs: outputs.clone(),
             system,
             class,
+            route,
+            hint,
+            probe: Some(probe),
         });
     }
 
@@ -219,6 +371,195 @@ pub fn plan_closure_with_substituters(
         derivations,
         counts,
     })
+}
+
+/// Resolves each route hint's `installable` to the exact derivation it names.
+///
+/// Hints bind to derivation store paths, not attribute names, so a hint always
+/// targets the same derivation regardless of how the frozen flake is reached.
+fn resolve_hint_drvs(hints: &[RouteHintSpec]) -> Result<BTreeMap<String, RouteHintSpec>> {
+    let mut resolved = BTreeMap::new();
+    for hint in hints {
+        let args = ["derivation", "show", "--no-pretty", &hint.installable]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let graph = parse_graph(&run_nix(&args)?)?;
+        let Some(key) = graph.derivations.keys().next() else {
+            return Err(Error::PlannerMissingDerivation {
+                drv: hint.installable.clone(),
+            });
+        };
+        resolved.insert(derivation_key(key), hint.clone());
+    }
+    Ok(resolved)
+}
+
+/// Output paths that a `skip_probe` hint removes from substituter probing.
+fn hint_skip_probe_paths(
+    hint_drvs: &BTreeMap<String, RouteHintSpec>,
+    output_paths: &BTreeMap<String, Vec<String>>,
+) -> BTreeSet<String> {
+    hint_drvs
+        .iter()
+        .filter(|(_, hint)| hint.skip_probe)
+        .filter_map(|(key, _)| output_paths.get(key))
+        .flat_map(|paths| paths.iter().cloned())
+        .collect()
+}
+
+/// Combines per-output probe answers into one derivation-level result.
+fn derive_probe_result(
+    key: &str,
+    hint_drvs: &BTreeMap<String, RouteHintSpec>,
+    outputs: &[String],
+    probe_results: &BTreeMap<String, ProbeResult>,
+) -> ProbeResult {
+    if hint_drvs
+        .get(key)
+        .is_some_and(|hint| hint.skip_probe)
+    {
+        return ProbeResult::SkippedKnownLocal;
+    }
+    let mut any_indeterminate = Vec::new();
+    let mut any_present = Option::<String>::None;
+    for output in outputs {
+        match probe_results.get(output) {
+            Some(ProbeResult::Present { substituter }) => {
+                any_present.get_or_insert_with(|| substituter.clone());
+            }
+            Some(ProbeResult::Indeterminate { errors }) => {
+                any_indeterminate.extend(errors.clone());
+            }
+            Some(ProbeResult::Missing | ProbeResult::SkippedKnownLocal) => {}
+            None => {}
+        }
+    }
+    if let Some(substituter) = any_present {
+        return ProbeResult::Present { substituter };
+    }
+    if !any_indeterminate.is_empty() {
+        return ProbeResult::Indeterminate {
+            errors: any_indeterminate,
+        };
+    }
+    ProbeResult::Missing
+}
+
+/// Chooses the realization route for one frontier derivation.
+#[allow(clippy::too_many_arguments)]
+fn select_route(
+    key: &str,
+    probe: &ProbeResult,
+    hints: &[RouteHintSpec],
+    hint_drvs: &BTreeMap<String, RouteHintSpec>,
+    system: &str,
+    build_system: &str,
+    host_system: &str,
+    policy: &RealizationPolicy,
+) -> RealizationRoute {
+    let hint = hint_drvs.get(key);
+    match probe {
+        ProbeResult::Present { substituter } => RealizationRoute::Substitute {
+            substituter: substituter.clone(),
+        },
+        ProbeResult::SkippedKnownLocal => route_for_miss(hint, system, build_system, policy),
+        ProbeResult::Missing
+        | ProbeResult::Indeterminate { .. } => {
+            if let Some(hint) = hint {
+                return route_for_hint(hint, hints, system, build_system, policy);
+            }
+            if system == build_system {
+                return RealizationRoute::BuildLocal;
+            }
+            if system == host_system {
+                return match policy {
+                    RealizationPolicy::RemoteNative { builders } if !builders.is_empty() => {
+                        RealizationRoute::RemoteNative {
+                            builders: builders.clone(),
+                        }
+                    }
+                    RealizationPolicy::SubstituteOnly
+                    | RealizationPolicy::RemoteNative { builders: _ } => {
+                        RealizationRoute::Fail {
+                            reason: "host-system miss with no eligible native builder"
+                                .to_owned(),
+                        }
+                    }
+                };
+            }
+            RealizationRoute::Fail {
+                reason: format!("system `{system}` is neither build nor host"),
+            }
+        }
+    }
+}
+
+fn route_for_hint(
+    hint: &RouteHintSpec,
+    _hints: &[RouteHintSpec],
+    system: &str,
+    build_system: &str,
+    policy: &RealizationPolicy,
+) -> RealizationRoute {
+    match hint.on_miss {
+        MissRoute::BuildLocal if system == build_system => RealizationRoute::BuildLocal,
+        MissRoute::BuildLocal => RealizationRoute::Fail {
+            reason: format!(
+                "hint `{}` requests build-local but derivation runs on `{system}`",
+                hint.label
+            ),
+        },
+        MissRoute::RemoteNative => match policy {
+            RealizationPolicy::RemoteNative { builders } if !builders.is_empty() => {
+                RealizationRoute::RemoteNative {
+                    builders: builders.clone(),
+                }
+            }
+            RealizationPolicy::SubstituteOnly | RealizationPolicy::RemoteNative { builders: _ } => {
+                RealizationRoute::Fail {
+                    reason: format!(
+                        "hint `{}` requests remote-native but no eligible builder is declared",
+                        hint.label
+                    ),
+                }
+            }
+        },
+        MissRoute::Fail => RealizationRoute::Fail {
+            reason: format!("hint `{}` requires substitution", hint.label),
+        },
+    }
+}
+
+/// Applies the known-local (skip-probe) `on_miss` without probing.
+fn route_for_miss(
+    hint: Option<&RouteHintSpec>,
+    system: &str,
+    build_system: &str,
+    policy: &RealizationPolicy,
+) -> RealizationRoute {
+    match hint {
+        Some(hint) => route_for_hint(hint, &[], system, build_system, policy),
+        None => {
+            if system == build_system {
+                RealizationRoute::BuildLocal
+            } else {
+                RealizationRoute::Fail {
+                    reason: "known-local derivation not on the build system".to_owned(),
+                }
+            }
+        }
+    }
+}
+
+/// Maps a realization route back to the legacy class used by existing gates.
+fn route_class(route: &RealizationRoute) -> DerivationClass {
+    match route {
+        RealizationRoute::Substitute { .. } => DerivationClass::HostSubstituted,
+        RealizationRoute::BuildLocal => DerivationClass::BuildLocal,
+        RealizationRoute::RemoteNative { .. } => DerivationClass::HostRemote,
+        RealizationRoute::Fail { .. } => DerivationClass::Unhandled,
+    }
 }
 
 /// Returns the derivations Nix may need to realize for the requested outputs.
@@ -514,40 +855,128 @@ fn run_command_with_stderr(
     String::from_utf8(stdout).map_err(|source| Error::PlannerUtf8 { command, source })
 }
 
-fn probe_outputs(substituters: &[String], outputs: &[String]) -> Result<BTreeMap<String, bool>> {
+fn probe_outputs(
+    substituters: &[String],
+    outputs: &[String],
+) -> Result<BTreeMap<String, ProbeResult>> {
     if substituters.is_empty() {
         return Err(Error::PlannerNoSubstituters);
     }
-
-    let mut availability = outputs
-        .iter()
-        .cloned()
-        .map(|output| (output, false))
-        .collect::<BTreeMap<_, _>>();
-    let mut pending = outputs.to_vec();
-    let mut queried = BTreeSet::new();
-
-    for substituter in substituters {
-        if !queried.insert(substituter) || pending.is_empty() {
-            continue;
-        }
-
-        let probed = probe_substituter_outputs(substituter, &pending)?;
-        merge_availability(&mut availability, probed);
-        pending.retain(|output| !availability.get(output).copied().unwrap_or(false));
+    if outputs.is_empty() {
+        return Ok(BTreeMap::new());
     }
 
+    let unique = substituters
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+
+    // One scoped thread per unique substituter. Store probes are independent,
+    // so latency is bounded by the slowest store instead of their sum.
+    let mut probes = Vec::with_capacity(unique.len());
+    let mut failed_stores = Vec::new();
+
+    std::thread::scope(|scope| {
+        let mut handles = Vec::with_capacity(unique.len());
+        for substituter in &unique {
+            let substituter = substituter.clone();
+            let own = outputs.to_vec();
+            handles.push(scope.spawn(move || {
+                let result = probe_substituter_outputs(&substituter, &own);
+                (substituter, result)
+            }));
+        }
+        for handle in handles {
+            let (substituter, result) = handle.join().unwrap_or_else(|_| {
+                (
+                    "unknown".to_owned(),
+                    Err(Error::PlannerCacheProbe {
+                        substituter: "unknown".to_owned(),
+                        output: outputs.first().cloned().unwrap_or_default(),
+                        source: std::io::Error::other("probe thread panicked"),
+                    }),
+                )
+            });
+            match result {
+                Ok(probed) => probes.push(probed),
+                Err(_) => failed_stores.push(substituter),
+            }
+        }
+    });
+
+    let store_names = unique.iter().map(String::as_str).collect::<Vec<_>>();
+    let mut availability = merge_store_probes_with_errors(
+        &store_names,
+        &probes,
+        &failed_stores.iter().map(String::as_str).collect::<Vec<_>>(),
+    );
+    // Stores that errored may have answered none of the outputs; make sure
+    // every requested output has an entry.
+    for output in outputs {
+        availability.entry(output.clone()).or_insert(ProbeResult::Missing);
+    }
     Ok(availability)
 }
 
-fn merge_availability(availability: &mut BTreeMap<String, bool>, probed: BTreeMap<String, bool>) {
-    for (output, present) in probed {
-        if present {
-            availability.insert(output, true);
-        }
-    }
+/// Merges per-store probe maps into one output-to-result map.
+#[cfg(test)]
+fn merge_store_probes(
+    stores: &[&str],
+    probes: &[BTreeMap<String, bool>],
+) -> BTreeMap<String, ProbeResult> {
+    merge_store_probes_with_errors(stores, probes, &[])
 }
 
+/// Merges per-store probe maps and marks store failures as indeterminate.
+fn merge_store_probes_with_errors(
+    stores: &[&str],
+    probes: &[BTreeMap<String, bool>],
+    failed_stores: &[&str],
+) -> BTreeMap<String, ProbeResult> {
+    let mut present = BTreeMap::<String, String>::new();
+    for (store, probe) in stores.iter().zip(probes) {
+        for (output, is_present) in probe {
+            if *is_present {
+                present
+                    .entry(output.clone())
+                    .or_insert_with(|| (*store).to_owned());
+            }
+        }
+    }
+    let mut result = BTreeMap::<String, ProbeResult>::new();
+    // Every output asked of any store is a candidate. A confirmed hit wins;
+    // a clean all-miss is Missing; any store failure turns misses into
+    // Indeterminate because the errored store could have served the path.
+    let mut outputs = BTreeSet::<&str>::new();
+    for probe in probes {
+        outputs.extend(probe.keys().map(String::as_str));
+    }
+    let errors = failed_stores.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    for output in outputs {
+        if let Some(substituter) = present.get(output) {
+            result.insert(
+                output.to_owned(),
+                ProbeResult::Present {
+                    substituter: substituter.clone(),
+                },
+            );
+        } else if errors.is_empty() {
+            result.insert(output.to_owned(), ProbeResult::Missing);
+        } else {
+            result.insert(
+                output.to_owned(),
+                ProbeResult::Indeterminate {
+                    errors: errors.clone(),
+                },
+            );
+        }
+    }
+    result
+}
+
+/// Queries one substituter for every output path, in bounded batches.
 fn probe_substituter_outputs(
     substituter: &str,
     outputs: &[String],
@@ -661,20 +1090,156 @@ mod tests {
     }
 
     #[test]
-    fn union_probe_keeps_an_output_found_by_an_earlier_substituter() {
-        let mut availability = BTreeMap::from([
-            ("/nix/store/a".to_owned(), true),
-            ("/nix/store/b".to_owned(), false),
-        ]);
-        let later_probe = BTreeMap::from([
-            ("/nix/store/a".to_owned(), false),
-            ("/nix/store/b".to_owned(), true),
-        ]);
+    fn parallel_probe_merges_a_hit_from_one_store_despite_another_missing() {
+        // Both stores answer; the output is present in exactly one.
+        let hits = BTreeMap::from([("/nix/store/a".to_owned(), true)]);
+        let misses = BTreeMap::from([("/nix/store/a".to_owned(), false)]);
+        let merged = merge_store_probes(&["store-1", "store-2"], &[hits, misses]);
+        assert_eq!(
+            merged["/nix/store/a"],
+            ProbeResult::Present {
+                substituter: "store-1".to_owned()
+            }
+        );
+    }
 
-        merge_availability(&mut availability, later_probe);
+    #[test]
+    fn all_misses_yield_missing() {
+        let merged = merge_store_probes(
+            &["store-1", "store-2"],
+            &[
+                BTreeMap::from([("/nix/store/a".to_owned(), false)]),
+                BTreeMap::from([("/nix/store/a".to_owned(), false)]),
+            ],
+        );
+        assert_eq!(merged["/nix/store/a"], ProbeResult::Missing);
+    }
 
-        assert!(availability["/nix/store/a"]);
-        assert!(availability["/nix/store/b"]);
+    #[test]
+    fn missing_plus_store_failure_is_indeterminate_not_missing() {
+        let merged = merge_store_probes_with_errors(
+            &["store-1", "store-2"],
+            &[BTreeMap::from([("/nix/store/a".to_owned(), false)])],
+            &["store-2"],
+        );
+        assert!(matches!(
+            &merged["/nix/store/a"],
+            ProbeResult::Indeterminate { errors } if errors.iter().all(|e| e == "store-2")
+        ));
+    }
+
+    #[test]
+    fn known_local_hint_skips_probe_and_routes_build_local() {
+        let hints = vec![RouteHintSpec {
+            label: "identity-cli".into(),
+            installable: ".#identity-cli".into(),
+            on_miss: MissRoute::BuildLocal,
+            origin: None,
+            skip_probe: true,
+        }];
+        let hint_drvs = BTreeMap::from([("identity.drv".to_owned(), hints[0].clone())]);
+        let output_paths = BTreeMap::from([(
+            "identity.drv".to_owned(),
+            vec!["/nix/store/identity".to_owned()],
+        )]);
+        let skipped = hint_skip_probe_paths(&hint_drvs, &output_paths);
+        assert_eq!(skipped, BTreeSet::from(["/nix/store/identity".to_owned()]));
+
+        let probe = derive_probe_result(
+            "identity.drv",
+            &hint_drvs,
+            &["/nix/store/identity".to_owned()],
+            &BTreeMap::from([(
+                "/nix/store/identity".to_owned(),
+                ProbeResult::Missing,
+            )]),
+        );
+        assert_eq!(probe, ProbeResult::SkippedKnownLocal);
+
+        let route = select_route(
+            "identity.drv",
+            &probe,
+            &hints,
+            &hint_drvs,
+            "x86_64-linux",
+            "x86_64-linux",
+            "aarch64-linux",
+            &RealizationPolicy::SubstituteOnly,
+        );
+        assert_eq!(route, RealizationRoute::BuildLocal);
+    }
+
+    #[test]
+    fn hint_on_miss_fail_blocks_substitution_requirement() {
+        let spec = RouteHintSpec {
+            label: "must-substitute".into(),
+            installable: ".#pkg".into(),
+            on_miss: MissRoute::Fail,
+            origin: None,
+            skip_probe: false,
+        };
+        let route = route_for_hint(
+            &spec,
+            &[],
+            "aarch64-linux",
+            "x86_64-linux",
+            &RealizationPolicy::SubstituteOnly,
+        );
+        assert!(matches!(route, RealizationRoute::Fail { .. }));
+    }
+
+    #[test]
+    fn remote_native_route_requires_a_declared_builder() {
+        let spec = RouteHintSpec {
+            label: "remote".into(),
+            installable: ".#pkg".into(),
+            on_miss: MissRoute::RemoteNative,
+            origin: None,
+            skip_probe: false,
+        };
+        let no_builder = route_for_hint(
+            &spec,
+            &[],
+            "aarch64-linux",
+            "x86_64-linux",
+            &RealizationPolicy::SubstituteOnly,
+        );
+        assert!(matches!(no_builder, RealizationRoute::Fail { .. }));
+
+        let with_builder = route_for_hint(
+            &spec,
+            &[],
+            "aarch64-linux",
+            "x86_64-linux",
+            &RealizationPolicy::RemoteNative {
+                builders: vec!["ssh://builder".into()],
+            },
+        );
+        assert_eq!(
+            with_builder,
+            RealizationRoute::RemoteNative {
+                builders: vec!["ssh://builder".into()]
+            }
+        );
+    }
+
+    #[test]
+    fn build_local_hint_on_wrong_system_fails() {
+        let spec = RouteHintSpec {
+            label: "cross".into(),
+            installable: ".#pkg".into(),
+            on_miss: MissRoute::BuildLocal,
+            origin: None,
+            skip_probe: false,
+        };
+        let route = route_for_hint(
+            &spec,
+            &[],
+            "aarch64-linux",
+            "x86_64-linux",
+            &RealizationPolicy::SubstituteOnly,
+        );
+        assert!(matches!(route, RealizationRoute::Fail { .. }));
     }
 
     #[test]
