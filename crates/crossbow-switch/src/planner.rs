@@ -757,7 +757,7 @@ fn load_derivations(graph: &mut DerivationGraph, keys: &BTreeSet<String>) -> Res
             "show".to_owned(),
             "--no-pretty".to_owned(),
         ];
-        args.extend(chunk.iter().map(|path| (*path).clone()));
+        args.extend(chunk.iter().map(|path| store_path(path)));
         let batch = parse_graph(&run_command(
             "nix",
             &args,
