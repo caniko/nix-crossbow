@@ -123,7 +123,12 @@
       (builtins.attrNames crossPackageOverrides);
     crossPackageShadow =
       (lib.genAttrs existingCrossPackageAttrNames (name: crossPkgs.${name}))
-      // crossPackageOverrides;
+      // crossPackageOverrides
+      // {
+        # NixOS security.wrappers constructs its static helper through
+        # pkgs.pkgsStatic rather than a top-level package attribute.
+        pkgsStatic = crossPkgs.pkgsStatic;
+      };
   in {
     assertions = [
       {
