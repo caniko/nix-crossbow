@@ -1,28 +1,30 @@
+use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::{
     ClosurePlan, DerivationClass, Error, MissRoute, Publisher, RealizationPolicy, Result,
     RouteHintSpec, SwitchPlan, TrustPublish, Verifier, plan_closure_with_hints,
-    run_cache_shaped_switch,
+    run_cache_shaped_switch, run_planned_switch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Parsed options for one `crossbow-switch` CLI invocation.
 pub struct CliOptions {
-    /// Rebuild action passed to `nixos-rebuild`.
+    /// Prepared-system action: switch, boot, test, or build.
     pub action: String,
-    /// Flake reference passed to `nixos-rebuild --flake`.
+    /// Frozen flake reference recorded in prepared state.
     pub flake_attr: String,
     /// Attribute built first to realise the system toplevel.
     pub toplevel_attr: String,
-    /// Optional SSH target passed to `nixos-rebuild --target-host`.
+    /// Optional SSH target receiving the prepared toplevel.
     pub target_ssh: Option<String>,
     /// Whether activation should pass `--use-substitutes`.
     pub use_substitutes: bool,
     /// Whether the closure should be published and verified before activation.
     pub capture: bool,
-    /// Whether local activation should run `nixos-rebuild` through `sudo`.
+    /// Whether local profile updates and activation should run through sudo.
     pub sudo: bool,
     /// Whether remote activation should run through sudo on the target host.
     pub remote_sudo: bool,
@@ -55,6 +57,15 @@ pub struct PlanOptions {
     pub route_hints: Vec<RouteHintSpec>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed options for executing a serialized authoritative plan.
+pub struct ExecutePlanOptions {
+    /// JSON plan file produced by `crossbow-switch plan --json`.
+    pub plan_file: PathBuf,
+    /// Switch options used for capture and exact activation.
+    pub switch: CliOptions,
+}
+
 /// Returns the command-line usage string.
 #[must_use]
 pub fn usage() -> &'static str {
@@ -65,6 +76,33 @@ pub fn usage() -> &'static str {
 #[must_use]
 pub fn plan_usage() -> &'static str {
     "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--substituter <store> ...] [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>] [--route-hint <label>@<installable>:<fail|build-local|remote-native>] [--skip-probe <label>]"
+}
+
+/// Returns usage for authoritative planned execution.
+#[must_use]
+pub fn execute_plan_usage() -> &'static str {
+    "usage: crossbow-switch execute-plan --plan <plan.json> --flake <frozen-flake> --toplevel <toplevel-attr> [switch options]"
+}
+
+/// Parses authoritative plan execution arguments.
+pub fn parse_execute_plan_args<I, S>(args: I) -> Result<ExecutePlanOptions>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let index = args.iter().position(|arg| arg == "--plan").ok_or_else(|| {
+        Error::MissingRequiredArgument {
+            flag: "--plan".to_owned(),
+        }
+    })?;
+    let plan_file = PathBuf::from(required_value(&args, index + 1, "--plan")?);
+    let switch = parse_args(
+        args.into_iter()
+            .enumerate()
+            .filter_map(|(i, arg)| (i != index && i != index + 1).then_some(arg)),
+    )?;
+    Ok(ExecutePlanOptions { plan_file, switch })
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -344,6 +382,18 @@ pub fn run_from_env() -> Result<()> {
         )?;
         return print_plan(&plan, options.json);
     }
+    if args.first().is_some_and(|arg| arg == "execute-plan") {
+        let execute_args = &args[1..];
+        if execute_args
+            .iter()
+            .any(|arg| arg == "-h" || arg == "--help")
+        {
+            println!("{}", execute_plan_usage());
+            return Ok(());
+        }
+        let options = parse_execute_plan_args(execute_args.iter().cloned())?;
+        return run_execute_plan(&options);
+    }
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         println!("{}", usage());
         return Ok(());
@@ -437,6 +487,45 @@ pub fn run_with_options(options: &CliOptions) -> Result<()> {
     run_cache_shaped_switch(&plan, publisher, verifier)
 }
 
+/// Loads, verifies, and executes one serialized authoritative plan.
+pub fn run_execute_plan(options: &ExecutePlanOptions) -> Result<()> {
+    let json = fs::read_to_string(&options.plan_file).map_err(|source| Error::NixStoreRead {
+        file: options.plan_file.display().to_string(),
+        source,
+    })?;
+    let closure: ClosurePlan =
+        serde_json::from_str(&json).map_err(|source| Error::PlannerJson { source })?;
+    let switch = SwitchPlan {
+        action: &options.switch.action,
+        flake_attr: &options.switch.flake_attr,
+        toplevel_attr: &options.switch.toplevel_attr,
+        target_ssh: options.switch.target_ssh.as_deref(),
+        use_substitutes: options.switch.use_substitutes,
+        capture: options.switch.capture,
+        sudo: options.switch.sudo,
+        remote_sudo: options.switch.remote_sudo,
+        max_jobs: options.switch.max_jobs,
+        realization_policy: options.switch.realization_policy.clone(),
+    };
+    let noop_publisher = NoopPublisher;
+    let command_publisher;
+    let publisher: &dyn Publisher = if let Some(command) = &options.switch.publish_command {
+        command_publisher = CommandPublisher { command };
+        &command_publisher
+    } else {
+        &noop_publisher
+    };
+    let trust_publish = TrustPublish;
+    let command_verifier;
+    let verifier: &dyn Verifier = if let Some(command) = &options.switch.verify_command {
+        command_verifier = CommandVerifier { command };
+        &command_verifier
+    } else {
+        &trust_publish
+    };
+    run_planned_switch(&switch, &closure, publisher, verifier)
+}
+
 struct NoopPublisher;
 
 impl Publisher for NoopPublisher {
@@ -520,11 +609,11 @@ fn run_path_command(command: &str, paths: &[String]) -> Result<String> {
 }
 
 fn parse_route_hint(spec: &str) -> Result<RouteHintSpec> {
-    let (label_installable, route) = spec
-        .rsplit_once(':')
-        .ok_or_else(|| Error::MissingArgumentValue {
-            flag: "--route-hint".to_owned(),
-        })?;
+    let (label_installable, route) =
+        spec.rsplit_once(':')
+            .ok_or_else(|| Error::MissingArgumentValue {
+                flag: "--route-hint".to_owned(),
+            })?;
     let on_miss = match route {
         "fail" => MissRoute::Fail,
         "build-local" => MissRoute::BuildLocal,
@@ -536,11 +625,12 @@ fn parse_route_hint(spec: &str) -> Result<RouteHintSpec> {
             });
         }
     };
-    let (label, installable) = label_installable
-        .split_once('@')
-        .ok_or_else(|| Error::MissingArgumentValue {
-            flag: "--route-hint".to_owned(),
-        })?;
+    let (label, installable) =
+        label_installable
+            .split_once('@')
+            .ok_or_else(|| Error::MissingArgumentValue {
+                flag: "--route-hint".to_owned(),
+            })?;
     Ok(RouteHintSpec {
         label: label.to_owned(),
         installable: installable.to_owned(),
@@ -615,6 +705,26 @@ mod tests {
             options.realization_policy,
             RealizationPolicy::SubstituteOnly
         );
+        Ok(())
+    }
+
+    #[test]
+    fn execute_plan_parser_reuses_switch_options() -> Result<()> {
+        let options = parse_execute_plan_args([
+            "--plan",
+            "/tmp/plan.json",
+            "--flake",
+            "/nix/store/source#host-crossbow",
+            "--toplevel",
+            "/nix/store/source#nixosConfigurations.host.config.system.build.toplevel",
+            "--action",
+            "test",
+            "--target-host",
+            "root@host",
+        ])?;
+        assert_eq!(options.plan_file, PathBuf::from("/tmp/plan.json"));
+        assert_eq!(options.switch.action, "test");
+        assert_eq!(options.switch.target_ssh.as_deref(), Some("root@host"));
         Ok(())
     }
 

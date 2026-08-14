@@ -257,6 +257,44 @@ pub enum Error {
     #[error("crossbow: exact planner requires at least one configured substituter")]
     PlannerNoSubstituters,
 
+    /// An executable plan uses an unsupported schema version.
+    #[error("crossbow: unsupported closure plan schema version {version}")]
+    UnsupportedPlanSchema {
+        /// Unsupported schema version.
+        version: u32,
+    },
+
+    /// An executable plan's content no longer matches its stable identifier.
+    #[error("crossbow: closure plan ID mismatch: expected `{expected}`, computed `{actual}`")]
+    PlanIdMismatch {
+        /// Identifier recorded in the plan.
+        expected: String,
+        /// Identifier computed from canonical content.
+        actual: String,
+    },
+
+    /// A caller attempted to execute a plan for another installable identity.
+    #[error(
+        "crossbow: closure plan identity mismatch for `{field}`: planned `{planned}`, requested `{requested}`"
+    )]
+    PlanIdentityMismatch {
+        /// Identity field that differed.
+        field: &'static str,
+        /// Identity sealed into the plan.
+        planned: String,
+        /// Identity supplied by the executor caller.
+        requested: String,
+    },
+
+    /// A fail-closed output action prevents execution.
+    #[error("crossbow: closure plan is blocked for `{path}`: {reason}")]
+    PlanBlocked {
+        /// Output path that cannot be realized safely.
+        path: String,
+        /// Planner reason for refusing execution.
+        reason: String,
+    },
+
     /// A cache probe could not be spawned.
     #[error("crossbow: failed to probe `{output}` in substituter `{substituter}`")]
     PlannerCacheProbe {

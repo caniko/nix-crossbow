@@ -2,13 +2,18 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
-use std::path::Path;
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::{Error, RealizationPolicy, Result};
+
+/// Current version of the authoritative closure-plan schema.
+pub const PLAN_SCHEMA_VERSION: u32 = 1;
+
+type OutputPaths = BTreeMap<(String, String), String>;
 
 /// The realization class assigned to one derivation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +122,37 @@ pub enum RealizationRoute {
     },
 }
 
+/// Authoritative probe and route decision for one derivation output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OutputAction {
+    /// Output name from the derivation.
+    pub output: String,
+    /// Expected output store path.
+    pub path: String,
+    /// Probe result used to select `route`.
+    pub probe: ProbeResult,
+    /// Exact route the executor must follow.
+    pub route: RealizationRoute,
+}
+
+/// One dependency edge retained in the executable plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanDependency {
+    /// Dependency derivation store path.
+    pub drv: String,
+    /// Outputs required from the dependency.
+    pub outputs: Vec<String>,
+}
+
+/// Exact outputs requested from one root derivation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanRoot {
+    /// Root derivation store path.
+    pub drv: String,
+    /// Requested root output names, without implicit expansion to every output.
+    pub outputs: Vec<String>,
+}
+
 impl Default for RealizationRoute {
     fn default() -> Self {
         Self::Fail {
@@ -154,6 +190,12 @@ pub struct DerivationPlan {
     /// Outcome of probing the requested outputs against the substituters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeResult>,
+    /// Authoritative independent actions for the requested outputs.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<OutputAction>,
+    /// Direct dependency edges retained from the realization frontier.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dependencies: Vec<PlanDependency>,
 }
 
 impl DerivationPlan {
@@ -177,9 +219,10 @@ impl DerivationPlan {
 }
 
 fn is_default_route(route: &RealizationRoute) -> bool {
-    *route == RealizationRoute::Fail {
-        reason: String::new(),
-    }
+    *route
+        == RealizationRoute::Fail {
+            reason: String::new(),
+        }
 }
 
 /// Counts for a structured closure plan.
@@ -201,14 +244,64 @@ pub struct PlanCounts {
 /// Complete machine-readable realization plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClosurePlan {
+    /// Version of this executable plan schema.
+    #[serde(default)]
+    pub schema_version: u32,
+    /// SHA-256 identifier over canonical plan content, excluding this field.
+    #[serde(default)]
+    pub plan_id: String,
+    /// Exact toplevel installable requested during planning.
+    #[serde(default)]
+    pub toplevel_installable: String,
+    /// Exact frozen flake installable that owns `toplevel_installable`.
+    #[serde(default)]
+    pub flake_installable: String,
     /// Build system running Crossbow.
     pub build_system: String,
     /// Target host system.
     pub host_system: String,
+    /// Exact root outputs requested by the installable.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<PlanRoot>,
     /// Derivations in the realized closure graph.
     pub derivations: Vec<DerivationPlan>,
     /// Aggregate class counts.
     pub counts: PlanCounts,
+}
+
+impl ClosurePlan {
+    /// Computes the stable identifier for this plan's canonical content.
+    pub fn canonical_plan_id(&self) -> Result<String> {
+        #[derive(Serialize)]
+        struct CanonicalPlan<'a> {
+            schema_version: u32,
+            toplevel_installable: &'a str,
+            flake_installable: &'a str,
+            build_system: &'a str,
+            host_system: &'a str,
+            roots: &'a [PlanRoot],
+            derivations: &'a [DerivationPlan],
+            counts: &'a PlanCounts,
+        }
+
+        let bytes = serde_json::to_vec(&CanonicalPlan {
+            schema_version: self.schema_version,
+            toplevel_installable: &self.toplevel_installable,
+            flake_installable: &self.flake_installable,
+            build_system: &self.build_system,
+            host_system: &self.host_system,
+            roots: &self.roots,
+            derivations: &self.derivations,
+            counts: &self.counts,
+        })
+        .map_err(|source| Error::PlannerJson { source })?;
+        Ok(format!("sha256-{:x}", Sha256::digest(bytes)))
+    }
+
+    fn seal(mut self) -> Result<Self> {
+        self.plan_id = self.canonical_plan_id()?;
+        Ok(self)
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -300,14 +393,7 @@ pub fn plan_closure_with_substituters(
     substituters: &[String],
     policy: &RealizationPolicy,
 ) -> Result<ClosurePlan> {
-    plan_closure_with_hints(
-        attr,
-        build_system,
-        host_system,
-        substituters,
-        policy,
-        &[],
-    )
+    plan_closure_with_hints(attr, build_system, host_system, substituters, policy, &[])
 }
 
 /// Computes a structured plan using the union of the supplied substituters and
@@ -326,31 +412,38 @@ pub fn plan_closure_with_hints(
     policy: &RealizationPolicy,
     hints: &[RouteHintSpec],
 ) -> Result<ClosurePlan> {
+    let roots = resolve_roots(attr, substituters, policy)?;
     let root_args = ["derivation", "show", "--no-pretty", attr]
         .into_iter()
         .map(str::to_owned)
         .collect::<Vec<_>>();
-    let roots = parse_graph(&run_nix(&root_args)?)?;
-    if roots.derivations.is_empty() {
-        return Ok(ClosurePlan {
+    let root_graph = parse_graph(&run_nix(&root_args)?)?;
+    if roots.is_empty() {
+        return ClosurePlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            plan_id: String::new(),
+            toplevel_installable: attr.to_owned(),
+            flake_installable: flake_installable_for_toplevel(attr),
             build_system: build_system.to_owned(),
             host_system: host_system.to_owned(),
+            roots,
             derivations: Vec::new(),
             counts: PlanCounts::default(),
-        });
+        }
+        .seal();
     }
 
     let hint_drvs = resolve_hint_drvs(hints)?;
-    let mut graph = roots.clone();
+    let mut graph = root_graph;
     let mut required = BTreeMap::<String, BTreeSet<String>>::new();
-    for (key, node) in &graph.derivations {
+    for root in &roots {
         required
-            .entry(key.clone())
+            .entry(derivation_key(&root.drv))
             .or_default()
-            .extend(node.outputs.keys().cloned());
+            .extend(root.outputs.iter().cloned());
     }
 
-    let mut output_paths = BTreeMap::<String, Vec<String>>::new();
+    let mut output_paths = OutputPaths::new();
     let mut availability = BTreeMap::<String, ProbeResult>::new();
     let mut frontier = BTreeMap::<String, BTreeSet<String>>::new();
 
@@ -364,24 +457,28 @@ pub fn plan_closure_with_hints(
             load_derivations(&mut graph, &missing)?;
         }
 
-        let unresolved = required
-            .keys()
-            .filter(|key| !output_paths.contains_key(*key))
-            .cloned()
-            .collect::<BTreeSet<_>>();
+        let unresolved = unresolved_outputs(&required, &output_paths);
         if !unresolved.is_empty() {
             output_paths.extend(resolve_output_paths(
                 &graph,
-                &required,
                 &unresolved,
+                substituters,
                 policy,
             )?);
         }
 
         let outputs_to_probe = output_paths
             .values()
-            .flat_map(|paths| paths.iter())
             .filter(|path| !availability.contains_key(*path))
+            .filter(|path| {
+                output_paths.iter().any(|((key, _), candidate)| {
+                    candidate == *path
+                        && graph
+                            .derivations
+                            .get(key)
+                            .is_some_and(|node| node.system != "builtin")
+                })
+            })
             .cloned()
             .collect::<BTreeSet<_>>();
         // `skip_probe` hint outputs are known local roots: never queried
@@ -391,10 +488,7 @@ pub fn plan_closure_with_hints(
             .cloned()
             .collect::<Vec<_>>();
         if !outputs_to_probe.is_empty() {
-            availability.extend(probe_outputs(
-                substituters,
-                &outputs_to_probe,
-            )?);
+            availability.extend(probe_outputs(substituters, &outputs_to_probe)?);
         }
 
         if !expand_frontier(
@@ -414,27 +508,51 @@ pub fn plan_closure_with_hints(
         let Some(node) = graph.derivations.get(&key) else {
             continue;
         };
-        if node.system == "builtin" {
-            continue;
-        }
         let output_names = names.iter().cloned().collect::<Vec<_>>();
         let outputs = output_names
             .iter()
-            .filter_map(|name| output_path_for_name(&required, &output_paths, &key, name))
+            .map(|name| output_path_for_name(&output_paths, &key, name))
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .cloned()
             .collect::<Vec<_>>();
         let system = node.system.clone();
-        let probe = derive_probe_result(&key, &hint_drvs, &outputs, &availability);
-        let route = select_route(
-            &key,
-            &probe,
-            hints,
-            &hint_drvs,
-            &system,
-            build_system,
-            host_system,
-            policy,
-        );
+        let actions = output_names
+            .iter()
+            .map(|output| {
+                let path = output_path_for_name(&output_paths, &key, output)?;
+                let probe = if system == "builtin"
+                    || hint_drvs.get(&key).is_some_and(|hint| hint.skip_probe)
+                {
+                    ProbeResult::SkippedKnownLocal
+                } else {
+                    availability
+                        .get(path)
+                        .cloned()
+                        .unwrap_or_else(|| ProbeResult::Indeterminate {
+                            errors: vec!["output was not probed".to_owned()],
+                        })
+                };
+                let route = select_route(
+                    &key,
+                    &probe,
+                    hints,
+                    &hint_drvs,
+                    &system,
+                    build_system,
+                    host_system,
+                    policy,
+                );
+                Ok(OutputAction {
+                    output: output.clone(),
+                    path: path.clone(),
+                    probe,
+                    route,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let probe = summarize_probes(&actions);
+        let route = summarize_routes(&actions);
         let class = route_class(&route);
 
         match class {
@@ -445,6 +563,25 @@ pub fn plan_closure_with_hints(
             DerivationClass::Unhandled => counts.unhandled += 1,
         }
         let hint = hint_drvs.get(&key).map(|spec| spec.label.clone());
+        let dependencies = node
+            .inputs
+            .drvs
+            .iter()
+            .filter_map(|(input_key, input)| {
+                let drv = derivation_key(input_key);
+                let requested = required.get(&drv)?;
+                let outputs = input
+                    .outputs
+                    .iter()
+                    .filter(|output| requested.contains(*output))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                (!outputs.is_empty()).then(|| PlanDependency {
+                    drv: store_path(&drv),
+                    outputs,
+                })
+            })
+            .collect();
         derivations.push(DerivationPlan {
             drv: store_path(&key),
             name: node
@@ -464,17 +601,172 @@ pub fn plan_closure_with_hints(
             route,
             hint,
             probe: Some(probe),
+            actions,
+            dependencies,
         });
     }
 
-    derivations.sort_by(|left, right| left.drv.cmp(&right.drv));
+    derivations = dependency_first(derivations, &roots);
 
-    Ok(ClosurePlan {
+    ClosurePlan {
+        schema_version: PLAN_SCHEMA_VERSION,
+        plan_id: String::new(),
+        toplevel_installable: attr.to_owned(),
+        flake_installable: flake_installable_for_toplevel(attr),
         build_system: build_system.to_owned(),
         host_system: host_system.to_owned(),
+        roots,
         derivations,
         counts,
-    })
+    }
+    .seal()
+}
+
+fn flake_installable_for_toplevel(toplevel: &str) -> String {
+    let Some((source, fragment)) = toplevel.split_once('#') else {
+        return String::new();
+    };
+    fragment
+        .strip_prefix("nixosConfigurations.")
+        .and_then(|fragment| fragment.strip_suffix(".config.system.build.toplevel"))
+        .map_or_else(String::new, |configuration| {
+            format!("{source}#{configuration}")
+        })
+}
+
+fn resolve_roots(
+    attr: &str,
+    substituters: &[String],
+    policy: &RealizationPolicy,
+) -> Result<Vec<PlanRoot>> {
+    let args = dry_run_args(&[attr.to_owned()], substituters, policy)?;
+    let output = run_command_silent("nix", &args, format!("nix build --dry-run --json {attr}"))?;
+    parse_roots(&output)
+}
+
+fn unresolved_outputs(
+    required: &BTreeMap<String, BTreeSet<String>>,
+    output_paths: &OutputPaths,
+) -> BTreeSet<(String, String)> {
+    required
+        .iter()
+        .flat_map(|(key, names)| names.iter().map(|name| (key.clone(), name.clone())))
+        .filter(|pair| !output_paths.contains_key(pair))
+        .collect()
+}
+
+fn parse_roots(output: &str) -> Result<Vec<PlanRoot>> {
+    let entries: Vec<OutputEntry> =
+        serde_json::from_str(output).map_err(|source| Error::PlannerJson { source })?;
+    Ok(entries
+        .into_iter()
+        .map(|entry| PlanRoot {
+            drv: store_path(&entry.drv_path),
+            outputs: entry.outputs.into_keys().collect(),
+        })
+        .collect())
+}
+
+fn summarize_probes(actions: &[OutputAction]) -> ProbeResult {
+    let errors = actions
+        .iter()
+        .filter_map(|action| match &action.probe {
+            ProbeResult::Indeterminate { errors } => Some(errors.as_slice()),
+            _ => None,
+        })
+        .flatten()
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
+        return ProbeResult::Indeterminate { errors };
+    }
+    if actions
+        .iter()
+        .any(|action| matches!(action.probe, ProbeResult::Missing))
+    {
+        return ProbeResult::Missing;
+    }
+    if actions
+        .iter()
+        .all(|action| matches!(action.probe, ProbeResult::LocalPresent))
+    {
+        return ProbeResult::LocalPresent;
+    }
+    if actions
+        .iter()
+        .all(|action| matches!(action.probe, ProbeResult::SkippedKnownLocal))
+    {
+        return ProbeResult::SkippedKnownLocal;
+    }
+    actions
+        .iter()
+        .find_map(|action| match &action.probe {
+            ProbeResult::Present { substituter } => Some(ProbeResult::Present {
+                substituter: substituter.clone(),
+            }),
+            _ => None,
+        })
+        .unwrap_or_else(|| ProbeResult::Indeterminate {
+            errors: vec!["no output actions".to_owned()],
+        })
+}
+
+fn summarize_routes(actions: &[OutputAction]) -> RealizationRoute {
+    actions
+        .iter()
+        .map(|action| &action.route)
+        .min_by_key(|route| match route {
+            RealizationRoute::Fail { .. } => 0,
+            RealizationRoute::RemoteNative { .. } => 1,
+            RealizationRoute::BuildLocal => 2,
+            RealizationRoute::Substitute { .. } => 3,
+            RealizationRoute::AlreadyPresent => 4,
+        })
+        .cloned()
+        .unwrap_or_else(|| RealizationRoute::Fail {
+            reason: "derivation has no output actions".to_owned(),
+        })
+}
+
+fn dependency_first(mut plans: Vec<DerivationPlan>, roots: &[PlanRoot]) -> Vec<DerivationPlan> {
+    let mut by_drv = plans
+        .drain(..)
+        .map(|plan| (plan.drv.clone(), plan))
+        .collect::<BTreeMap<_, _>>();
+    let mut ordered = Vec::with_capacity(by_drv.len());
+    let mut visited = BTreeSet::new();
+
+    fn visit(
+        drv: &str,
+        by_drv: &mut BTreeMap<String, DerivationPlan>,
+        visited: &mut BTreeSet<String>,
+        ordered: &mut Vec<DerivationPlan>,
+    ) {
+        if !visited.insert(drv.to_owned()) {
+            return;
+        }
+        let dependencies = by_drv
+            .get(drv)
+            .map(|plan| plan.dependencies.clone())
+            .unwrap_or_default();
+        for dependency in dependencies {
+            visit(&dependency.drv, by_drv, visited, ordered);
+        }
+        if let Some(plan) = by_drv.remove(drv) {
+            ordered.push(plan);
+        }
+    }
+
+    for root in roots {
+        visit(&root.drv, &mut by_drv, &mut visited, &mut ordered);
+    }
+    let remaining = by_drv.keys().cloned().collect::<Vec<_>>();
+    for drv in remaining {
+        visit(&drv, &mut by_drv, &mut visited, &mut ordered);
+    }
+    ordered
 }
 
 /// Resolves each route hint's `installable` to the exact derivation it names.
@@ -502,17 +794,22 @@ fn resolve_hint_drvs(hints: &[RouteHintSpec]) -> Result<BTreeMap<String, RouteHi
 /// Output paths that a `skip_probe` hint removes from substituter probing.
 fn hint_skip_probe_paths(
     hint_drvs: &BTreeMap<String, RouteHintSpec>,
-    output_paths: &BTreeMap<String, Vec<String>>,
+    output_paths: &OutputPaths,
 ) -> BTreeSet<String> {
     hint_drvs
         .iter()
         .filter(|(_, hint)| hint.skip_probe)
-        .filter_map(|(key, _)| output_paths.get(key))
-        .flat_map(|paths| paths.iter().cloned())
+        .flat_map(|(key, _)| {
+            output_paths
+                .iter()
+                .filter(move |((drv, _), _)| drv == key)
+                .map(|(_, path)| path.clone())
+        })
         .collect()
 }
 
 /// Combines per-output probe answers into one derivation-level result.
+#[cfg(test)]
 fn derive_probe_result(
     key: &str,
     hint_drvs: &BTreeMap<String, RouteHintSpec>,
@@ -571,14 +868,19 @@ fn select_route(
     policy: &RealizationPolicy,
 ) -> RealizationRoute {
     let hint = hint_drvs.get(key);
+    if system == "builtin" {
+        return RealizationRoute::BuildLocal;
+    }
     match probe {
         ProbeResult::Present { substituter } => RealizationRoute::Substitute {
             substituter: substituter.clone(),
         },
         ProbeResult::LocalPresent => RealizationRoute::AlreadyPresent,
         ProbeResult::SkippedKnownLocal => route_for_miss(hint, system, build_system, policy),
-        ProbeResult::Missing
-        | ProbeResult::Indeterminate { .. } => {
+        ProbeResult::Indeterminate { errors } => RealizationRoute::Fail {
+            reason: format!("output probe indeterminate: {}", errors.join(", ")),
+        },
+        ProbeResult::Missing => {
             if let Some(hint) = hint {
                 return route_for_hint(hint, hints, system, build_system, policy);
             }
@@ -593,12 +895,9 @@ fn select_route(
                         }
                     }
                     RealizationPolicy::SubstituteOnly
-                    | RealizationPolicy::RemoteNative { builders: _ } => {
-                        RealizationRoute::Fail {
-                            reason: "host-system miss with no eligible native builder"
-                                .to_owned(),
-                        }
-                    }
+                    | RealizationPolicy::RemoteNative { builders: _ } => RealizationRoute::Fail {
+                        reason: "host-system miss with no eligible native builder".to_owned(),
+                    },
                 };
             }
             RealizationRoute::Fail {
@@ -687,7 +986,7 @@ fn expand_frontier(
     graph: &DerivationGraph,
     required: &mut BTreeMap<String, BTreeSet<String>>,
     frontier: &mut BTreeMap<String, BTreeSet<String>>,
-    output_paths: &BTreeMap<String, Vec<String>>,
+    output_paths: &OutputPaths,
     availability: &BTreeMap<String, ProbeResult>,
 ) -> Result<bool> {
     let mut changed = false;
@@ -704,10 +1003,11 @@ fn expand_frontier(
             .ok_or_else(|| Error::PlannerMissingDerivation {
                 drv: store_path(&key),
             })?;
-        let available = node.system != "builtin"
-            && !names.is_empty()
+        let available = !names.is_empty()
+            && node.system != "builtin"
             && names.iter().all(|name| {
-                output_path_for_name(required, output_paths, &key, name)
+                output_paths
+                    .get(&(key.clone(), name.clone()))
                     .and_then(|path| availability.get(path))
                     .is_some_and(ProbeResult::is_available)
             });
@@ -726,16 +1026,16 @@ fn expand_frontier(
 }
 
 fn output_path_for_name<'a>(
-    required: &BTreeMap<String, BTreeSet<String>>,
-    output_paths: &'a BTreeMap<String, Vec<String>>,
+    output_paths: &'a OutputPaths,
     key: &str,
     name: &str,
-) -> Option<&'a String> {
-    let index = required
-        .get(key)?
-        .iter()
-        .position(|required_name| required_name == name)?;
-    output_paths.get(key)?.get(index)
+) -> Result<&'a String> {
+    output_paths
+        .get(&(key.to_owned(), name.to_owned()))
+        .ok_or_else(|| Error::PlannerMissingOutput {
+            drv: store_path(key),
+            output: name.to_owned(),
+        })
 }
 
 fn parse_graph(value: &str) -> Result<DerivationGraph> {
@@ -789,55 +1089,44 @@ fn store_path(path: &str) -> String {
 
 fn resolve_output_paths(
     graph: &DerivationGraph,
-    required: &BTreeMap<String, BTreeSet<String>>,
-    keys: &BTreeSet<String>,
+    outputs: &BTreeSet<(String, String)>,
+    substituters: &[String],
     policy: &RealizationPolicy,
-) -> Result<BTreeMap<String, Vec<String>>> {
-    let mut resolved = BTreeMap::<(String, String), String>::new();
+) -> Result<OutputPaths> {
+    let mut resolved = OutputPaths::new();
     let mut pending = Vec::<(String, String, String)>::new();
 
-    for key in keys {
-        let names = required
-            .get(key)
-            .ok_or_else(|| Error::PlannerMissingDerivation {
-                drv: store_path(key),
-            })?;
+    for (key, name) in outputs {
         let Some(node) = graph.derivations.get(key) else {
             return Err(Error::PlannerMissingDerivation {
                 drv: store_path(key),
             });
         };
-        if node.system == "builtin" {
-            continue;
-        }
-        for name in names {
-            let output = node
-                .outputs
-                .get(name)
-                .ok_or_else(|| Error::PlannerMissingOutput {
-                    drv: store_path(key),
-                    output: name.clone(),
-                })?;
-            match &output.path {
-                Some(path) => {
-                    resolved.insert((key.clone(), name.clone()), store_path(path));
-                }
-                None => pending.push((
-                    key.clone(),
-                    name.clone(),
-                    format!("{}^{}", store_path(key), name),
-                )),
+        let output = node
+            .outputs
+            .get(name)
+            .ok_or_else(|| Error::PlannerMissingOutput {
+                drv: store_path(key),
+                output: name.clone(),
+            })?;
+        match &output.path {
+            Some(path) => {
+                resolved.insert((key.clone(), name.clone()), store_path(path));
             }
+            None => pending.push((
+                key.clone(),
+                name.clone(),
+                format!("{}^{}", store_path(key), name),
+            )),
         }
     }
 
     for chunk in pending.chunks(256) {
-        let mut args = ["build", "--dry-run", "--json", "--no-link"]
-            .into_iter()
-            .map(str::to_owned)
+        let specs = chunk
+            .iter()
+            .map(|(_, _, spec)| spec.clone())
             .collect::<Vec<_>>();
-        args.extend(chunk.iter().map(|(_, _, spec)| spec.clone()));
-        args.extend(crate::realization_nix_flags(policy)?);
+        let args = dry_run_args(&specs, substituters, policy)?;
         let output = run_command_silent(
             "nix",
             &args,
@@ -853,34 +1142,42 @@ fn resolve_output_paths(
         }
     }
 
-    let mut paths = BTreeMap::new();
-    for key in keys {
-        let names = required
-            .get(key)
-            .ok_or_else(|| Error::PlannerMissingDerivation {
+    for (key, name) in outputs {
+        if !resolved.contains_key(&(key.clone(), name.clone())) {
+            return Err(Error::PlannerMissingOutput {
                 drv: store_path(key),
-            })?;
-        if graph
-            .derivations
-            .get(key)
-            .is_some_and(|node| node.system == "builtin")
-        {
-            continue;
+                output: name.clone(),
+            });
         }
-        let mut output_paths = Vec::with_capacity(names.len());
-        for name in names {
-            let path = resolved
-                .get(&(key.clone(), name.clone()))
-                .cloned()
-                .ok_or_else(|| Error::PlannerMissingOutput {
-                    drv: store_path(key),
-                    output: name.clone(),
-                })?;
-            output_paths.push(path);
-        }
-        paths.insert(key.clone(), output_paths);
     }
-    Ok(paths)
+    Ok(resolved)
+}
+
+fn dry_run_args(
+    installables: &[String],
+    substituters: &[String],
+    policy: &RealizationPolicy,
+) -> Result<Vec<String>> {
+    let mut args = ["build", "--dry-run", "--json", "--no-link"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    args.extend_from_slice(installables);
+    args.extend(planner_realization_flags(substituters, policy)?);
+    Ok(args)
+}
+
+fn planner_realization_flags(
+    substituters: &[String],
+    policy: &RealizationPolicy,
+) -> Result<Vec<String>> {
+    let mut flags = crate::realization_nix_flags(policy)?;
+    flags.extend([
+        "--option".to_owned(),
+        "substituters".to_owned(),
+        substituters.join(" "),
+    ]);
+    Ok(flags)
 }
 
 fn run_nix(args: &[String]) -> Result<String> {
@@ -956,60 +1253,57 @@ fn probe_outputs(
         return Ok(BTreeMap::new());
     }
 
+    let local = probe_substituter_outputs("daemon", outputs);
     let mut availability = BTreeMap::new();
-    let mut pending = Vec::new();
-    for output in outputs {
-        if Path::new(output).exists() {
-            availability.insert(output.clone(), ProbeResult::LocalPresent);
-        } else {
-            pending.push(output.clone());
-        }
+    let pending = match &local {
+        Ok(probed) => outputs
+            .iter()
+            .filter(|output| !probed.get(*output).copied().unwrap_or(false))
+            .cloned()
+            .collect::<Vec<_>>(),
+        Err(_) => outputs.to_vec(),
+    };
+    if let Ok(probed) = &local {
+        availability.extend(
+            probed
+                .iter()
+                .filter(|(_, present)| **present)
+                .map(|(output, _)| (output.clone(), ProbeResult::LocalPresent)),
+        );
     }
 
+    let mut seen = BTreeSet::new();
     let unique = substituters
         .iter()
+        .filter(|substituter| seen.insert((*substituter).clone()))
         .cloned()
-        .collect::<BTreeSet<_>>()
-        .into_iter()
         .collect::<Vec<_>>();
 
     let mut probes = Vec::with_capacity(unique.len());
-    let mut failed_stores = Vec::new();
 
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(unique.len());
         for substituter in &unique {
-            let substituter = substituter.clone();
+            let store = substituter.clone();
             let own = pending.clone();
-            handles.push(scope.spawn(move || {
-                let result = probe_substituter_outputs(&substituter, &own);
-                (substituter, result)
-            }));
+            handles.push((
+                substituter.clone(),
+                scope.spawn(move || probe_substituter_outputs(&store, &own)),
+            ));
         }
-        for handle in handles {
-            let (substituter, result) = handle.join().unwrap_or_else(|_| {
-                (
-                    "unknown".to_owned(),
-                    Err(Error::PlannerCacheProbe {
-                        substituter: "unknown".to_owned(),
-                        output: pending.first().cloned().unwrap_or_default(),
-                        source: std::io::Error::other("probe thread panicked"),
-                    }),
-                )
+        for (substituter, handle) in handles {
+            let result = handle.join().unwrap_or_else(|_| {
+                Err(Error::PlannerCacheProbe {
+                    substituter: substituter.clone(),
+                    output: pending.first().cloned().unwrap_or_default(),
+                    source: std::io::Error::other("probe thread panicked"),
+                })
             });
-            match result {
-                Ok(probed) => probes.push(probed),
-                Err(_) => failed_stores.push(substituter),
-            }
+            probes.push((substituter, result));
         }
     });
 
-    let store_names = unique.iter().map(String::as_str).collect::<Vec<_>>();
-    availability.extend(merge_store_probes_with_errors(
-        &store_names,
-        &probes,
-        &failed_stores.iter().map(String::as_str).collect::<Vec<_>>(),
-    ));
+    availability.extend(merge_store_probe_results(&pending, &probes, local.is_err()));
     // Stores that errored may have answered none of the outputs; make sure
     // every requested output has an entry.
     for output in &pending {
@@ -1030,6 +1324,7 @@ fn merge_store_probes(
 }
 
 /// Merges per-store probe maps and marks store failures as indeterminate.
+#[cfg(test)]
 fn merge_store_probes_with_errors(
     stores: &[&str],
     probes: &[BTreeMap<String, bool>],
@@ -1053,7 +1348,10 @@ fn merge_store_probes_with_errors(
     for probe in probes {
         outputs.extend(probe.keys().map(String::as_str));
     }
-    let errors = failed_stores.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+    let errors = failed_stores
+        .iter()
+        .map(|s| (*s).to_owned())
+        .collect::<Vec<_>>();
     for output in outputs {
         if let Some(substituter) = present.get(output) {
             result.insert(
@@ -1076,11 +1374,66 @@ fn merge_store_probes_with_errors(
     result
 }
 
+fn merge_store_probe_results(
+    outputs: &[String],
+    probes: &[(String, Result<BTreeMap<String, bool>>)],
+    local_probe_failed: bool,
+) -> BTreeMap<String, ProbeResult> {
+    let mut result = BTreeMap::new();
+    for output in outputs {
+        let hit = probes.iter().find_map(|(store, probe)| {
+            probe
+                .as_ref()
+                .ok()
+                .and_then(|values| values.get(output))
+                .copied()
+                .unwrap_or(false)
+                .then(|| store.clone())
+        });
+        if let Some(substituter) = hit {
+            result.insert(output.clone(), ProbeResult::Present { substituter });
+            continue;
+        }
+        let mut errors = probes
+            .iter()
+            .filter(|(_, probe)| probe.is_err())
+            .map(|(store, _)| store.clone())
+            .collect::<Vec<_>>();
+        if local_probe_failed {
+            errors.insert(0, "daemon".to_owned());
+        }
+        result.insert(
+            output.clone(),
+            if errors.is_empty() {
+                ProbeResult::Missing
+            } else {
+                ProbeResult::Indeterminate { errors }
+            },
+        );
+    }
+    result
+}
+
 /// Queries one substituter for every output path, in bounded batches.
 fn probe_substituter_outputs(
     substituter: &str,
     outputs: &[String],
 ) -> Result<BTreeMap<String, bool>> {
+    let ping = Command::new("nix")
+        .args(["store", "ping", "--store", substituter])
+        .output()
+        .map_err(|source| Error::PlannerCacheProbe {
+            substituter: substituter.to_owned(),
+            output: outputs.first().cloned().unwrap_or_default(),
+            source,
+        })?;
+    if !ping.status.success() {
+        return Err(Error::PlannerCacheProbeFailed {
+            substituter: substituter.to_owned(),
+            output: outputs.first().cloned().unwrap_or_default(),
+            stderr: String::from_utf8_lossy(&ping.stderr).trim().to_owned(),
+        });
+    }
     let mut availability = BTreeMap::new();
     for chunk in outputs.chunks(1024) {
         let mut args = vec![
@@ -1116,13 +1469,9 @@ fn probe_substituter_outputs(
             };
             availability.insert(output.clone(), !value.is_null());
         }
-        if !result.status.success() {
-            return Err(Error::PlannerCacheProbeFailed {
-                substituter: substituter.to_owned(),
-                output: chunk.first().cloned().unwrap_or_default(),
-                stderr: String::from_utf8_lossy(&result.stderr).trim().to_owned(),
-            });
-        }
+        // `nix path-info` exits non-zero for ordinary misses while still
+        // returning a complete JSON map with null values. Complete JSON is the
+        // authoritative per-path answer; malformed or incomplete JSON fails.
     }
     Ok(availability)
 }
@@ -1134,8 +1483,13 @@ mod tests {
     #[test]
     fn serializes_machine_readable_plan() {
         let plan = ClosurePlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            plan_id: String::new(),
+            toplevel_installable: "/nix/store/source#top".to_owned(),
+            flake_installable: "/nix/store/source#host".to_owned(),
             build_system: "x86_64-linux".into(),
             host_system: "aarch64-linux".into(),
+            roots: vec![],
             derivations: vec![],
             counts: PlanCounts::default(),
         };
@@ -1199,6 +1553,168 @@ mod tests {
     }
 
     #[test]
+    fn root_parser_preserves_only_requested_outputs() {
+        let roots = parse_roots(
+            r#"[{"drvPath":"/nix/store/root.drv","outputs":{"dev":"/nix/store/root-dev"}}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            roots,
+            vec![PlanRoot {
+                drv: "/nix/store/root.drv".to_owned(),
+                outputs: vec!["dev".to_owned()]
+            }]
+        );
+    }
+
+    #[test]
+    fn real_nix_missing_json_and_selected_output_are_machine_readable() {
+        if Command::new("nix").arg("--version").output().is_err() {
+            return;
+        }
+        let missing = "/nix/store/00000000000000000000000000000000-crossbow-invalid";
+        let output = Command::new("nix")
+            .args([
+                "path-info",
+                "--json",
+                "--json-format",
+                "1",
+                "--store",
+                "daemon",
+                missing,
+            ])
+            .output()
+            .unwrap();
+        let json: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(json.get(missing).unwrap().is_null());
+
+        let output = Command::new("nix")
+            .args([
+                "build",
+                "--dry-run",
+                "--json",
+                "--no-link",
+                "--impure",
+                "--expr",
+                r#"derivation { name = "crossbow-selected-output-test"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "mkdir -p $out $dev" ]; outputs = [ "out" "dev" ]; }"#,
+                "^dev",
+                "--option",
+                "substituters",
+                "",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let roots = parse_roots(&String::from_utf8(output.stdout).unwrap()).unwrap();
+        assert_eq!(roots.len(), 1);
+        assert_eq!(roots[0].outputs, ["dev"]);
+    }
+
+    #[test]
+    fn later_required_output_of_known_derivation_is_unresolved() {
+        let mut required =
+            BTreeMap::from([("shared.drv".to_owned(), BTreeSet::from(["out".to_owned()]))]);
+        let paths = BTreeMap::from([(
+            ("shared.drv".to_owned(), "out".to_owned()),
+            "/nix/store/shared".to_owned(),
+        )]);
+        assert!(unresolved_outputs(&required, &paths).is_empty());
+
+        required
+            .get_mut("shared.drv")
+            .unwrap()
+            .insert("dev".to_owned());
+        assert_eq!(
+            unresolved_outputs(&required, &paths),
+            BTreeSet::from([("shared.drv".to_owned(), "dev".to_owned())])
+        );
+    }
+
+    #[test]
+    fn later_frontier_expansion_resolves_new_output_of_known_derivation() {
+        let graph = parse_graph(
+            r#"{"derivations": {
+              "root.drv": {"system":"x86_64-linux","outputs":{"out":{"path":"root"}},"inputs":{"drvs":{"first.drv":{"outputs":["out"]}}}},
+              "first.drv": {"system":"x86_64-linux","outputs":{"out":{"path":"first"}},"inputs":{"drvs":{"shared.drv":{"outputs":["out"]},"later.drv":{"outputs":["out"]}}}},
+              "later.drv": {"system":"x86_64-linux","outputs":{"out":{"path":"later"}},"inputs":{"drvs":{"shared.drv":{"outputs":["dev"]}}}},
+              "shared.drv": {"system":"x86_64-linux","outputs":{"out":{"path":"shared"},"dev":{"path":"shared-dev"}},"inputs":{"drvs":{}}}
+            },"version":4}"#,
+        )
+        .unwrap();
+        let mut required =
+            BTreeMap::from([("root.drv".to_owned(), BTreeSet::from(["out".to_owned()]))]);
+        let mut frontier = BTreeMap::new();
+        let mut paths = BTreeMap::from([
+            (
+                ("root.drv".to_owned(), "out".to_owned()),
+                "/nix/store/root".to_owned(),
+            ),
+            (
+                ("first.drv".to_owned(), "out".to_owned()),
+                "/nix/store/first".to_owned(),
+            ),
+            (
+                ("later.drv".to_owned(), "out".to_owned()),
+                "/nix/store/later".to_owned(),
+            ),
+            (
+                ("shared.drv".to_owned(), "out".to_owned()),
+                "/nix/store/shared".to_owned(),
+            ),
+        ]);
+        let availability = paths
+            .values()
+            .map(|path| (path.clone(), ProbeResult::Missing))
+            .collect();
+
+        for _ in 0..3 {
+            expand_frontier(&graph, &mut required, &mut frontier, &paths, &availability).unwrap();
+        }
+        let unresolved = unresolved_outputs(&required, &paths);
+        assert_eq!(
+            unresolved,
+            BTreeSet::from([("shared.drv".to_owned(), "dev".to_owned())])
+        );
+        paths.extend(
+            resolve_output_paths(
+                &graph,
+                &unresolved,
+                &["https://cache".to_owned()],
+                &RealizationPolicy::SubstituteOnly,
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            paths[&("shared.drv".to_owned(), "dev".to_owned())],
+            "/nix/store/shared-dev"
+        );
+    }
+
+    #[test]
+    fn planner_dry_runs_pin_only_ordered_substituters() {
+        let args = dry_run_args(
+            &["/nix/store/root.drv^out".to_owned()],
+            &["https://private".to_owned(), "https://public".to_owned()],
+            &RealizationPolicy::SubstituteOnly,
+        )
+        .unwrap();
+        assert!(args.windows(3).any(|args| {
+            args == ["--option", "substituters", "https://private https://public"]
+        }));
+        assert_eq!(
+            args.iter()
+                .filter(|arg| arg.as_str() == "substituters")
+                .count(),
+            1
+        );
+        assert!(!args.iter().any(|arg| arg.contains("trusted-public-keys")));
+    }
+
+    #[test]
     fn frontier_expansion_prunes_inputs_of_substituted_nodes() {
         let graph = parse_graph(
             r#"
@@ -1226,14 +1742,17 @@ mod tests {
             BTreeMap::from([("root.drv".to_owned(), BTreeSet::from(["out".to_owned()]))]);
         let mut frontier = BTreeMap::new();
         let output_paths = BTreeMap::from([
-            ("root.drv".to_owned(), vec!["/nix/store/root".to_owned()]),
             (
-                "cached.drv".to_owned(),
-                vec!["/nix/store/cached".to_owned()],
+                ("root.drv".to_owned(), "out".to_owned()),
+                "/nix/store/root".to_owned(),
             ),
             (
-                "missing.drv".to_owned(),
-                vec!["/nix/store/missing".to_owned()],
+                ("cached.drv".to_owned(), "out".to_owned()),
+                "/nix/store/cached".to_owned(),
+            ),
+            (
+                ("missing.drv".to_owned(), "out".to_owned()),
+                "/nix/store/missing".to_owned(),
             ),
         ]);
         let availability = BTreeMap::from([
@@ -1313,14 +1832,196 @@ mod tests {
     }
 
     #[test]
-    fn local_presence_skips_substituter_probe() {
-        let output = tempfile::NamedTempFile::new().unwrap();
-        let path = output.path().to_string_lossy().into_owned();
-        let availability = probe_outputs(
-            &["https://unused.example".to_owned()],
-            std::slice::from_ref(&path),
-        )
-        .unwrap();
+    fn probe_merge_preserves_substituter_order_and_failure_attribution() {
+        let output = "/nix/store/a".to_owned();
+        let probes = vec![
+            (
+                "second".to_owned(),
+                Ok(BTreeMap::from([(output.clone(), true)])),
+            ),
+            (
+                "first".to_owned(),
+                Ok(BTreeMap::from([(output.clone(), true)])),
+            ),
+        ];
+        assert_eq!(
+            merge_store_probe_results(std::slice::from_ref(&output), &probes, false)[&output],
+            ProbeResult::Present {
+                substituter: "second".to_owned()
+            }
+        );
+
+        let failed = vec![(
+            "private".to_owned(),
+            Err(Error::PlannerCacheProbeFailed {
+                substituter: "private".to_owned(),
+                output: output.clone(),
+                stderr: "down".to_owned(),
+            }),
+        )];
+        assert_eq!(
+            merge_store_probe_results(std::slice::from_ref(&output), &failed, true)[&output],
+            ProbeResult::Indeterminate {
+                errors: vec!["daemon".to_owned(), "private".to_owned()]
+            }
+        );
+    }
+
+    #[test]
+    fn indeterminate_probe_always_fails_closed() {
+        let route = select_route(
+            "root.drv",
+            &ProbeResult::Indeterminate {
+                errors: vec!["cache".to_owned()],
+            },
+            &[],
+            &BTreeMap::new(),
+            "x86_64-linux",
+            "x86_64-linux",
+            "aarch64-linux",
+            &RealizationPolicy::SubstituteOnly,
+        );
+        assert!(matches!(route, RealizationRoute::Fail { .. }));
+    }
+
+    #[test]
+    fn dependency_order_and_plan_id_are_stable() {
+        fn plan(drv: &str, dependencies: Vec<PlanDependency>) -> DerivationPlan {
+            DerivationPlan {
+                drv: drv.to_owned(),
+                name: None,
+                pname: None,
+                output_names: vec![],
+                outputs: vec![],
+                system: "x86_64-linux".to_owned(),
+                class: DerivationClass::BuildLocal,
+                route: RealizationRoute::BuildLocal,
+                hint: None,
+                probe: None,
+                actions: vec![],
+                dependencies,
+            }
+        }
+        let dependency = plan("/nix/store/z-dependency.drv", vec![]);
+        let root = plan(
+            "/nix/store/a-root.drv",
+            vec![PlanDependency {
+                drv: dependency.drv.clone(),
+                outputs: vec!["out".to_owned()],
+            }],
+        );
+        let ordered = dependency_first(
+            vec![root.clone(), dependency.clone()],
+            &[PlanRoot {
+                drv: root.drv.clone(),
+                outputs: vec!["out".to_owned()],
+            }],
+        );
+        assert_eq!(ordered[0].drv, dependency.drv);
+        assert_eq!(ordered[1].drv, root.drv);
+
+        let plan = ClosurePlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            plan_id: "ignored".to_owned(),
+            toplevel_installable: "/nix/store/source#top".to_owned(),
+            flake_installable: "/nix/store/source#host".to_owned(),
+            build_system: "x86_64-linux".to_owned(),
+            host_system: "aarch64-linux".to_owned(),
+            roots: vec![],
+            derivations: ordered,
+            counts: PlanCounts::default(),
+        };
+        assert_eq!(
+            plan.canonical_plan_id().unwrap(),
+            plan.canonical_plan_id().unwrap()
+        );
+    }
+
+    #[test]
+    fn installable_identity_is_part_of_plan_id() {
+        let mut first = ClosurePlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            plan_id: String::new(),
+            toplevel_installable: "/nix/store/source#top-a".to_owned(),
+            flake_installable: "/nix/store/source#host".to_owned(),
+            build_system: "x86_64-linux".to_owned(),
+            host_system: "aarch64-linux".to_owned(),
+            roots: vec![],
+            derivations: vec![],
+            counts: PlanCounts::default(),
+        };
+        let first_id = first.canonical_plan_id().unwrap();
+        first.toplevel_installable = "/nix/store/source#top-b".to_owned();
+        assert_ne!(first_id, first.canonical_plan_id().unwrap());
+        first.toplevel_installable = "/nix/store/source#top-a".to_owned();
+        first.flake_installable = "/nix/store/source#other-host".to_owned();
+        assert_ne!(first_id, first.canonical_plan_id().unwrap());
+    }
+
+    #[test]
+    fn builtin_dependency_is_ordered_before_its_consumer_and_build_local() {
+        let builtin_route = select_route(
+            "builtin.drv",
+            &ProbeResult::SkippedKnownLocal,
+            &[],
+            &BTreeMap::new(),
+            "builtin",
+            "x86_64-linux",
+            "aarch64-linux",
+            &RealizationPolicy::SubstituteOnly,
+        );
+        assert_eq!(builtin_route, RealizationRoute::BuildLocal);
+
+        let builtin = DerivationPlan {
+            drv: "/nix/store/builtin.drv".to_owned(),
+            name: None,
+            pname: None,
+            output_names: vec!["out".to_owned()],
+            outputs: vec!["/nix/store/builtin".to_owned()],
+            system: "builtin".to_owned(),
+            class: DerivationClass::BuildLocal,
+            route: builtin_route,
+            hint: None,
+            probe: Some(ProbeResult::SkippedKnownLocal),
+            actions: vec![],
+            dependencies: vec![],
+        };
+        let root = DerivationPlan {
+            drv: "/nix/store/root.drv".to_owned(),
+            name: None,
+            pname: None,
+            output_names: vec!["out".to_owned()],
+            outputs: vec!["/nix/store/root".to_owned()],
+            system: "x86_64-linux".to_owned(),
+            class: DerivationClass::BuildLocal,
+            route: RealizationRoute::BuildLocal,
+            hint: None,
+            probe: Some(ProbeResult::Missing),
+            actions: vec![],
+            dependencies: vec![PlanDependency {
+                drv: builtin.drv.clone(),
+                outputs: vec!["out".to_owned()],
+            }],
+        };
+        let ordered = dependency_first(
+            vec![root.clone(), builtin.clone()],
+            &[PlanRoot {
+                drv: root.drv,
+                outputs: vec!["out".to_owned()],
+            }],
+        );
+        assert_eq!(ordered[0].drv, builtin.drv);
+    }
+
+    #[test]
+    fn local_presence_requires_a_daemon_probe_hit() {
+        let path = "/nix/store/example".to_owned();
+        let local = BTreeMap::from([(path.clone(), true)]);
+        let availability = local
+            .iter()
+            .filter(|(_, present)| **present)
+            .map(|(output, _)| (output.clone(), ProbeResult::LocalPresent))
+            .collect::<BTreeMap<_, _>>();
 
         assert_eq!(availability[&path], ProbeResult::LocalPresent);
     }
@@ -1336,8 +2037,8 @@ mod tests {
         }];
         let hint_drvs = BTreeMap::from([("identity.drv".to_owned(), hints[0].clone())]);
         let output_paths = BTreeMap::from([(
-            "identity.drv".to_owned(),
-            vec!["/nix/store/identity".to_owned()],
+            ("identity.drv".to_owned(), "out".to_owned()),
+            "/nix/store/identity".to_owned(),
         )]);
         let skipped = hint_skip_probe_paths(&hint_drvs, &output_paths);
         assert_eq!(skipped, BTreeSet::from(["/nix/store/identity".to_owned()]));
@@ -1465,6 +2166,8 @@ mod tests {
             route: RealizationRoute::BuildLocal,
             hint: None,
             probe: None,
+            actions: Vec::new(),
+            dependencies: Vec::new(),
         };
 
         assert_eq!(plan.display_label(), "canix (canix-1.0)");

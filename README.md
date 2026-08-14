@@ -80,3 +80,16 @@ Crossbow names cache strategy explicitly:
 - `linux -> darwin`, which requires a user-provided Apple SDK and osxcross.
 
 Unsupported pairs fail with explicit error messages instead of silently substituting another strategy.
+
+## Authoritative Plans
+
+`crossbow-switch plan --json` only records the intended realization. Execute
+that exact plan explicitly; the legacy switch command still performs its own
+generic realization.
+
+```sh
+crossbow-switch execute-plan --plan plan.json \
+  --flake /nix/store/source#host-crossbow \
+  --toplevel /nix/store/source#nixosConfigurations.host.config.system.build.toplevel \
+  --action build
+```
