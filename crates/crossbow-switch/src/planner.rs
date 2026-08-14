@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 use crate::{Error, RealizationPolicy, Result};
 
 /// Current version of the authoritative closure-plan schema.
-pub const PLAN_SCHEMA_VERSION: u32 = 1;
+pub const PLAN_SCHEMA_VERSION: u32 = 2;
 
 type OutputPaths = BTreeMap<(String, String), String>;
 
@@ -1017,8 +1017,8 @@ fn expand_frontier(
 
         for (input_key, input) in &node.inputs.drvs {
             let entry = required.entry(derivation_key(input_key)).or_default();
-            if input.outputs.iter().any(|name| entry.insert(name.clone())) {
-                changed = true;
+            for name in &input.outputs {
+                changed |= entry.insert(name.clone());
             }
         }
     }
@@ -1631,6 +1631,32 @@ mod tests {
         assert_eq!(
             unresolved_outputs(&required, &paths),
             BTreeSet::from([("shared.drv".to_owned(), "dev".to_owned())])
+        );
+    }
+
+    #[test]
+    fn frontier_expansion_keeps_every_required_dependency_output() {
+        let graph = parse_graph(
+            r#"{"derivations": {
+              "root.drv": {"system":"x86_64-linux","outputs":{"out":{"path":"root"}},"inputs":{"drvs":{"dependency.drv":{"outputs":["man","out"]}}}},
+              "dependency.drv": {"system":"aarch64-linux","outputs":{"man":{"path":"dependency-man"},"out":{"path":"dependency"}},"inputs":{"drvs":{}}}
+            },"version":4}"#,
+        )
+        .unwrap();
+        let mut required =
+            BTreeMap::from([("root.drv".to_owned(), BTreeSet::from(["out".to_owned()]))]);
+        let mut frontier = BTreeMap::new();
+        let paths = BTreeMap::from([(
+            ("root.drv".to_owned(), "out".to_owned()),
+            "/nix/store/root".to_owned(),
+        )]);
+        let availability = BTreeMap::from([("/nix/store/root".to_owned(), ProbeResult::Missing)]);
+
+        expand_frontier(&graph, &mut required, &mut frontier, &paths, &availability).unwrap();
+
+        assert_eq!(
+            required["dependency.drv"],
+            BTreeSet::from(["man".to_owned(), "out".to_owned()])
         );
     }
 
