@@ -25,6 +25,7 @@ Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and
 - `lib.hardwareProfiles`: optional target hardware profiles such as `rockpro64`.
 - `lib.mkOptimizedHostPlatform`: merge a hardware profile into a Nix host platform descriptor.
 - `lib.withCrossSupport`: augment package outputs with cross variants.
+- `lib.mkPinManifest`: normalize Crossbow cache roots into channel-grouped package and consumer-target requirements.
 
 ## Target Hardware Optimization
 
@@ -80,6 +81,19 @@ Crossbow names cache strategy explicitly:
 - `linux -> darwin`, which requires a user-provided Apple SDK and osxcross.
 
 Unsupported pairs fail with explicit error messages instead of silently substituting another strategy.
+
+## Pin Manifest
+
+Consumers can expose a `crossbowPinManifest` flake output using
+`lib.mkPinManifest`, then inspect it without changing the lock file:
+
+```sh
+crossbow-switch pin-manifest --flake . --attr crossbowPinManifest --json
+```
+
+The manifest groups required packages by nixpkgs channel and keeps every exact
+consumer target, including duplicate package uses across hosts. A consumer
+such as canix can pass each group to its cache-pin transaction.
 
 ## Authoritative Plans
 

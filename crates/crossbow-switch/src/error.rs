@@ -237,6 +237,61 @@ pub enum Error {
         source: serde_json::Error,
     },
 
+    /// The pin-manifest Nix evaluation could not be spawned.
+    #[error("crossbow: failed to run `nix eval --no-write-lock-file --json {installable}`")]
+    PinManifestCommand {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// Underlying spawn failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The pin-manifest Nix evaluation failed.
+    #[error(
+        "crossbow: `nix eval --no-write-lock-file --json {installable}` failed (exit status {status:?}): {stderr}"
+    )]
+    PinManifestFailed {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// Process exit code, or `None` when the process ended without one.
+        status: Option<i32>,
+        /// Captured Nix stderr.
+        stderr: String,
+    },
+
+    /// The pin-manifest Nix evaluation emitted non-UTF-8 output.
+    #[error(
+        "crossbow: `nix eval --no-write-lock-file --json {installable}` produced non-UTF-8 output"
+    )]
+    PinManifestUtf8 {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// Underlying UTF-8 error.
+        #[source]
+        source: FromUtf8Error,
+    },
+
+    /// The pin-manifest Nix evaluation emitted invalid JSON.
+    #[error("crossbow: pin-manifest JSON for `{installable}` is invalid")]
+    PinManifestJson {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// JSON parsing failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Serializing the parsed pin-manifest JSON for output failed.
+    #[error("crossbow: failed to serialize pin-manifest JSON for `{installable}`")]
+    PinManifestOutputJson {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// JSON serialization failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// Nix omitted one requested derivation from `nix derivation show`.
     #[error("crossbow: planner could not find derivation `{drv}` in nix derivation show output")]
     PlannerMissingDerivation {

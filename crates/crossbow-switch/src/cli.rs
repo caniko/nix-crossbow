@@ -66,16 +66,33 @@ pub struct ExecutePlanOptions {
     pub switch: CliOptions,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed options for the read-only pin manifest command.
+pub struct PinManifestOptions {
+    /// Flake source evaluated for the manifest.
+    pub flake_source: String,
+    /// Attribute evaluated from the flake source.
+    pub attr: String,
+    /// Whether to pretty-print the evaluated JSON.
+    pub json: bool,
+}
+
 /// Returns the command-line usage string.
 #[must_use]
 pub fn usage() -> &'static str {
-    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo] [--max-jobs <N>] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
+    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo] [--max-jobs <N>] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>] | crossbow-switch plan ... | crossbow-switch pin-manifest --flake <flake-source> [--attr <attr>] [--json]"
 }
 
 /// Returns the usage string for the read-only planner.
 #[must_use]
 pub fn plan_usage() -> &'static str {
     "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--substituter <store> ...] [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>] [--route-hint <label>@<installable>:<fail|build-local|remote-native>] [--skip-probe <label>]"
+}
+
+/// Returns the usage string for the read-only pin manifest command.
+#[must_use]
+pub fn pin_manifest_usage() -> &'static str {
+    "usage: crossbow-switch pin-manifest --flake <flake-source> [--attr <attr>] [--json]"
 }
 
 /// Returns usage for authoritative planned execution.
@@ -103,6 +120,54 @@ where
             .filter_map(|(i, arg)| (i != index && i != index + 1).then_some(arg)),
     )?;
     Ok(ExecutePlanOptions { plan_file, switch })
+}
+
+/// Parses arguments for the read-only pin manifest command.
+pub fn parse_pin_manifest_args<I, S>(args: I) -> Result<PinManifestOptions>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let mut flake_source = None;
+    let mut attr = "crossbowPinManifest".to_owned();
+    let mut json = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--flake" => {
+                index += 1;
+                flake_source = Some(required_value(&args, index, "--flake")?.to_owned());
+            }
+            "--attr" => {
+                index += 1;
+                attr = required_value(&args, index, "--attr")?.to_owned();
+            }
+            "--json" => json = true,
+            "-h" | "--help" => {
+                return Err(Error::UnknownArgument {
+                    argument: args[index].clone(),
+                    usage: pin_manifest_usage().to_owned(),
+                });
+            }
+            unknown => {
+                return Err(Error::UnknownArgument {
+                    argument: unknown.to_owned(),
+                    usage: pin_manifest_usage().to_owned(),
+                });
+            }
+        }
+        index += 1;
+    }
+
+    Ok(PinManifestOptions {
+        flake_source: flake_source.ok_or_else(|| Error::MissingRequiredArgument {
+            flag: "--flake".to_owned(),
+        })?,
+        attr,
+        json,
+    })
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -394,6 +459,18 @@ pub fn run_from_env() -> Result<()> {
         let options = parse_execute_plan_args(execute_args.iter().cloned())?;
         return run_execute_plan(&options);
     }
+    if args.first().is_some_and(|arg| arg == "pin-manifest") {
+        let pin_manifest_args = &args[1..];
+        if pin_manifest_args
+            .iter()
+            .any(|arg| arg == "-h" || arg == "--help")
+        {
+            println!("{}", pin_manifest_usage());
+            return Ok(());
+        }
+        let options = parse_pin_manifest_args(pin_manifest_args.iter().cloned())?;
+        return run_pin_manifest(&options);
+    }
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         println!("{}", usage());
         return Ok(());
@@ -401,6 +478,58 @@ pub fn run_from_env() -> Result<()> {
 
     let options = parse_args(args)?;
     run_with_options(&options)
+}
+
+/// Evaluates and prints a flake's pin manifest.
+pub fn run_pin_manifest(options: &PinManifestOptions) -> Result<()> {
+    let installable = if options.flake_source.contains('#') {
+        options.flake_source.clone()
+    } else {
+        format!("{}#{}", options.flake_source, options.attr)
+    };
+    let output = Command::new("nix")
+        .args([
+            "eval",
+            "--no-write-lock-file",
+            "--json",
+            installable.as_str(),
+        ])
+        .output()
+        .map_err(|source| Error::PinManifestCommand {
+            installable: installable.clone(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(Error::PinManifestFailed {
+            installable,
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|source| Error::PinManifestUtf8 {
+        installable: installable.clone(),
+        source,
+    })?;
+    let value = serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|source| {
+        Error::PinManifestJson {
+            installable: installable.clone(),
+            source,
+        }
+    })?;
+    let rendered = if options.json {
+        serde_json::to_string_pretty(&value)
+    } else {
+        serde_json::to_string(&value)
+    }
+    .map_err(|source| Error::PinManifestOutputJson {
+        installable,
+        source,
+    })?;
+
+    println!("{rendered}");
+    Ok(())
 }
 
 fn print_plan(plan: &ClosurePlan, json: bool) -> Result<()> {
@@ -928,5 +1057,54 @@ mod tests {
                 .to_string()
                 .contains("unsupported nixos-rebuild action")
         );
+    }
+
+    #[test]
+    fn pin_manifest_parser_uses_default_attribute() -> Result<()> {
+        let options = parse_pin_manifest_args(["--flake", "."])?;
+
+        assert_eq!(options.flake_source, ".");
+        assert_eq!(options.attr, "crossbowPinManifest");
+        assert!(!options.json);
+        Ok(())
+    }
+
+    #[test]
+    fn pin_manifest_parser_accepts_attribute_and_json_output() -> Result<()> {
+        let options = parse_pin_manifest_args([
+            "--flake",
+            "github:example/project",
+            "--attr",
+            "packages.x86_64-linux.manifest",
+            "--json",
+        ])?;
+
+        assert_eq!(options.flake_source, "github:example/project");
+        assert_eq!(options.attr, "packages.x86_64-linux.manifest");
+        assert!(options.json);
+        Ok(())
+    }
+
+    #[test]
+    fn pin_manifest_parser_requires_flake_source() {
+        let error = parse_pin_manifest_args(["--json"]).unwrap_err();
+
+        assert!(error.to_string().contains("missing --flake"));
+    }
+
+    #[test]
+    fn pin_manifest_parser_rejects_unknown_arguments() {
+        let error = parse_pin_manifest_args(["--flake", ".", "--pretty"]).unwrap_err();
+
+        assert!(error.to_string().contains("unknown argument `--pretty`"));
+        assert!(error.to_string().contains("pin-manifest"));
+    }
+
+    #[test]
+    fn pin_manifest_parser_accepts_an_installable_flake_reference() -> Result<()> {
+        let options = parse_pin_manifest_args(["--flake", ".#crossbowPinManifest"])?;
+
+        assert_eq!(options.flake_source, ".#crossbowPinManifest");
+        Ok(())
     }
 }

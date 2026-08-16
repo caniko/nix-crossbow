@@ -181,6 +181,116 @@
         checks = {
           crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
 
+          pin-manifest = let
+            manifest = inputs.self.lib.mkPinManifest {
+              roots = [
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  arch = "aarch64-linux";
+                  name = "direct";
+                  policy = "must-substitute";
+                  target = "target.direct";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  hostSystem = "aarch64-linux";
+                  host = "thething";
+                  name = "assembled";
+                  policy = "cross-build";
+                  target = "target.assembled";
+                  cachePackages = ["zeta"];
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  arch = "aarch64-linux";
+                  name = "shared-one";
+                  policy = "cross-build";
+                  target = "target.shared-one";
+                  cachePackages = ["shared"];
+                  packageTargets.shared = "target.shared.one";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  arch = "aarch64-linux";
+                  name = "shared-two";
+                  policy = "cross-build";
+                  target = "target.shared-two";
+                  cachePackages = ["shared"];
+                  packageTargets.shared = "target.shared.two";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  arch = "aarch64-linux";
+                  name = "excluded";
+                  policy = "build-platform";
+                  target = "target.excluded";
+                }
+              ];
+            };
+            reordered = inputs.self.lib.mkPinManifest {
+              roots = [
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "build-platform";
+                  arch = "aarch64-linux";
+                  name = "excluded";
+                  target = "target.excluded";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "cross-build";
+                  arch = "aarch64-linux";
+                  name = "shared-two";
+                  target = "target.shared-two";
+                  cachePackages = ["shared"];
+                  packageTargets.shared = "target.shared.two";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "must-substitute";
+                  arch = "aarch64-linux";
+                  name = "direct";
+                  target = "target.direct";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "cross-build";
+                  hostSystem = "aarch64-linux";
+                  host = "thething";
+                  name = "assembled";
+                  target = "target.assembled";
+                  cachePackages = ["zeta"];
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "cross-build";
+                  arch = "aarch64-linux";
+                  name = "shared-one";
+                  target = "target.shared-one";
+                  cachePackages = ["shared"];
+                  packageTargets.shared = "target.shared.one";
+                }
+              ];
+            };
+          in pkgs.runCommand "crossbow-pin-manifest" {} ''
+            test ${pkgs.lib.escapeShellArg (builtins.toJSON manifest)} = ${pkgs.lib.escapeShellArg (builtins.toJSON reordered)}
+            test '${pkgs.lib.concatStringsSep " " manifest.groups.aarch64.packages}' = 'direct shared zeta'
+            test '${manifest.groups.aarch64.consumerTargets.zeta}' = 'nixosConfigurations.thething-crossbow.pkgs.zeta'
+            test '${manifest.groups.aarch64.requiredConsumerTargets."shared#1"}' = 'target.shared.two'
+            test '${toString (builtins.length manifest.groups.aarch64.entries)}' = 4
+            touch $out
+          '';
+
           crossbow-metadata-pkl =
             pkgs.runCommand "crossbow-metadata-pkl" {
               buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
