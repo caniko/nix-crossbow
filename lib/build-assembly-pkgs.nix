@@ -123,7 +123,12 @@
       (builtins.attrNames crossPackageOverrides);
     crossPackageShadow =
       (lib.genAttrs existingCrossPackageAttrNames (name: crossPkgs.${name}))
-      // crossPackageOverrides;
+      // crossPackageOverrides
+      // {
+        # NixOS security.wrappers constructs its static helper through
+        # pkgs.pkgsStatic rather than a top-level package attribute.
+        pkgsStatic = crossPkgs.pkgsStatic;
+      };
   in {
     assertions = [
       {
@@ -328,6 +333,16 @@
             writeShellScriptBin
             writeShellApplication
             ;
+
+          # `pkgs.writers.writeJSON` closes over host `formats` at pkgs
+          # construction time. Shadowing `formats` does not reach it, so
+          # NixOS `system.build.inhibitSwitch` stays host-arch. Only the
+          # JSON data writer is swapped; compiling writers stay host-native.
+          writers =
+            hostPkgs.writers
+            // {
+              inherit (buildPkgs.writers) writeJSON;
+            };
         }
         // installerToolsShadow
         // crossPackageShadow
@@ -352,7 +367,7 @@
           buildPackages =
             hostPkgs.buildPackages
             // {
-              inherit (buildPkgs) gettext;
+              inherit (buildPkgs) gettext runCommand;
             };
         }
     );
