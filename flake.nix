@@ -2,7 +2,7 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    rs-harbor.url = "git+ssh://git@codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=f209ddbca3fdbb0dc31fa3886ccc2ff7369c18ac";
+    rs-harbor.url = "git+ssh://git@github.com/caniko/rs-harbor.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
     nixpkgs.follows = "rs-harbor/nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
