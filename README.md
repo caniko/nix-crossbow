@@ -2,7 +2,7 @@
 
 <!-- simit:badges:start -->
 
-[![CI](https://img.shields.io/badge/CI-drift-2088ff)](.forgejo/workflows/ci.yaml) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/crossbow-switch)
+[![CI](https://img.shields.io/badge/CI-drift-2088ff)](.github/workflows/ci.yaml) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/crossbow-switch)
 
 <!-- simit:badges:end -->
 
@@ -22,6 +22,7 @@ Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and
 - `lib.mkNixosNativeSubstitutedSystem`: evaluate a host-native NixOS system for cache-first QEMU-free substitution.
 - `lib.mkNixosCrossSystem`: compatibility alias for `mkNixosSwitchSystem`.
 - `lib.mkCrossOverlay`: build-side cross package override module helper for cache-shaped NixOS systems.
+- `lib.mkPinManifest`: normalize Crossbow cache roots into channel-grouped package and consumer-target requirements.
 - `lib.hardwareProfiles`: optional target hardware profiles such as `rockpro64`.
 - `lib.mkOptimizedHostPlatform`: merge a hardware profile into a Nix host platform descriptor.
 - `lib.withCrossSupport`: augment package outputs with cross variants.
@@ -67,6 +68,19 @@ Crossbow names cache strategy explicitly:
 - `cache-shaped-with-cross-overrides`: host-system derivations keep their normal cache shape, while explicit package overrides may use cross derivations from the build machine.
 - `native-substituted`: the build machine evaluates or orchestrates a host-native system and downloads host-system paths from substituters. This is the right mode when you want `cache.nixos.org` aarch64 binaries on an x86_64 machine.
 - `remote-native`: use substituters first and route missing host-system builds to native hardware.
+
+## Pin Manifest
+
+Consumers can expose a `crossbowPinManifest` flake output using
+`lib.mkPinManifest`, then inspect it without changing the lock file:
+
+```sh
+crossbow-switch pin-manifest --flake . --attr crossbowPinManifest --json
+```
+
+The manifest groups required packages by nixpkgs channel and keeps every exact
+consumer target, including duplicate package uses across hosts. A consumer
+such as canix can pass each group to its cache-pin transaction.
 
 ## Supported Now
 
