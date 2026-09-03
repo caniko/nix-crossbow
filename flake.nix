@@ -2,8 +2,9 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    rs-harbor.url = "git+ssh://git@github.com/caniko/rs-harbor.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
-    nixpkgs.follows = "rs-harbor/nixpkgs";
+    harbor-rs.url = "git+ssh://git@github.com/caniko/harbor-rs.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
+    rs-harbor.follows = "harbor-rs";
+    nixpkgs.follows = "harbor-rs/nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
@@ -125,7 +126,7 @@
           if (crossRustProbePackage.drvAttrs ? cargoArtifacts) && (crossRustProbePackage.drvAttrs.cargoArtifacts ? drvAttrs)
           then (crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs.env or {}) // crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs
           else {};
-        buildCache = inputs.rs-harbor.lib.mkBuildCachePolicy {
+        buildCache = inputs.harbor-rs.lib.mkBuildCachePolicy {
           inherit pkgs;
           buildPackageSet = pkgs.buildPackages;
           sccachePackage = pkgs.buildPackages.sccache;
@@ -140,9 +141,9 @@
           crossbow-switch = let
             pkgsWithRust = import inputs.nixpkgs {
               inherit system;
-              overlays = [(import inputs.rs-harbor.inputs.rust-overlay)];
+              overlays = [(import inputs.harbor-rs.inputs.rust-overlay)];
             };
-            toolchain = inputs.rs-harbor.lib.mkToolchain { pkgs = pkgsWithRust; toolchainProfile = "stable"; };
+            toolchain = inputs.harbor-rs.lib.mkToolchain { pkgs = pkgsWithRust; toolchainProfile = "stable"; };
             rustPlatform = pkgs.makeRustPlatform { rustc = toolchain.rustToolchain; cargo = toolchain.rustToolchain; };
           in buildCache.withRustCache {
             package = rustPlatform.buildRustPackage {
