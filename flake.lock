@@ -52,11 +52,11 @@
         "nixpkgs-lib": "nixpkgs-lib"
       },
       "locked": {
-        "lastModified": 1778716662,
-        "narHash": "sha256-m1Yf0wZ8j1OHjTc2UwHwyQRSnNeSgLJOd7q5Y45hzi4=",
+        "lastModified": 1788450739,
+        "narHash": "sha256-glZLQlzIn1fXH6PazR2iUmTo7kzzyYSshrWhLS9TqCU=",
         "owner": "hercules-ci",
         "repo": "flake-parts",
-        "rev": "f7c1a2d347e4c52d5fb8d10cb4d94b5884e546fb",
+        "rev": "31729ca8cbdb4fa927b34e5f4353e6a83f39e993",
         "type": "github"
       },
       "original": {
@@ -277,13 +277,13 @@
         "rev": "fac8049316846e0ef1c1e6acd92aed7a337b333a",
         "revCount": 217,
         "type": "git",
-        "url": "ssh://git@github.com/caniko/harbor-rs.git"
+        "url": "https://github.com/caniko/harbor-rs.git"
       },
       "original": {
         "ref": "trunk",
         "rev": "fac8049316846e0ef1c1e6acd92aed7a337b333a",
         "type": "git",
-        "url": "ssh://git@github.com/caniko/harbor-rs.git"
+        "url": "https://github.com/caniko/harbor-rs.git"
       }
     },
     "nix-bundle": {
@@ -349,11 +349,11 @@
     },
     "nixpkgs-lib": {
       "locked": {
-        "lastModified": 1777168982,
-        "narHash": "sha256-GOkGPcboWE9BmGCRMLX3worL4EMnsnG8MyKmXNeYuhQ=",
+        "lastModified": 1788057806,
+        "narHash": "sha256-DTQSMxzDWmT0zhguthvegnVkn7CFqGCv4IHCzk5ZUpM=",
         "owner": "nix-community",
         "repo": "nixpkgs.lib",
-        "rev": "f5901329dade4a6ea039af1433fb087bd9c1fe14",
+        "rev": "596e2e3940e09b2abbeb03f75fa1828c57fcd72c",
         "type": "github"
       },
       "original": {
@@ -437,9 +437,6 @@
         "nixpkgs": [
           "harbor-rs",
           "nixpkgs"
-        ],
-        "rs-harbor": [
-          "harbor-rs"
         ]
       }
     },
