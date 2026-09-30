@@ -5,13 +5,18 @@ use std::io::Read;
 use std::process::{Command, Stdio};
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use sha2::{Digest, Sha256};
 
-use crate::{Error, RealizationPolicy, Result};
+use crate::{Error, RealizationPolicy, Result, RuntimePath};
 
 /// Current version of the authoritative closure-plan schema.
-pub const PLAN_SCHEMA_VERSION: u32 = 2;
+pub const PLAN_SCHEMA_VERSION: u32 = 3;
+
+/// Whether this engine can execute a current or persisted legacy plan.
+#[must_use]
+pub fn supports_plan_schema(version: u32) -> bool {
+    matches!(version, 2 | PLAN_SCHEMA_VERSION)
+}
 
 type OutputPaths = BTreeMap<(String, String), String>;
 
@@ -265,6 +270,9 @@ pub struct ClosurePlan {
     pub roots: Vec<PlanRoot>,
     /// Derivations in the realized closure graph.
     pub derivations: Vec<DerivationPlan>,
+    /// Exact cached runtime closure, in dependency-first restore order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub runtime_paths: Vec<RuntimePath>,
     /// Aggregate class counts.
     pub counts: PlanCounts,
 }
@@ -281,6 +289,9 @@ impl ClosurePlan {
             host_system: &'a str,
             roots: &'a [PlanRoot],
             derivations: &'a [DerivationPlan],
+            // Omitting an empty extension preserves schema-2 attempt IDs.
+            #[serde(skip_serializing_if = "slice_is_empty")]
+            runtime_paths: &'a [RuntimePath],
             counts: &'a PlanCounts,
         }
 
@@ -292,6 +303,7 @@ impl ClosurePlan {
             host_system: &self.host_system,
             roots: &self.roots,
             derivations: &self.derivations,
+            runtime_paths: &self.runtime_paths,
             counts: &self.counts,
         })
         .map_err(|source| Error::PlannerJson { source })?;
@@ -302,6 +314,10 @@ impl ClosurePlan {
         self.plan_id = self.canonical_plan_id()?;
         Ok(self)
     }
+}
+
+fn slice_is_empty<T>(value: &&[T]) -> bool {
+    value.is_empty()
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -428,6 +444,7 @@ pub fn plan_closure_with_hints(
             host_system: host_system.to_owned(),
             roots,
             derivations: Vec::new(),
+            runtime_paths: Vec::new(),
             counts: PlanCounts::default(),
         }
         .seal();
@@ -607,6 +624,17 @@ pub fn plan_closure_with_hints(
     }
 
     derivations = dependency_first(derivations, &roots);
+    let runtime_roots = derivations
+        .iter()
+        .flat_map(|derivation| &derivation.actions)
+        .filter_map(|action| match &action.route {
+            RealizationRoute::Substitute { substituter } => {
+                Some((action.path.clone(), substituter.clone()))
+            }
+            _ => None,
+        })
+        .collect();
+    let runtime_paths = crate::runtime::plan_runtime_paths(&runtime_roots, substituters)?;
 
     ClosurePlan {
         schema_version: PLAN_SCHEMA_VERSION,
@@ -617,6 +645,7 @@ pub fn plan_closure_with_hints(
         host_system: host_system.to_owned(),
         roots,
         derivations,
+        runtime_paths,
         counts,
     }
     .seal()
@@ -1419,66 +1448,16 @@ fn probe_substituter_outputs(
     substituter: &str,
     outputs: &[String],
 ) -> Result<BTreeMap<String, bool>> {
-    let ping = Command::new("nix")
-        .args(["store", "ping", "--store", substituter])
-        .output()
-        .map_err(|source| Error::PlannerCacheProbe {
-            substituter: substituter.to_owned(),
-            output: outputs.first().cloned().unwrap_or_default(),
-            source,
-        })?;
-    if !ping.status.success() {
-        return Err(Error::PlannerCacheProbeFailed {
-            substituter: substituter.to_owned(),
-            output: outputs.first().cloned().unwrap_or_default(),
-            stderr: String::from_utf8_lossy(&ping.stderr).trim().to_owned(),
-        });
-    }
-    let mut availability = BTreeMap::new();
-    for chunk in outputs.chunks(1024) {
-        let mut args = vec![
-            "path-info".to_owned(),
-            "--json".to_owned(),
-            "--json-format".to_owned(),
-            "1".to_owned(),
-            "--store".to_owned(),
-            substituter.to_owned(),
-        ];
-        args.extend(chunk.iter().cloned());
-        let result = Command::new("nix").args(&args).output().map_err(|source| {
-            Error::PlannerCacheProbe {
-                substituter: substituter.to_owned(),
-                output: chunk.first().cloned().unwrap_or_default(),
-                source,
-            }
-        })?;
-        let values = serde_json::from_slice::<Value>(&result.stdout).map_err(|source| {
-            Error::PlannerCacheProbeJson {
-                substituter: substituter.to_owned(),
-                output: chunk.first().cloned().unwrap_or_default(),
-                reason: source.to_string(),
-            }
-        })?;
-        for output in chunk {
-            let Some(value) = values.get(output) else {
-                return Err(Error::PlannerCacheProbeJson {
-                    substituter: substituter.to_owned(),
-                    output: output.clone(),
-                    reason: "response did not contain the queried output".to_owned(),
-                });
-            };
-            availability.insert(output.clone(), !value.is_null());
-        }
-        // `nix path-info` exits non-zero for ordinary misses while still
-        // returning a complete JSON map with null values. Complete JSON is the
-        // authoritative per-path answer; malformed or incomplete JSON fails.
-    }
-    Ok(availability)
+    Ok(crate::runtime::query_store(substituter, outputs)?
+        .into_iter()
+        .map(|(path, info)| (path, info.is_some()))
+        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
 
     #[test]
     fn serializes_machine_readable_plan() {
@@ -1491,6 +1470,7 @@ mod tests {
             host_system: "aarch64-linux".into(),
             roots: vec![],
             derivations: vec![],
+            runtime_paths: vec![],
             counts: PlanCounts::default(),
         };
         let json = serde_json::to_string(&plan).unwrap();
@@ -1529,6 +1509,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(old.counts.local_present, 0);
+    }
+
+    #[test]
+    fn persisted_schema_two_plan_keeps_its_original_identifier() {
+        let plan: ClosurePlan = serde_json::from_str(r#"{
+            "schema_version": 2,
+            "plan_id": "sha256-8ad96f81da2930f8e45044188f819cacbdd299088a9e388e4bb29ce23dce5ac3",
+            "toplevel_installable": "/nix/store/source#top",
+            "flake_installable": "/nix/store/source#host",
+            "build_system": "x86_64-linux",
+            "host_system": "aarch64-linux",
+            "derivations": [],
+            "counts": {"host_substituted":0,"local_present":0,"build_local":0,"host_remote":0,"unhandled":0}
+        }"#).unwrap();
+        assert!(supports_plan_schema(plan.schema_version));
+        assert_eq!(plan.plan_id, plan.canonical_plan_id().unwrap());
+        assert!(plan.runtime_paths.is_empty());
+        assert!(
+            !serde_json::to_value(plan)
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("runtime_paths")
+        );
     }
 
     #[test]
@@ -1955,6 +1959,7 @@ mod tests {
             host_system: "aarch64-linux".to_owned(),
             roots: vec![],
             derivations: ordered,
+            runtime_paths: vec![],
             counts: PlanCounts::default(),
         };
         assert_eq!(
@@ -1974,6 +1979,7 @@ mod tests {
             host_system: "aarch64-linux".to_owned(),
             roots: vec![],
             derivations: vec![],
+            runtime_paths: vec![],
             counts: PlanCounts::default(),
         };
         let first_id = first.canonical_plan_id().unwrap();

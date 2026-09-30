@@ -67,6 +67,14 @@ impl fmt::Display for MissingPrerequisite {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Temporary roots could not be created for an exact runtime restore.
+    #[error("crossbow: failed to create temporary runtime GC roots")]
+    RuntimeGcRoots {
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// A target system was not present in the shared metadata.
     #[error(
         "crossbow: unsupported host platform `{system}`; add it to lib/targets.nix and lib/platform-map.nix first"

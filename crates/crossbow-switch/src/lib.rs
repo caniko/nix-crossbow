@@ -25,6 +25,7 @@ pub mod metadata;
 pub mod planner;
 /// Parsed Crossbow requirements artifact (roots, drvs, fingerprint).
 pub mod requirements;
+mod runtime;
 /// Generic prepared-state persistence for prerequisite roots.
 pub mod state;
 
@@ -35,9 +36,10 @@ pub use executor::execute_plan;
 pub use planner::{
     ClosurePlan, DerivationClass, DerivationPlan, MissRoute, OutputAction, PLAN_SCHEMA_VERSION,
     PlanCounts, PlanDependency, PlanRoot, RealizationRoute, RouteHintSpec, plan_closure,
-    plan_closure_with_hints, plan_closure_with_substituters,
+    plan_closure_with_hints, plan_closure_with_substituters, supports_plan_schema,
 };
 pub use requirements::{LabeledRoot, RequirementsArtifact, RootDiff, diff_roots, label_roots};
+pub use runtime::RuntimePath;
 pub use state::{
     PreparedState, StateStatus, load_prepared_state, save_prepared_state, state_file_path,
     state_to_labeled_roots,
@@ -1355,6 +1357,7 @@ mod tests {
             host_system: "aarch64-linux".to_owned(),
             roots: vec![],
             derivations: vec![],
+            runtime_paths: vec![],
             counts: PlanCounts::default(),
         };
         plan.plan_id = plan.canonical_plan_id().unwrap();

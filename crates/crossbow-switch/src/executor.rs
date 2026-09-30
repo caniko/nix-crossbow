@@ -1,15 +1,39 @@
+use std::path::PathBuf;
 use std::process::Command;
 
-use crate::planner::{ClosurePlan, PLAN_SCHEMA_VERSION, RealizationRoute};
+use crate::planner::{ClosurePlan, RealizationRoute, supports_plan_schema};
 use crate::{Error, Result};
 
 trait CommandRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<()>;
+    fn path_info(&self, path: &str) -> Result<crate::runtime::PathInfo>;
+    fn gc_root(&self, _path: &str) -> Option<PathBuf> {
+        None
+    }
 }
 
-struct ProcessRunner;
+struct ProcessRunner {
+    gc_roots: tempfile::TempDir,
+}
 
 impl CommandRunner for ProcessRunner {
+    fn gc_root(&self, path: &str) -> Option<PathBuf> {
+        Some(
+            self.gc_roots
+                .path()
+                .join(path.rsplit('/').next().unwrap_or("invalid")),
+        )
+    }
+
+    fn path_info(&self, path: &str) -> Result<crate::runtime::PathInfo> {
+        crate::runtime::query_store("daemon", &[path.to_owned()])?
+            .remove(path)
+            .flatten()
+            .ok_or_else(|| {
+                crate::runtime::blocked(path, "restored runtime path is not valid in the daemon")
+            })
+    }
+
     fn run(&self, program: &str, args: &[String]) -> Result<()> {
         let command = format!("{program} {}", args.join(" "));
         let output = Command::new(program)
@@ -35,7 +59,11 @@ impl CommandRunner for ProcessRunner {
 /// Actions run in the dependency-first order recorded in the plan. Every
 /// expected output is validated through the local Nix daemon after its action.
 pub fn execute_plan(plan: &ClosurePlan, max_jobs: Option<u32>) -> Result<()> {
-    execute_plan_with_runner(plan, max_jobs, &ProcessRunner)
+    let gc_roots = tempfile::Builder::new()
+        .prefix("crossbow-runtime-")
+        .tempdir()
+        .map_err(|source| Error::RuntimeGcRoots { source })?;
+    execute_plan_with_runner(plan, max_jobs, &ProcessRunner { gc_roots })
 }
 
 fn execute_plan_with_runner(
@@ -43,7 +71,7 @@ fn execute_plan_with_runner(
     max_jobs: Option<u32>,
     runner: &dyn CommandRunner,
 ) -> Result<()> {
-    if plan.schema_version != PLAN_SCHEMA_VERSION {
+    if !supports_plan_schema(plan.schema_version) {
         return Err(Error::UnsupportedPlanSchema {
             version: plan.schema_version,
         });
@@ -67,9 +95,91 @@ fn execute_plan_with_runner(
         return Err(Error::PlanBlocked { path, reason });
     }
 
+    if plan.schema_version == 2 {
+        if let Some(path) = plan.runtime_paths.first() {
+            return Err(crate::runtime::blocked(
+                &path.path,
+                "legacy plan cannot carry a runtime restore schedule",
+            ));
+        }
+    } else {
+        crate::runtime::validate_schedule(&plan.runtime_paths)?;
+        let runtime_paths = plan
+            .runtime_paths
+            .iter()
+            .map(|path| (path.path.as_str(), path))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for action in plan
+            .derivations
+            .iter()
+            .flat_map(|derivation| &derivation.actions)
+        {
+            if let RealizationRoute::Substitute { substituter } = &action.route
+                && runtime_paths
+                    .get(action.path.as_str())
+                    .is_none_or(|path| path.substituter.as_ref() != Some(substituter))
+            {
+                return Err(crate::runtime::blocked(
+                    &action.path,
+                    "runtime schedule does not preserve the output's planned origin",
+                ));
+            }
+        }
+        for path in &plan.runtime_paths {
+            let gc_root = runner.gc_root(&path.path);
+            if let Some(substituter) = &path.substituter {
+                let mut args = vec![
+                    "copy".to_owned(),
+                    "--no-recursive".to_owned(),
+                    "--from".to_owned(),
+                    substituter.clone(),
+                    "--option".to_owned(),
+                    "require-sigs".to_owned(),
+                    "true".to_owned(),
+                ];
+                if let Some(root) = &gc_root {
+                    args.extend(["--out-link".to_owned(), root.to_string_lossy().into_owned()]);
+                }
+                args.push(path.path.clone());
+                runner.run("nix", &args)?;
+            } else if let Some(root) = &gc_root {
+                // Pin paths that planning found locally without allowing any
+                // realization if GC removed them between planning and execution.
+                runner.run(
+                    "nix",
+                    &[
+                        "build".to_owned(),
+                        "--out-link".to_owned(),
+                        root.to_string_lossy().into_owned(),
+                        "--max-jobs".to_owned(),
+                        "0".to_owned(),
+                        "--builders".to_owned(),
+                        String::new(),
+                        "--option".to_owned(),
+                        "substitute".to_owned(),
+                        "false".to_owned(),
+                        path.path.clone(),
+                    ],
+                )?;
+            }
+            let info = runner.path_info(&path.path)?;
+            let mut references = info.references;
+            references.sort();
+            let mut expected = path.references.clone();
+            expected.sort();
+            if info.nar_hash != path.nar_hash || references != expected {
+                return Err(crate::runtime::blocked(
+                    &path.path,
+                    "restored runtime metadata differs from the sealed plan",
+                ));
+            }
+        }
+    }
+
     for derivation in &plan.derivations {
         for action in &derivation.actions {
             let args = match &action.route {
+                RealizationRoute::Substitute { .. } if plan.schema_version != 2 => Vec::new(),
                 RealizationRoute::Substitute { substituter } => vec![
                     "copy".to_owned(),
                     "--from".to_owned(),
@@ -233,8 +343,8 @@ pub fn parse_executor_kind(kind: &str) -> Result<ExecutorDescriptor> {
 mod tests {
     use super::*;
     use crate::planner::{
-        DerivationClass, DerivationPlan, OutputAction, PlanCounts, PlanDependency, PlanRoot,
-        ProbeResult,
+        DerivationClass, DerivationPlan, OutputAction, PLAN_SCHEMA_VERSION, PlanCounts,
+        PlanDependency, PlanRoot, ProbeResult,
     };
     use std::cell::RefCell;
 
@@ -344,6 +454,9 @@ mod tests {
     }
 
     impl CommandRunner for RecordingRunner {
+        fn path_info(&self, _: &str) -> Result<crate::runtime::PathInfo> {
+            panic!("legacy fixture has no runtime metadata queries")
+        }
         fn run(&self, program: &str, args: &[String]) -> Result<()> {
             self.calls
                 .borrow_mut()
@@ -416,7 +529,7 @@ mod tests {
             }],
         };
         let mut plan = ClosurePlan {
-            schema_version: PLAN_SCHEMA_VERSION,
+            schema_version: 2,
             plan_id: String::new(),
             toplevel_installable: "/nix/store/source#top".to_owned(),
             flake_installable: "/nix/store/source#host".to_owned(),
@@ -427,6 +540,7 @@ mod tests {
                 outputs: vec!["out".to_owned()],
             }],
             derivations: vec![dependency, root],
+            runtime_paths: vec![],
             counts: PlanCounts {
                 build_local: 2,
                 ..PlanCounts::default()
@@ -434,6 +548,215 @@ mod tests {
         };
         plan.plan_id = plan.canonical_plan_id().unwrap();
         plan
+    }
+
+    #[derive(Default)]
+    struct SplitCacheRunner {
+        present: RefCell<std::collections::BTreeSet<String>>,
+        copies: RefCell<Vec<(String, String)>>,
+        pins: RefCell<std::collections::BTreeSet<String>>,
+        nar_hash_drift: bool,
+    }
+
+    impl CommandRunner for SplitCacheRunner {
+        fn gc_root(&self, path: &str) -> Option<PathBuf> {
+            Some(PathBuf::from("/test/crossbow-roots").join(path.rsplit('/').next().unwrap()))
+        }
+
+        fn path_info(&self, path: &str) -> Result<crate::runtime::PathInfo> {
+            assert!(self.present.borrow().contains(path));
+            Ok(crate::runtime::PathInfo {
+                nar_hash: if path.ends_with("root") {
+                    if self.nar_hash_drift {
+                        "sha256-different"
+                    } else {
+                        "sha256-root"
+                    }
+                } else {
+                    "sha256-leaf"
+                }
+                .to_owned(),
+                references: if path.ends_with("root") {
+                    vec!["/nix/store/runtime-leaf".to_owned()]
+                } else {
+                    vec![]
+                },
+            })
+        }
+        fn run(&self, program: &str, args: &[String]) -> Result<()> {
+            assert_eq!(program, "nix");
+            if args[0] == "build" {
+                assert!(args.windows(2).any(|pair| pair == ["--max-jobs", "0"]));
+                assert!(args.windows(2).any(|pair| pair == ["--builders", ""]));
+                assert!(
+                    args.windows(3)
+                        .any(|triple| triple == ["--option", "substitute", "false"])
+                );
+                let path = args.last().unwrap();
+                if !self.present.borrow().contains(path) {
+                    return Err(crate::runtime::blocked(path, "local reference disappeared"));
+                }
+                self.pins.borrow_mut().insert(path.clone());
+                return Ok(());
+            }
+            if args[0] == "copy" {
+                assert!(args.iter().any(|arg| arg == "--out-link"));
+                assert!(
+                    args.windows(3)
+                        .any(|triple| triple == ["--option", "require-sigs", "true"])
+                );
+                let origin = args.iter().position(|arg| arg == "--from").unwrap() + 1;
+                let path = args.last().unwrap();
+                let is_root = path == "/nix/store/runtime-root";
+                let references_present = self.present.borrow().contains("/nix/store/runtime-leaf");
+                if (is_root
+                    && (!args.iter().any(|arg| arg == "--no-recursive") || !references_present))
+                    || args[origin]
+                        != if is_root {
+                            "review-cache"
+                        } else {
+                            "upstream-cache"
+                        }
+                {
+                    return Err(Error::CommandFailed {
+                        command: "split-cache restore".to_owned(),
+                        stderr: "runtime reference is not valid in the selected source".to_owned(),
+                    });
+                }
+                self.present.borrow_mut().insert(path.clone());
+                self.pins.borrow_mut().insert(path.clone());
+                self.copies
+                    .borrow_mut()
+                    .push((args[origin].clone(), path.clone()));
+                return Ok(());
+            }
+            assert_eq!(args[0], "path-info", "substitution must never build");
+            assert!(self.present.borrow().contains(args.last().unwrap()));
+            Ok(())
+        }
+    }
+
+    fn split_cache_plan() -> ClosurePlan {
+        let mut plan = executable_plan();
+        plan.schema_version = PLAN_SCHEMA_VERSION;
+        plan.derivations.remove(0);
+        let root = &mut plan.derivations[0];
+        root.dependencies.clear();
+        root.actions = vec![action(
+            "out",
+            "/nix/store/runtime-root",
+            RealizationRoute::Substitute {
+                substituter: "review-cache".to_owned(),
+            },
+        )];
+        let mut json = serde_json::to_value(plan).unwrap();
+        json["runtime_paths"] = serde_json::json!([
+            {"path":"/nix/store/runtime-leaf", "substituter":"upstream-cache", "nar_hash":"sha256-leaf", "references":[]},
+            {"path":"/nix/store/runtime-root", "substituter":"review-cache", "nar_hash":"sha256-root", "references":["/nix/store/runtime-leaf"]}
+        ]);
+        let mut plan: ClosurePlan = serde_json::from_value(json).unwrap();
+        plan.plan_id = plan.canonical_plan_id().unwrap();
+        plan
+    }
+
+    #[test]
+    fn cross_cache_runtime_references_are_restored_without_builds() {
+        let runner = SplitCacheRunner::default();
+        execute_plan_with_runner(&split_cache_plan(), Some(2), &runner).unwrap();
+        assert_eq!(
+            *runner.present.borrow(),
+            std::collections::BTreeSet::from([
+                "/nix/store/runtime-leaf".to_owned(),
+                "/nix/store/runtime-root".to_owned(),
+            ])
+        );
+        assert_eq!(
+            *runner.copies.borrow(),
+            vec![
+                (
+                    "upstream-cache".to_owned(),
+                    "/nix/store/runtime-leaf".to_owned()
+                ),
+                (
+                    "review-cache".to_owned(),
+                    "/nix/store/runtime-root".to_owned()
+                ),
+            ]
+        );
+        assert_eq!(*runner.pins.borrow(), *runner.present.borrow());
+    }
+
+    #[test]
+    fn restored_metadata_drift_aborts_the_plan() {
+        let runner = SplitCacheRunner {
+            nar_hash_drift: true,
+            ..SplitCacheRunner::default()
+        };
+        let error = execute_plan_with_runner(&split_cache_plan(), None, &runner).unwrap_err();
+        assert!(matches!(error, Error::PlanBlocked { path, reason }
+            if path == "/nix/store/runtime-root" && reason.contains("sealed plan")));
+    }
+
+    #[test]
+    fn local_runtime_references_do_not_require_another_copy() {
+        let runner = SplitCacheRunner::default();
+        runner
+            .present
+            .borrow_mut()
+            .insert("/nix/store/runtime-leaf".into());
+        let mut plan = split_cache_plan();
+        plan.runtime_paths[0].substituter = None;
+        plan.plan_id = plan.canonical_plan_id().unwrap();
+        execute_plan_with_runner(&plan, None, &runner).unwrap();
+        assert_eq!(runner.copies.borrow().len(), 1);
+        assert_eq!(*runner.pins.borrow(), *runner.present.borrow());
+    }
+
+    #[test]
+    fn vanished_local_reference_aborts_without_fetching_or_building() {
+        let runner = SplitCacheRunner::default();
+        let mut plan = split_cache_plan();
+        plan.runtime_paths[0].substituter = None;
+        plan.plan_id = plan.canonical_plan_id().unwrap();
+        assert!(matches!(
+            execute_plan_with_runner(&plan, None, &runner),
+            Err(Error::PlanBlocked { .. })
+        ));
+        assert!(runner.copies.borrow().is_empty());
+    }
+
+    #[test]
+    fn invalid_runtime_schedules_abort_before_store_mutation() {
+        for mutation in 0..4 {
+            let runner = SplitCacheRunner::default();
+            let mut plan = split_cache_plan();
+            match mutation {
+                0 => plan.runtime_paths.reverse(),
+                1 => {
+                    plan.runtime_paths.remove(0);
+                }
+                2 => plan.runtime_paths[1].substituter = Some("different-origin".into()),
+                _ => plan.schema_version = 2,
+            }
+            plan.plan_id = plan.canonical_plan_id().unwrap();
+            assert!(matches!(
+                execute_plan_with_runner(&plan, None, &runner),
+                Err(Error::PlanBlocked { .. })
+            ));
+            assert!(runner.copies.borrow().is_empty());
+        }
+    }
+
+    #[test]
+    fn runtime_origin_tampering_invalidates_the_plan_id() {
+        let runner = SplitCacheRunner::default();
+        let mut plan = split_cache_plan();
+        plan.runtime_paths[0].substituter = Some("different-origin".into());
+        assert!(matches!(
+            execute_plan_with_runner(&plan, None, &runner),
+            Err(Error::PlanIdMismatch { .. })
+        ));
+        assert!(runner.copies.borrow().is_empty());
     }
 
     #[test]
