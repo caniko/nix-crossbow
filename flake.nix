@@ -44,10 +44,11 @@
           then "aarch64-linux"
           else "x86_64-linux";
         crossPackageProbeOverrides = {
-          hello = (import inputs.nixpkgs {
-            localSystem = {inherit system;};
-            crossSystem = {system = crossPackageProbeHost;};
-          }).hello;
+          hello =
+            (import inputs.nixpkgs {
+              localSystem = {inherit system;};
+              crossSystem = {system = crossPackageProbeHost;};
+            }).hello;
         };
         crossPackageProbe = inputs.self.lib.mkNixosSwitchSystem {
           build = system;
@@ -119,10 +120,16 @@
               inherit system;
               overlays = [(import inputs.rs-harbor.inputs.rust-overlay)];
             };
-            toolchain = inputs.rs-harbor.lib.mkToolchain { pkgs = pkgsWithRust; toolchainProfile = "stable"; };
-            rustPlatform = pkgs.makeRustPlatform { rustc = toolchain.rustToolchain; cargo = toolchain.rustToolchain; };
-          in buildCache.withRustCache {
-            package = rustPlatform.buildRustPackage {
+            toolchain = inputs.rs-harbor.lib.mkToolchain {
+              pkgs = pkgsWithRust;
+              toolchainProfile = "stable";
+            };
+            rustPlatform = pkgs.makeRustPlatform {
+              rustc = toolchain.rustToolchain;
+              cargo = toolchain.rustToolchain;
+            };
+          in
+            rustPlatform.buildRustPackage {
               pname = "crossbow-switch";
               version = "0.1.0";
               src = ./.;
@@ -130,6 +137,8 @@
               cargoBuildFlags = ["-p" "crossbow-switch"];
               cargoTestFlags = ["-p" "crossbow-switch"];
             };
+          crossbow-switch-cached = buildCache.withRustCache {
+            package = inputs.self.packages.${system}.crossbow-switch;
           };
 
           tiny-c-aarch64-linux = inputs.self.lib.mkCross {
@@ -150,22 +159,23 @@
         checks = {
           crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
 
-          crossbow-metadata-pkl = pkgs.runCommand "crossbow-metadata-pkl" {
-            buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
-          } ''
-            pkl_json="$(mktemp)"
-            pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
+          crossbow-metadata-pkl =
+            pkgs.runCommand "crossbow-metadata-pkl" {
+              buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
+            } ''
+              pkl_json="$(mktemp)"
+              pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
 
-            sidecar_json="$(mktemp)"
-            jq -S -c . ${./data/crossbow-metadata.json} > "$sidecar_json"
-            if ! diff -u "$pkl_json" "$sidecar_json"; then
-              echo "ERROR: data/crossbow-metadata.json is out of sync with data/CrossbowMetadata.pkl" >&2
-              echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
-              exit 1
-            fi
+              sidecar_json="$(mktemp)"
+              jq -S -c . ${./data/crossbow-metadata.json} > "$sidecar_json"
+              if ! diff -u "$pkl_json" "$sidecar_json"; then
+                echo "ERROR: data/crossbow-metadata.json is out of sync with data/CrossbowMetadata.pkl" >&2
+                echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
+                exit 1
+              fi
 
-            touch "$out"
-          '';
+              touch "$out"
+            '';
 
           platform-map = pkgs.runCommand "crossbow-platform-map" {} ''
             test "${inputs.self.lib.nixSystemToZigTarget "aarch64-linux"}" = "aarch64-linux-gnu"
