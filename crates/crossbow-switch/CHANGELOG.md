@@ -12,3 +12,5 @@ First registry release of the existing Crossbow runtime library and executable.
 - Compatibility with persisted schema-2 plan identities and execution.
 - Shared maintained Serde/thiserror macro generation and warning-free native
   compiler checks, without changing runtime or persisted-state behavior.
+- Portable Nix packaging for hosted workers, with managed compiler-cache
+  wrapping available through the separate `crossbow-switch-cached` output.

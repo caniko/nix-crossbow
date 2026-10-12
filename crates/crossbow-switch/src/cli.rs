@@ -269,17 +269,7 @@ where
         return Err(Error::CaptureRequiresPublishCommand);
     }
 
-    let realization_policy = match realization_policy.as_str() {
-        "substitute-only" if remote_builders.is_empty() => RealizationPolicy::SubstituteOnly,
-        "remote-native" => RealizationPolicy::RemoteNative {
-            builders: remote_builders,
-        },
-        value => {
-            return Err(Error::InvalidRealizationPolicy {
-                value: value.to_owned(),
-            });
-        }
-    };
+    let realization_policy = resolve_realization_policy(&realization_policy, &remote_builders)?;
 
     Ok(CliOptions {
         action,
@@ -387,17 +377,7 @@ where
         index += 1;
     }
 
-    let realization_policy = match realization_policy.as_str() {
-        "substitute-only" if remote_builders.is_empty() => RealizationPolicy::SubstituteOnly,
-        "remote-native" => RealizationPolicy::RemoteNative {
-            builders: remote_builders,
-        },
-        value => {
-            return Err(Error::InvalidRealizationPolicy {
-                value: value.to_owned(),
-            });
-        }
-    };
+    let realization_policy = resolve_realization_policy(&realization_policy, &remote_builders)?;
 
     Ok(PlanOptions {
         toplevel_attr: toplevel_attr.ok_or_else(|| Error::MissingRequiredArgument {
@@ -767,6 +747,21 @@ fn parse_route_hint(spec: &str) -> Result<RouteHintSpec> {
         origin: None,
         skip_probe: false,
     })
+}
+
+fn resolve_realization_policy(
+    policy: &str,
+    remote_builders: &[String],
+) -> Result<RealizationPolicy> {
+    match policy {
+        "substitute-only" if remote_builders.is_empty() => Ok(RealizationPolicy::SubstituteOnly),
+        "remote-native" => Ok(RealizationPolicy::RemoteNative {
+            builders: remote_builders.to_vec(),
+        }),
+        value => Err(Error::InvalidRealizationPolicy {
+            value: value.to_owned(),
+        }),
+    }
 }
 
 fn required_value<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {

@@ -2,7 +2,7 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    rs-harbor.url = "git+https://codeberg.org/caniko/rs-harbor.git?ref=trunk&rev=c26b735eede8078f795651c4a9cbf0be8733b221";
+    rs-harbor.url = "git+https://github.com/caniko/rs-harbor.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
     nixpkgs.follows = "rs-harbor/nixpkgs";
     rust-overlay.follows = "rs-harbor/rust-overlay";
     flake-parts.url = "github:hercules-ci/flake-parts";
@@ -150,19 +150,22 @@
         inherit formatter;
 
         packages = {
-          crossbow-switch = buildCache.withRustCache {
-            package =
-              (rustPkgs.makeRustPlatform {
-                rustc = toolchain.rustToolchain;
-                cargo = toolchain.rustToolchain;
-              }).buildRustPackage {
-                pname = "crossbow-switch";
-                version = "0.1.0";
-                src = ./.;
-                cargoLock.lockFile = ./Cargo.lock;
-                cargoBuildFlags = ["-p" "crossbow-switch"];
-                cargoTestFlags = ["-p" "crossbow-switch"];
-              };
+          # The portable output also runs on hosted workers without a managed
+          # cache transport. Cache-shaped builds retain their explicit output.
+          crossbow-switch =
+            (rustPkgs.makeRustPlatform {
+              rustc = toolchain.rustToolchain;
+              cargo = toolchain.rustToolchain;
+            }).buildRustPackage {
+              pname = "crossbow-switch";
+              version = "0.1.0";
+              src = ./.;
+              cargoLock.lockFile = ./Cargo.lock;
+              cargoBuildFlags = ["-p" "crossbow-switch"];
+              cargoTestFlags = ["-p" "crossbow-switch"];
+            };
+          crossbow-switch-cached = buildCache.withRustCache {
+            package = inputs.self.packages.${system}.crossbow-switch;
           };
 
           tiny-c-aarch64-linux = inputs.self.lib.mkCross {
@@ -182,6 +185,10 @@
 
         checks = {
           crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
+
+          portable-package-cache-policy = assert !(inputs.self.packages.${system}.crossbow-switch.passthru.rsHarborBuildCacheWrapped or false);
+          assert inputs.self.packages.${system}.crossbow-switch-cached.passthru.rsHarborBuildCacheWrapped or false;
+            pkgs.runCommand "crossbow-portable-package-cache-policy" {} "touch $out";
 
           pin-manifest = let
             manifest = inputs.self.lib.mkPinManifest {
