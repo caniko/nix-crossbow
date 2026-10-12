@@ -1,5 +1,11 @@
 [ci]
-provider = "crow"
-platform = "forgejo"
+provider = "actions"
+platform = "github"
 runtime = "nix"
-runner = "codefloe-global"
+runner = "ubuntu-24.04"
+publish_crates = true
+with_msrv = true
+with_docs = true
+with_audit = true
+with_deny = true
+packages = ["crossbow-switch"]

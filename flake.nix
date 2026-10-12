@@ -45,11 +45,13 @@
           then "aarch64-linux"
           else "x86_64-linux";
         crossPackageProbeOverrides = {
-          hello =
-            (import inputs.nixpkgs {
+          inherit
+            ((import inputs.nixpkgs {
               localSystem = {inherit system;};
               crossSystem = {system = crossPackageProbeHost;};
-            }).hello;
+            }))
+            hello
+            ;
         };
         crossPackageProbe = inputs.self.lib.mkNixosSwitchSystem {
           build = system;
@@ -282,14 +284,15 @@
                 }
               ];
             };
-          in pkgs.runCommand "crossbow-pin-manifest" {} ''
-            test ${pkgs.lib.escapeShellArg (builtins.toJSON manifest)} = ${pkgs.lib.escapeShellArg (builtins.toJSON reordered)}
-            test '${pkgs.lib.concatStringsSep " " manifest.groups.aarch64.packages}' = 'direct shared zeta'
-            test '${manifest.groups.aarch64.consumerTargets.zeta}' = 'nixosConfigurations.thething-crossbow.pkgs.zeta'
-            test '${manifest.groups.aarch64.requiredConsumerTargets."shared#1"}' = 'target.shared.two'
-            test '${toString (builtins.length manifest.groups.aarch64.entries)}' = 4
-            touch $out
-          '';
+          in
+            pkgs.runCommand "crossbow-pin-manifest" {} ''
+              test ${pkgs.lib.escapeShellArg (builtins.toJSON manifest)} = ${pkgs.lib.escapeShellArg (builtins.toJSON reordered)}
+              test '${pkgs.lib.concatStringsSep " " manifest.groups.aarch64.packages}' = 'direct shared zeta'
+              test '${manifest.groups.aarch64.consumerTargets.zeta}' = 'nixosConfigurations.thething-crossbow.pkgs.zeta'
+              test '${manifest.groups.aarch64.requiredConsumerTargets."shared#1"}' = 'target.shared.two'
+              test '${toString (builtins.length manifest.groups.aarch64.entries)}' = 4
+              touch $out
+            '';
 
           crossbow-metadata-pkl =
             pkgs.runCommand "crossbow-metadata-pkl" {
@@ -358,7 +361,7 @@
                 enable = true;
                 inherit pkgs;
                 crossbowCrossPkgs = import inputs.nixpkgs {
-                  localSystem = {system = system;};
+                  localSystem = {inherit system;};
                   crossSystem = {system = "aarch64-linux";};
                 };
               }).pkgs.stdenv.hostPlatform.system
@@ -407,16 +410,22 @@
           '';
         };
 
-        devShells.default = pkgs.mkShell {
-          packages = [
-            pkgs.alejandra
-            pkgs.cargo
-            pkgs.clippy
-            pkgs.nix
-            pkgs.rustc
-            pkgs.rustfmt
-            pkgs.zig
-          ];
+        devShells = rec {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.alejandra
+              pkgs.cargo
+              pkgs.clippy
+              pkgs.nix
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.zig
+            ];
+          };
+          docs = default.overrideAttrs (_: {RUSTDOCFLAGS = "-D warnings";});
+          msrv = pkgs.mkShell {
+            packages = [rustPkgs.rust-bin.stable."1.88.0".default];
+          };
         };
       };
     };

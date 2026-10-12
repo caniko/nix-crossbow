@@ -309,7 +309,6 @@ fn prepare_planned_switch_with_executor(
     execute(closure_plan, switch.max_jobs)?;
     let root = closure_plan
         .roots
-        .as_slice()
         .first()
         .filter(|_| closure_plan.roots.len() == 1)
         .ok_or_else(|| Error::PlannerMissingOutput {
@@ -318,7 +317,6 @@ fn prepare_planned_switch_with_executor(
         })?;
     let output = root
         .outputs
-        .as_slice()
         .first()
         .filter(|_| root.outputs.len() == 1)
         .ok_or_else(|| Error::PlannerMissingOutput {
