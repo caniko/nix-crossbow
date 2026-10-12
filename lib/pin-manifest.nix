@@ -217,7 +217,7 @@
       })
       packages);
     duplicatePackages = builtins.filter (package: builtins.length (targetsFor package) > 1) packages;
-      requiredConsumerTargets = builtins.listToAttrs (lib.concatLists (map (
+    requiredConsumerTargets = builtins.listToAttrs (lib.concatLists (map (
         package:
           lib.imap0 (index: target: {
             name = "${package}#${toString (index + 1)}";
