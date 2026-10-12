@@ -2,8 +2,8 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    rs-harbor.url = "git+https://github.com/caniko/rs-harbor.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
-    nixpkgs.follows = "rs-harbor/nixpkgs";
+    harbor.url = "git+https://github.com/caniko/harbor.git?ref=feat/harbor-monorepo-components&rev=e8b1996580e4ecd51dd402edf4a16d9df88e3a1b";
+    nixpkgs.follows = "harbor/nixpkgs";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
@@ -24,21 +24,11 @@
         system,
         ...
       }: let
-        formatter = pkgs.writeShellApplication {
-          name = "crossbow-fmt";
-          runtimeInputs = [pkgs.alejandra];
-          text = ''
-            if [ "$#" -eq 0 ]; then
-              set -- .
-            fi
-
-            if [ "$#" -eq 1 ] && [ "$1" = "--check" ]; then
-              set -- --check .
-            fi
-
-            exec alejandra "$@"
-          '';
+        treefmtEval = inputs.harbor.inputs.treefmt-nix.lib.evalModule pkgs {
+          projectRootFile = "flake.nix";
+          programs.alejandra.enable = true;
         };
+        formatter = treefmtEval.config.build.wrapper;
         crossPackageProbeHost =
           if system == "x86_64-linux"
           then "aarch64-linux"
@@ -103,7 +93,7 @@
           if (crossRustProbePackage.drvAttrs ? cargoArtifacts) && (crossRustProbePackage.drvAttrs.cargoArtifacts ? drvAttrs)
           then (crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs.env or {}) // crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs
           else {};
-        buildCache = inputs.rs-harbor.lib.mkBuildCachePolicy {
+        buildCache = inputs.harbor.lib.rust.mkBuildCachePolicy {
           inherit pkgs;
           buildPackageSet = pkgs.buildPackages;
           sccachePackage = pkgs.buildPackages.sccache;
@@ -118,9 +108,9 @@
           crossbow-switch = let
             pkgsWithRust = import inputs.nixpkgs {
               inherit system;
-              overlays = [(import inputs.rs-harbor.inputs.rust-overlay)];
+              overlays = [(import inputs.harbor.inputs.rust-overlay)];
             };
-            toolchain = inputs.rs-harbor.lib.mkToolchain {
+            toolchain = inputs.harbor.lib.rust.mkToolchain {
               pkgs = pkgsWithRust;
               toolchainProfile = "stable";
             };
@@ -266,7 +256,7 @@
 
         devShells.default = pkgs.mkShell {
           packages = [
-            pkgs.alejandra
+            formatter
             pkgs.cargo
             pkgs.clippy
             pkgs.nix
