@@ -2,7 +2,7 @@
 
 <!-- simit:badges:start -->
 
-[![CI](https://img.shields.io/badge/CI-managed-2088ff)](.github/workflows/ci.yaml) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/crossbow-switch)
+[![CI](https://img.shields.io/badge/CI-managed-2088ff)](.github/workflows/ci.yaml) [![docs](https://img.shields.io/badge/docs-enabled-6f42c1)](https://docs.rs/crossbow-switch) [![crates.io](https://img.shields.io/badge/crates.io-ready-f46623)](https://crates.io/crates/crossbow-switch)
 
 <!-- simit:badges:end -->
 
@@ -25,6 +25,7 @@ Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and
 - `lib.hardwareProfiles`: optional target hardware profiles such as `rockpro64`.
 - `lib.mkOptimizedHostPlatform`: merge a hardware profile into a Nix host platform descriptor.
 - `lib.withCrossSupport`: augment package outputs with cross variants.
+- `lib.mkPinManifest`: normalize Crossbow cache roots into channel-grouped package and consumer-target requirements.
 
 ## Target Hardware Optimization
 
@@ -80,3 +81,53 @@ Crossbow names cache strategy explicitly:
 - `linux -> darwin`, which requires a user-provided Apple SDK and osxcross.
 
 Unsupported pairs fail with explicit error messages instead of silently substituting another strategy.
+
+## Pin Manifest
+
+Consumers can expose a `crossbowPinManifest` flake output using
+`lib.mkPinManifest`, then inspect it without changing the lock file:
+
+```sh
+crossbow-switch pin-manifest --flake . --attr crossbowPinManifest --json
+```
+
+The manifest groups required packages by nixpkgs channel and keeps every exact
+consumer target, including duplicate package uses across hosts. A consumer
+such as canix can pass each group to its cache-pin transaction.
+
+## Authoritative Plans
+
+`crossbow-switch plan --json` only records the intended realization. Execute
+that exact plan explicitly; the legacy switch command still performs its own
+generic realization.
+
+```sh
+crossbow-switch execute-plan --plan plan.json \
+  --flake /nix/store/source#host-crossbow \
+  --toplevel /nix/store/source#nixosConfigurations.host.config.system.build.toplevel \
+  --action build
+```
+
+Schema 3 records `runtime_paths` separately from the derivation build frontier.
+Each cached runtime path includes its selected store, NAR hash and direct
+references. References are resolved across the declared substituters and local
+daemon, then restored dependency-first with signature checking and
+non-recursive copies. A cached wrapper can therefore reference upstream-cached
+components without requiring every component in the wrapper's cache.
+Temporary GC roots keep restored and already-local runtime paths live throughout
+execution; the caller's persisted candidate roots continue to own the result.
+
+Execution checks restored NAR hashes and references against the sealed plan;
+missing references, indeterminate availability, changed metadata and invalid
+ordering fail before local builds. Self-references are supported. Non-self
+reference cycles fail during planning. Runtime references never enter the
+derivation build frontier or enable native host compilation.
+
+Persisted schema-2 plans retain their original canonical identifiers and
+execution semantics. Consumers validating persisted plans should use
+`supports_plan_schema` rather than comparing only to `PLAN_SCHEMA_VERSION`.
+Rust callers constructing `ClosurePlan` literals must provide `runtime_paths`
+(an empty vector for a legacy or substitution-free plan).
+
+Development checks use `cargo test --locked --workspace`,
+`cargo clippy --locked --workspace --all-targets -- -D warnings`, and `treefmt`.

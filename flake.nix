@@ -4,6 +4,7 @@
   inputs = {
     rs-harbor.url = "git+https://github.com/caniko/rs-harbor.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
     nixpkgs.follows = "rs-harbor/nixpkgs";
+    rust-overlay.follows = "rs-harbor/rust-overlay";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
@@ -44,11 +45,13 @@
           then "aarch64-linux"
           else "x86_64-linux";
         crossPackageProbeOverrides = {
-          hello =
-            (import inputs.nixpkgs {
+          inherit
+            ((import inputs.nixpkgs {
               localSystem = {inherit system;};
               crossSystem = {system = crossPackageProbeHost;};
-            }).hello;
+            }))
+            hello
+            ;
         };
         crossPackageProbe = inputs.self.lib.mkNixosSwitchSystem {
           build = system;
@@ -69,6 +72,29 @@
                 crossbowProbe.package = pkgs.hello;
               };
             })
+          ];
+        };
+        crossPackageProbeRequirements = inputs.self.lib.mkNixosSwitchRequirements {
+          buildPkgs = pkgs;
+          host = crossPackageProbeHost;
+          modules = [
+            {
+              boot.loader.grub.enable = false;
+              fileSystems."/".device = "nodev";
+              fileSystems."/".fsType = "tmpfs";
+              system.stateVersion = "25.11";
+            }
+          ];
+        };
+        crossPackageProbeNative = inputs.self.lib.mkNixosNativeSubstitutedSystem {
+          host = crossPackageProbeHost;
+          modules = [
+            {
+              boot.loader.grub.enable = false;
+              fileSystems."/".device = "nodev";
+              fileSystems."/".fsType = "tmpfs";
+              system.stateVersion = "25.11";
+            }
           ];
         };
         crossRustProbeCrossPkgs = import inputs.nixpkgs {
@@ -111,25 +137,26 @@
           namespaceScope = "canix-rust";
           namespaceGeneration = 5;
         };
+        rustPkgs = import inputs.nixpkgs {
+          localSystem = {inherit system;};
+          overlays = [(import inputs.rust-overlay)];
+        };
+        toolchain = inputs.rs-harbor.lib.mkToolchain {
+          pkgs = rustPkgs;
+          toolchainProfile = "stable";
+          cache.enable = false;
+        };
       in {
         inherit formatter;
 
         packages = {
-          crossbow-switch = let
-            pkgsWithRust = import inputs.nixpkgs {
-              inherit system;
-              overlays = [(import inputs.rs-harbor.inputs.rust-overlay)];
-            };
-            toolchain = inputs.rs-harbor.lib.mkToolchain {
-              pkgs = pkgsWithRust;
-              toolchainProfile = "stable";
-            };
-            rustPlatform = pkgs.makeRustPlatform {
+          # The portable output also runs on hosted workers without a managed
+          # cache transport. Cache-shaped builds retain their explicit output.
+          crossbow-switch =
+            (rustPkgs.makeRustPlatform {
               rustc = toolchain.rustToolchain;
               cargo = toolchain.rustToolchain;
-            };
-          in
-            rustPlatform.buildRustPackage {
+            }).buildRustPackage {
               pname = "crossbow-switch";
               version = "0.1.0";
               src = ./.;
@@ -159,6 +186,121 @@
         checks = {
           crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
 
+          portable-package-cache-policy = assert !(inputs.self.packages.${system}.crossbow-switch.passthru.rsHarborBuildCacheWrapped or false);
+          assert inputs.self.packages.${system}.crossbow-switch-cached.passthru.rsHarborBuildCacheWrapped or false;
+            pkgs.runCommand "crossbow-portable-package-cache-policy" {} "touch $out";
+
+          pin-manifest = let
+            manifest = inputs.self.lib.mkPinManifest {
+              roots = [
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  arch = "aarch64-linux";
+                  name = "direct";
+                  policy = "must-substitute";
+                  target = "target.direct";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  hostSystem = "aarch64-linux";
+                  host = "thething";
+                  name = "assembled";
+                  policy = "cross-build";
+                  target = "target.assembled";
+                  cachePackages = ["zeta"];
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  arch = "aarch64-linux";
+                  name = "shared-one";
+                  policy = "cross-build";
+                  target = "target.shared-one";
+                  cachePackages = ["shared"];
+                  packageTargets.shared = "target.shared.one";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  arch = "aarch64-linux";
+                  name = "shared-two";
+                  policy = "cross-build";
+                  target = "target.shared-two";
+                  cachePackages = ["shared"];
+                  packageTargets.shared = "target.shared.two";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  arch = "aarch64-linux";
+                  name = "excluded";
+                  policy = "build-platform";
+                  target = "target.excluded";
+                }
+              ];
+            };
+            reordered = inputs.self.lib.mkPinManifest {
+              roots = [
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "build-platform";
+                  arch = "aarch64-linux";
+                  name = "excluded";
+                  target = "target.excluded";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "cross-build";
+                  arch = "aarch64-linux";
+                  name = "shared-two";
+                  target = "target.shared-two";
+                  cachePackages = ["shared"];
+                  packageTargets.shared = "target.shared.two";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "must-substitute";
+                  arch = "aarch64-linux";
+                  name = "direct";
+                  target = "target.direct";
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "cross-build";
+                  hostSystem = "aarch64-linux";
+                  host = "thething";
+                  name = "assembled";
+                  target = "target.assembled";
+                  cachePackages = ["zeta"];
+                }
+                {
+                  channel = "aarch64";
+                  inputName = "nixpkgs";
+                  policy = "cross-build";
+                  arch = "aarch64-linux";
+                  name = "shared-one";
+                  target = "target.shared-one";
+                  cachePackages = ["shared"];
+                  packageTargets.shared = "target.shared.one";
+                }
+              ];
+            };
+          in
+            pkgs.runCommand "crossbow-pin-manifest" {} ''
+              test ${pkgs.lib.escapeShellArg (builtins.toJSON manifest)} = ${pkgs.lib.escapeShellArg (builtins.toJSON reordered)}
+              test '${pkgs.lib.concatStringsSep " " manifest.groups.aarch64.packages}' = 'direct shared zeta'
+              test '${manifest.groups.aarch64.consumerTargets.zeta}' = 'nixosConfigurations.thething-crossbow.pkgs.zeta'
+              test '${manifest.groups.aarch64.requiredConsumerTargets."shared#1"}' = 'target.shared.two'
+              test '${toString (builtins.length manifest.groups.aarch64.entries)}' = 4
+              touch $out
+            '';
+
           crossbow-metadata-pkl =
             pkgs.runCommand "crossbow-metadata-pkl" {
               buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
@@ -166,13 +308,18 @@
               pkl_json="$(mktemp)"
               pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
 
-              sidecar_json="$(mktemp)"
-              jq -S -c . ${./data/crossbow-metadata.json} > "$sidecar_json"
-              if ! diff -u "$pkl_json" "$sidecar_json"; then
-                echo "ERROR: data/crossbow-metadata.json is out of sync with data/CrossbowMetadata.pkl" >&2
-                echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
-                exit 1
-              fi
+              for sidecar in \
+                ${./data/crossbow-metadata.json} \
+                ${./crates/crossbow-switch/data/crossbow-metadata.json}
+              do
+                sidecar_json="$(mktemp)"
+                jq -S -c . "$sidecar" > "$sidecar_json"
+                if ! diff -u "$pkl_json" "$sidecar_json"; then
+                  echo "ERROR: $sidecar is out of sync with data/CrossbowMetadata.pkl" >&2
+                  echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
+                  exit 1
+                fi
+              done
 
               touch "$out"
             '';
@@ -221,7 +368,7 @@
                 enable = true;
                 inherit pkgs;
                 crossbowCrossPkgs = import inputs.nixpkgs {
-                  localSystem = {system = system;};
+                  localSystem = {inherit system;};
                   crossSystem = {system = "aarch64-linux";};
                 };
               }).pkgs.stdenv.hostPlatform.system
@@ -233,6 +380,12 @@
             }" = "0"
             test "${crossPackageProbe.config.crossbowProbe.package.stdenv.buildPlatform.system}" = "${system}"
             test "${crossPackageProbe.config.crossbowProbe.package.stdenv.hostPlatform.system}" = "${crossPackageProbeHost}"
+            test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/roots
+            test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/drvs
+            test -e ${crossPackageProbeRequirements}/roots
+            test -e ${crossPackageProbeRequirements}/drvs
+            grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel}" ${crossPackageProbeRequirements}/roots >/dev/null
+            grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel.drvPath}" ${crossPackageProbeRequirements}/drvs >/dev/null
             touch $out
           '';
 
@@ -264,16 +417,24 @@
           '';
         };
 
-        devShells.default = pkgs.mkShell {
-          packages = [
-            pkgs.alejandra
-            pkgs.cargo
-            pkgs.clippy
-            pkgs.nix
-            pkgs.rustc
-            pkgs.rustfmt
-            pkgs.zig
-          ];
+        devShells = rec {
+          default = pkgs.mkShell {
+            packages = [
+              pkgs.alejandra
+              pkgs.cargo
+              pkgs.cargo-audit
+              pkgs.cargo-deny
+              pkgs.clippy
+              pkgs.nix
+              pkgs.rustc
+              pkgs.rustfmt
+              pkgs.zig
+            ];
+          };
+          docs = default.overrideAttrs (_: {RUSTDOCFLAGS = "-D warnings";});
+          msrv = pkgs.mkShell {
+            packages = [rustPkgs.rust-bin.stable."1.88.0".default];
+          };
         };
       };
     };

@@ -1,27 +1,30 @@
+use std::fs;
 use std::io::Write;
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
 use crate::{
-    ClosurePlan, DerivationClass, Error, Publisher, RealizationPolicy, Result, SwitchPlan,
-    TrustPublish, Verifier, run_cache_shaped_switch,
+    ClosurePlan, DerivationClass, Error, MissRoute, Publisher, RealizationPolicy, Result,
+    RouteHintSpec, SwitchPlan, TrustPublish, Verifier, plan_closure_with_hints,
+    run_cache_shaped_switch, run_planned_switch,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Parsed options for one `crossbow-switch` CLI invocation.
 pub struct CliOptions {
-    /// Rebuild action passed to `nixos-rebuild`.
+    /// Prepared-system action: switch, boot, test, or build.
     pub action: String,
-    /// Flake reference passed to `nixos-rebuild --flake`.
+    /// Frozen flake reference recorded in prepared state.
     pub flake_attr: String,
     /// Attribute built first to realise the system toplevel.
     pub toplevel_attr: String,
-    /// Optional SSH target passed to `nixos-rebuild --target-host`.
+    /// Optional SSH target receiving the prepared toplevel.
     pub target_ssh: Option<String>,
     /// Whether activation should pass `--use-substitutes`.
     pub use_substitutes: bool,
     /// Whether the closure should be published and verified before activation.
     pub capture: bool,
-    /// Whether local activation should run `nixos-rebuild` through `sudo`.
+    /// Whether local profile updates and activation should run through sudo.
     pub sudo: bool,
     /// Whether remote activation should run through sudo on the target host.
     pub remote_sudo: bool,
@@ -50,18 +53,121 @@ pub struct PlanOptions {
     pub json: bool,
     /// Explicit policy for missing derivations.
     pub realization_policy: RealizationPolicy,
+    /// Runtime route hints binding installables to miss routes.
+    pub route_hints: Vec<RouteHintSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed options for executing a serialized authoritative plan.
+pub struct ExecutePlanOptions {
+    /// JSON plan file produced by `crossbow-switch plan --json`.
+    pub plan_file: PathBuf,
+    /// Switch options used for capture and exact activation.
+    pub switch: CliOptions,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Parsed options for the read-only pin manifest command.
+pub struct PinManifestOptions {
+    /// Flake source evaluated for the manifest.
+    pub flake_source: String,
+    /// Attribute evaluated from the flake source.
+    pub attr: String,
+    /// Whether to pretty-print the evaluated JSON.
+    pub json: bool,
 }
 
 /// Returns the command-line usage string.
 #[must_use]
 pub fn usage() -> &'static str {
-    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo] [--max-jobs <N>] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
+    "usage: crossbow-switch --flake <flake-attr> --toplevel <toplevel-attr> [--action switch|boot|test|build] [--target-host <ssh-host>] [--use-substitutes] [--use-remote-sudo] [--capture --publish-command <command>] [--verify-command <command>] [--sudo] [--max-jobs <N>] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>] | crossbow-switch plan ... | crossbow-switch pin-manifest --flake <flake-source> [--attr <attr>] [--json]"
 }
 
 /// Returns the usage string for the read-only planner.
 #[must_use]
 pub fn plan_usage() -> &'static str {
-    "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--substituter <store> ...] [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>]"
+    "usage: crossbow-switch plan --toplevel <toplevel-attr> --build-system <system> --host-system <system> --substituter <store> [--substituter <store> ...] [--json] [--realization-policy substitute-only|remote-native] [--remote-builder <builder-spec>] [--route-hint <label>@<installable>:<fail|build-local|remote-native>] [--skip-probe <label>]"
+}
+
+/// Returns the usage string for the read-only pin manifest command.
+#[must_use]
+pub fn pin_manifest_usage() -> &'static str {
+    "usage: crossbow-switch pin-manifest --flake <flake-source> [--attr <attr>] [--json]"
+}
+
+/// Returns usage for authoritative planned execution.
+#[must_use]
+pub fn execute_plan_usage() -> &'static str {
+    "usage: crossbow-switch execute-plan --plan <plan.json> --flake <frozen-flake> --toplevel <toplevel-attr> [switch options]"
+}
+
+/// Parses authoritative plan execution arguments.
+pub fn parse_execute_plan_args<I, S>(args: I) -> Result<ExecutePlanOptions>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let index = args.iter().position(|arg| arg == "--plan").ok_or_else(|| {
+        Error::MissingRequiredArgument {
+            flag: "--plan".to_owned(),
+        }
+    })?;
+    let plan_file = PathBuf::from(required_value(&args, index + 1, "--plan")?);
+    let switch = parse_args(
+        args.into_iter()
+            .enumerate()
+            .filter_map(|(i, arg)| (i != index && i != index + 1).then_some(arg)),
+    )?;
+    Ok(ExecutePlanOptions { plan_file, switch })
+}
+
+/// Parses arguments for the read-only pin manifest command.
+pub fn parse_pin_manifest_args<I, S>(args: I) -> Result<PinManifestOptions>
+where
+    I: IntoIterator<Item = S>,
+    S: Into<String>,
+{
+    let args = args.into_iter().map(Into::into).collect::<Vec<_>>();
+    let mut flake_source = None;
+    let mut attr = "crossbowPinManifest".to_owned();
+    let mut json = false;
+    let mut index = 0;
+
+    while index < args.len() {
+        match args[index].as_str() {
+            "--flake" => {
+                index += 1;
+                flake_source = Some(required_value(&args, index, "--flake")?.to_owned());
+            }
+            "--attr" => {
+                index += 1;
+                attr = required_value(&args, index, "--attr")?.to_owned();
+            }
+            "--json" => json = true,
+            "-h" | "--help" => {
+                return Err(Error::UnknownArgument {
+                    argument: args[index].clone(),
+                    usage: pin_manifest_usage().to_owned(),
+                });
+            }
+            unknown => {
+                return Err(Error::UnknownArgument {
+                    argument: unknown.to_owned(),
+                    usage: pin_manifest_usage().to_owned(),
+                });
+            }
+        }
+        index += 1;
+    }
+
+    Ok(PinManifestOptions {
+        flake_source: flake_source.ok_or_else(|| Error::MissingRequiredArgument {
+            flag: "--flake".to_owned(),
+        })?,
+        attr,
+        json,
+    })
 }
 
 /// Parses CLI arguments into [`CliOptions`].
@@ -199,6 +305,7 @@ where
     let mut json = false;
     let mut realization_policy = "substitute-only".to_owned();
     let mut remote_builders = Vec::new();
+    let mut route_hints = Vec::new();
     let mut index = 0;
 
     while index < args.len() {
@@ -220,6 +327,31 @@ where
                 substituters.push(required_value(&args, index, "--substituter")?.to_owned());
             }
             "--json" => json = true,
+            "--route-hint" => {
+                index += 1;
+                route_hints.push(parse_route_hint(required_value(
+                    &args,
+                    index,
+                    "--route-hint",
+                )?)?);
+            }
+            "--skip-probe" => {
+                index += 1;
+                let label = required_value(&args, index, "--skip-probe")?.to_owned();
+                let mut found = false;
+                for hint in &mut route_hints {
+                    if hint.label == label {
+                        hint.skip_probe = true;
+                        found = true;
+                    }
+                }
+                if !found {
+                    return Err(Error::UnknownArgument {
+                        argument: format!("--skip-probe {label}"),
+                        usage: plan_usage().to_owned(),
+                    });
+                }
+            }
             "--realization-policy" => {
                 index += 1;
                 realization_policy =
@@ -266,6 +398,7 @@ where
         },
         json,
         realization_policy,
+        route_hints,
     })
 }
 
@@ -284,14 +417,39 @@ pub fn run_from_env() -> Result<()> {
             return Ok(());
         }
         let options = parse_plan_args(plan_args.iter().cloned())?;
-        let plan = crate::plan_closure_with_substituters(
+        let plan = plan_closure_with_hints(
             &options.toplevel_attr,
             &options.build_system,
             &options.host_system,
             &options.substituters,
             &options.realization_policy,
+            &options.route_hints,
         )?;
         return print_plan(&plan, options.json);
+    }
+    if args.first().is_some_and(|arg| arg == "execute-plan") {
+        let execute_args = &args[1..];
+        if execute_args
+            .iter()
+            .any(|arg| arg == "-h" || arg == "--help")
+        {
+            println!("{}", execute_plan_usage());
+            return Ok(());
+        }
+        let options = parse_execute_plan_args(execute_args.iter().cloned())?;
+        return run_execute_plan(&options);
+    }
+    if args.first().is_some_and(|arg| arg == "pin-manifest") {
+        let pin_manifest_args = &args[1..];
+        if pin_manifest_args
+            .iter()
+            .any(|arg| arg == "-h" || arg == "--help")
+        {
+            println!("{}", pin_manifest_usage());
+            return Ok(());
+        }
+        let options = parse_pin_manifest_args(pin_manifest_args.iter().cloned())?;
+        return run_pin_manifest(&options);
     }
     if args.iter().any(|arg| arg == "-h" || arg == "--help") {
         println!("{}", usage());
@@ -300,6 +458,58 @@ pub fn run_from_env() -> Result<()> {
 
     let options = parse_args(args)?;
     run_with_options(&options)
+}
+
+/// Evaluates and prints a flake's pin manifest.
+pub fn run_pin_manifest(options: &PinManifestOptions) -> Result<()> {
+    let installable = if options.flake_source.contains('#') {
+        options.flake_source.clone()
+    } else {
+        format!("{}#{}", options.flake_source, options.attr)
+    };
+    let output = Command::new("nix")
+        .args([
+            "eval",
+            "--no-write-lock-file",
+            "--json",
+            installable.as_str(),
+        ])
+        .output()
+        .map_err(|source| Error::PinManifestCommand {
+            installable: installable.clone(),
+            source,
+        })?;
+
+    if !output.status.success() {
+        return Err(Error::PinManifestFailed {
+            installable,
+            status: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+
+    let stdout = String::from_utf8(output.stdout).map_err(|source| Error::PinManifestUtf8 {
+        installable: installable.clone(),
+        source,
+    })?;
+    let value = serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|source| {
+        Error::PinManifestJson {
+            installable: installable.clone(),
+            source,
+        }
+    })?;
+    let rendered = if options.json {
+        serde_json::to_string_pretty(&value)
+    } else {
+        serde_json::to_string(&value)
+    }
+    .map_err(|source| Error::PinManifestOutputJson {
+        installable,
+        source,
+    })?;
+
+    println!("{rendered}");
+    Ok(())
 }
 
 fn print_plan(plan: &ClosurePlan, json: bool) -> Result<()> {
@@ -313,6 +523,7 @@ fn print_plan(plan: &ClosurePlan, json: bool) -> Result<()> {
 
     println!("build-system={}", plan.build_system);
     println!("host-system={}", plan.host_system);
+    println!("local-present={}", plan.counts.local_present);
     println!("host-substituted={}", plan.counts.host_substituted);
     println!("build-local={}", plan.counts.build_local);
     println!("host-remote={}", plan.counts.host_remote);
@@ -333,8 +544,12 @@ fn print_plan(plan: &ClosurePlan, json: bool) -> Result<()> {
             continue;
         }
         println!("{class:?}:");
-        for path in paths {
-            println!("  {path}");
+        for derivation in plan
+            .derivations
+            .iter()
+            .filter(|derivation| derivation.class == class)
+        {
+            println!("  {} [{}]", derivation.display_label(), derivation.drv);
         }
     }
     Ok(())
@@ -379,6 +594,45 @@ pub fn run_with_options(options: &CliOptions) -> Result<()> {
     };
 
     run_cache_shaped_switch(&plan, publisher, verifier)
+}
+
+/// Loads, verifies, and executes one serialized authoritative plan.
+pub fn run_execute_plan(options: &ExecutePlanOptions) -> Result<()> {
+    let json = fs::read_to_string(&options.plan_file).map_err(|source| Error::NixStoreRead {
+        file: options.plan_file.display().to_string(),
+        source,
+    })?;
+    let closure: ClosurePlan =
+        serde_json::from_str(&json).map_err(|source| Error::PlannerJson { source })?;
+    let switch = SwitchPlan {
+        action: &options.switch.action,
+        flake_attr: &options.switch.flake_attr,
+        toplevel_attr: &options.switch.toplevel_attr,
+        target_ssh: options.switch.target_ssh.as_deref(),
+        use_substitutes: options.switch.use_substitutes,
+        capture: options.switch.capture,
+        sudo: options.switch.sudo,
+        remote_sudo: options.switch.remote_sudo,
+        max_jobs: options.switch.max_jobs,
+        realization_policy: options.switch.realization_policy.clone(),
+    };
+    let noop_publisher = NoopPublisher;
+    let command_publisher;
+    let publisher: &dyn Publisher = if let Some(command) = &options.switch.publish_command {
+        command_publisher = CommandPublisher { command };
+        &command_publisher
+    } else {
+        &noop_publisher
+    };
+    let trust_publish = TrustPublish;
+    let command_verifier;
+    let verifier: &dyn Verifier = if let Some(command) = &options.switch.verify_command {
+        command_verifier = CommandVerifier { command };
+        &command_verifier
+    } else {
+        &trust_publish
+    };
+    run_planned_switch(&switch, &closure, publisher, verifier)
 }
 
 struct NoopPublisher;
@@ -460,6 +714,38 @@ fn run_path_command(command: &str, paths: &[String]) -> Result<String> {
     String::from_utf8(output.stdout).map_err(|source| Error::CommandUtf8 {
         command: command.to_owned(),
         source,
+    })
+}
+
+fn parse_route_hint(spec: &str) -> Result<RouteHintSpec> {
+    let (label_installable, route) =
+        spec.rsplit_once(':')
+            .ok_or_else(|| Error::MissingArgumentValue {
+                flag: "--route-hint".to_owned(),
+            })?;
+    let on_miss = match route {
+        "fail" => MissRoute::Fail,
+        "build-local" => MissRoute::BuildLocal,
+        "remote-native" => MissRoute::RemoteNative,
+        value => {
+            return Err(Error::UnknownArgument {
+                argument: format!("--route-hint route `{value}`"),
+                usage: plan_usage().to_owned(),
+            });
+        }
+    };
+    let (label, installable) =
+        label_installable
+            .split_once('@')
+            .ok_or_else(|| Error::MissingArgumentValue {
+                flag: "--route-hint".to_owned(),
+            })?;
+    Ok(RouteHintSpec {
+        label: label.to_owned(),
+        installable: installable.to_owned(),
+        on_miss,
+        origin: None,
+        skip_probe: false,
     })
 }
 
@@ -547,6 +833,26 @@ mod tests {
     }
 
     #[test]
+    fn execute_plan_parser_reuses_switch_options() -> Result<()> {
+        let options = parse_execute_plan_args([
+            "--plan",
+            "/tmp/plan.json",
+            "--flake",
+            "/nix/store/source#host-crossbow",
+            "--toplevel",
+            "/nix/store/source#nixosConfigurations.host.config.system.build.toplevel",
+            "--action",
+            "test",
+            "--target-host",
+            "root@host",
+        ])?;
+        assert_eq!(options.plan_file, PathBuf::from("/tmp/plan.json"));
+        assert_eq!(options.switch.action, "test");
+        assert_eq!(options.switch.target_ssh.as_deref(), Some("root@host"));
+        Ok(())
+    }
+
+    #[test]
     fn planner_parser_accepts_repeated_substituters() -> Result<()> {
         let options = parse_plan_args([
             "--toplevel",
@@ -569,6 +875,75 @@ mod tests {
             ]
         );
         Ok(())
+    }
+
+    #[test]
+    fn planner_parser_accepts_route_hints() -> Result<()> {
+        let options = parse_plan_args([
+            "--toplevel",
+            ".#top",
+            "--build-system",
+            "x86_64-linux",
+            "--host-system",
+            "aarch64-linux",
+            "--substituter",
+            "https://cache.example",
+            "--route-hint",
+            "grpc@.#packages.x86_64-linux.grpc:build-local",
+            "--route-hint",
+            "plugin@.#plugin:remote-native",
+            "--skip-probe",
+            "grpc",
+        ])?;
+
+        assert_eq!(options.route_hints.len(), 2);
+        assert_eq!(options.route_hints[0].label, "grpc");
+        assert_eq!(
+            options.route_hints[0].installable,
+            ".#packages.x86_64-linux.grpc"
+        );
+        assert_eq!(options.route_hints[0].on_miss, MissRoute::BuildLocal);
+        assert!(options.route_hints[0].skip_probe);
+        assert_eq!(options.route_hints[1].label, "plugin");
+        assert_eq!(options.route_hints[1].on_miss, MissRoute::RemoteNative);
+        assert!(!options.route_hints[1].skip_probe);
+        Ok(())
+    }
+
+    #[test]
+    fn planner_parser_rejects_unknown_route_hint_route() {
+        let error = parse_plan_args([
+            "--toplevel",
+            ".#top",
+            "--build-system",
+            "x86_64-linux",
+            "--host-system",
+            "aarch64-linux",
+            "--substituter",
+            "https://cache.example",
+            "--route-hint",
+            "x@.#x:substitute",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("route `substitute`"));
+    }
+
+    #[test]
+    fn planner_parser_rejects_unknown_skip_probe_label() {
+        let error = parse_plan_args([
+            "--toplevel",
+            ".#top",
+            "--build-system",
+            "x86_64-linux",
+            "--host-system",
+            "aarch64-linux",
+            "--substituter",
+            "https://cache.example",
+            "--skip-probe",
+            "nope",
+        ])
+        .unwrap_err();
+        assert!(error.to_string().contains("--skip-probe nope"));
     }
 
     #[test]
@@ -677,5 +1052,54 @@ mod tests {
                 .to_string()
                 .contains("unsupported nixos-rebuild action")
         );
+    }
+
+    #[test]
+    fn pin_manifest_parser_uses_default_attribute() -> Result<()> {
+        let options = parse_pin_manifest_args(["--flake", "."])?;
+
+        assert_eq!(options.flake_source, ".");
+        assert_eq!(options.attr, "crossbowPinManifest");
+        assert!(!options.json);
+        Ok(())
+    }
+
+    #[test]
+    fn pin_manifest_parser_accepts_attribute_and_json_output() -> Result<()> {
+        let options = parse_pin_manifest_args([
+            "--flake",
+            "github:example/project",
+            "--attr",
+            "packages.x86_64-linux.manifest",
+            "--json",
+        ])?;
+
+        assert_eq!(options.flake_source, "github:example/project");
+        assert_eq!(options.attr, "packages.x86_64-linux.manifest");
+        assert!(options.json);
+        Ok(())
+    }
+
+    #[test]
+    fn pin_manifest_parser_requires_flake_source() {
+        let error = parse_pin_manifest_args(["--json"]).unwrap_err();
+
+        assert!(error.to_string().contains("missing --flake"));
+    }
+
+    #[test]
+    fn pin_manifest_parser_rejects_unknown_arguments() {
+        let error = parse_pin_manifest_args(["--flake", ".", "--pretty"]).unwrap_err();
+
+        assert!(error.to_string().contains("unknown argument `--pretty`"));
+        assert!(error.to_string().contains("pin-manifest"));
+    }
+
+    #[test]
+    fn pin_manifest_parser_accepts_an_installable_flake_reference() -> Result<()> {
+        let options = parse_pin_manifest_args(["--flake", ".#crossbowPinManifest"])?;
+
+        assert_eq!(options.flake_source, ".#crossbowPinManifest");
+        Ok(())
     }
 }

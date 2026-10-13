@@ -3,12 +3,25 @@ name = "crossbow-switch"
 version = "0.1.0"
 edition = "2024"
 license = "MIT OR Apache-2.0"
+rust-version = "1.88"
+description = "Cache-shaped NixOS realization, closure restoration, and prepared activation"
+repository = "https://github.com/caniko/nix-crossbow"
+documentation = "https://docs.rs/crossbow-switch"
+readme = "README.md"
+keywords = ["nix", "nixos", "cross-compilation", "deployment"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
+include = ["src/**", "data/**", "tests/**", "README.md", "LICENSE", "CHANGELOG.md"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["-D", "warnings"]
 
 [dependencies]
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-thiserror = "2"
+thiserror = "2.0.21"
+tempfile = "3"
 
 [lib]
 path = "src/lib.rs"

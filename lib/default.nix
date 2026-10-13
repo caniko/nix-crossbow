@@ -22,6 +22,7 @@
     inherit (hardwareProfiles) hardwareProfileFor;
   };
   buildAssemblyPkgs = import ./build-assembly-pkgs.nix {inherit lib;};
+  pinManifest = import ./pin-manifest.nix {inherit lib;};
   crossRust = import ./cross-rust.nix {inherit lib self;};
   toplevelOverride = import ./toplevel-override.nix {};
 
@@ -56,12 +57,14 @@
       inherit
         (nixosSystems)
         mkNixosSwitchSystem
+        mkNixosSwitchRequirements
         mkNixosStrictCrossSystem
         mkNixosNativeSubstitutedSystem
         mkNixosCrossSystem
         mkCrossOverlay
         ;
       inherit (withCrossSupport) withCrossSupport;
+      inherit (pinManifest) mkPinManifest;
 
       executors = import ../executors {lib = self;};
       toolchains = import ../toolchains {lib = self;};

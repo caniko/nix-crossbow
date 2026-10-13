@@ -1,9 +1,163 @@
-use std::string::FromUtf8Error;
+use std::{fmt, string::FromUtf8Error};
+
+/// Maximum diagnostic size retained for a failed realization.
+pub const MAX_REALIZATION_DIAGNOSTIC_BYTES: usize = 4096;
+
+/// The bounded class of prerequisite or realization failure reported by Nix.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RealizationFailureKind {
+    /// A required output was not available from the configured substituters.
+    MissingCacheRoot,
+    /// A required output belongs to a platform unavailable on the build host.
+    WrongPlatform,
+    /// An explicitly selected remote builder failed or could not be reached.
+    RemoteBuilder,
+    /// Nix rejected or failed the realization without a more specific class.
+    NixRealization,
+    /// The failure did not match a known Nix diagnostic.
+    Unknown,
+}
+
+impl fmt::Display for RealizationFailureKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::MissingCacheRoot => "missing-cache-root",
+            Self::WrongPlatform => "wrong-platform",
+            Self::RemoteBuilder => "remote-builder",
+            Self::NixRealization => "nix-realization",
+            Self::Unknown => "unknown",
+        })
+    }
+}
+
+/// Bounded, redacted context for a failed realization prerequisite.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct MissingPrerequisite {
+    /// Failed requirement or realization root.
+    pub root: String,
+    /// Affected Nix system, or `unknown` when Nix did not identify one.
+    pub system: String,
+    /// Non-sensitive cache or builder context.
+    pub cache_context: String,
+    /// Whether explicit native recovery may satisfy this prerequisite.
+    pub recoverable_by_native_recovery: bool,
+    /// Bounded, redacted diagnostic preview.
+    pub diagnostic: String,
+    /// Stable failure classification.
+    pub kind: RealizationFailureKind,
+}
+
+impl fmt::Display for MissingPrerequisite {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "{} root={} system={} context={} recoverable_by_native_recovery={}: {}",
+            self.kind,
+            self.root,
+            self.system,
+            self.cache_context,
+            self.recoverable_by_native_recovery,
+            self.diagnostic
+        )
+    }
+}
 
 /// Errors produced by Crossbow switch planning, metadata lookup, and runtime commands.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum Error {
+    /// Temporary roots could not be created for an exact runtime restore.
+    #[error("crossbow: failed to create temporary runtime GC roots")]
+    RuntimeGcRoots {
+        /// Underlying filesystem error.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// A target system was not present in the shared metadata.
+    #[error(
+        "crossbow: unsupported host platform `{system}`; add it to lib/targets.nix and lib/platform-map.nix first"
+    )]
+    UnsupportedHostPlatform {
+        /// Unsupported Nix system string.
+        system: String,
+    },
+
+    /// A Nix system did not have the requested compiler target mapping.
+    #[error("crossbow: no {name} mapping for `{system}`")]
+    MissingPlatformMapping {
+        /// Mapping table name.
+        name: String,
+        /// Nix system string that was missing.
+        system: String,
+    },
+
+    /// A cache mode name was not present in the shared metadata.
+    #[error("crossbow: unsupported cache mode `{mode}`; expected one of {expected}")]
+    UnsupportedCacheMode {
+        /// Unsupported cache mode.
+        mode: String,
+        /// Comma-separated supported cache modes.
+        expected: String,
+    },
+
+    /// A hardware optimization profile name was not present in the shared metadata.
+    #[error(
+        "crossbow: unsupported hardware optimization profile `{profile}`; expected one of {expected}"
+    )]
+    UnsupportedHardwareProfile {
+        /// Unsupported profile name.
+        profile: String,
+        /// Comma-separated supported profile names.
+        expected: String,
+    },
+
+    /// A hardware optimization profile was used with the wrong host system.
+    #[error(
+        "crossbow: hardware optimization profile `{profile}` is for `{profile_system}` but host is `{host}`"
+    )]
+    HardwareProfileHostMismatch {
+        /// Profile name.
+        profile: String,
+        /// System the profile supports.
+        profile_system: String,
+        /// Host system requested by the caller.
+        host: String,
+    },
+
+    /// A build optimization profile name was not present in the shared metadata.
+    #[error(
+        "crossbow: unsupported build optimization profile `{profile}`; expected one of {expected}"
+    )]
+    UnsupportedBuildOptimizationProfile {
+        /// Unsupported profile name.
+        profile: String,
+        /// Comma-separated supported profile names.
+        expected: String,
+    },
+
+    /// A native-builder check was planned without a host system.
+    #[error("crossbow: native-builder check `{check_name}` requires a non-empty host system")]
+    NativeBuilderMissingHost {
+        /// Check derivation name.
+        check_name: String,
+    },
+
+    /// A declared executor exists in metadata but has no phase-1 implementation.
+    #[error("crossbow: executor `{kind}` is declared but not implemented in phase 1")]
+    ExecutorNotImplemented {
+        /// Executor kind.
+        kind: String,
+    },
+
+    /// An executor kind string is not recognized by Crossbow.
+    #[error("crossbow: unknown executor `{kind}`")]
+    UnknownExecutor {
+        /// Unknown executor kind.
+        kind: String,
+    },
+
     /// A CLI argument was not recognized.
     #[error("crossbow: unknown argument `{argument}`\n{usage}")]
     UnknownArgument {
@@ -91,6 +245,61 @@ pub enum Error {
         source: serde_json::Error,
     },
 
+    /// The pin-manifest Nix evaluation could not be spawned.
+    #[error("crossbow: failed to run `nix eval --no-write-lock-file --json {installable}`")]
+    PinManifestCommand {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// Underlying spawn failure.
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// The pin-manifest Nix evaluation failed.
+    #[error(
+        "crossbow: `nix eval --no-write-lock-file --json {installable}` failed (exit status {status:?}): {stderr}"
+    )]
+    PinManifestFailed {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// Process exit code, or `None` when the process ended without one.
+        status: Option<i32>,
+        /// Captured Nix stderr.
+        stderr: String,
+    },
+
+    /// The pin-manifest Nix evaluation emitted non-UTF-8 output.
+    #[error(
+        "crossbow: `nix eval --no-write-lock-file --json {installable}` produced non-UTF-8 output"
+    )]
+    PinManifestUtf8 {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// Underlying UTF-8 error.
+        #[source]
+        source: FromUtf8Error,
+    },
+
+    /// The pin-manifest Nix evaluation emitted invalid JSON.
+    #[error("crossbow: pin-manifest JSON for `{installable}` is invalid")]
+    PinManifestJson {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// JSON parsing failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
+    /// Serializing the parsed pin-manifest JSON for output failed.
+    #[error("crossbow: failed to serialize pin-manifest JSON for `{installable}`")]
+    PinManifestOutputJson {
+        /// Flake installable evaluated by Nix.
+        installable: String,
+        /// JSON serialization failure.
+        #[source]
+        source: serde_json::Error,
+    },
+
     /// Nix omitted one requested derivation from `nix derivation show`.
     #[error("crossbow: planner could not find derivation `{drv}` in nix derivation show output")]
     PlannerMissingDerivation {
@@ -110,6 +319,44 @@ pub enum Error {
     /// The exact planner was invoked without any cache to probe.
     #[error("crossbow: exact planner requires at least one configured substituter")]
     PlannerNoSubstituters,
+
+    /// An executable plan uses an unsupported schema version.
+    #[error("crossbow: unsupported closure plan schema version {version}")]
+    UnsupportedPlanSchema {
+        /// Unsupported schema version.
+        version: u32,
+    },
+
+    /// An executable plan's content no longer matches its stable identifier.
+    #[error("crossbow: closure plan ID mismatch: expected `{expected}`, computed `{actual}`")]
+    PlanIdMismatch {
+        /// Identifier recorded in the plan.
+        expected: String,
+        /// Identifier computed from canonical content.
+        actual: String,
+    },
+
+    /// A caller attempted to execute a plan for another installable identity.
+    #[error(
+        "crossbow: closure plan identity mismatch for `{field}`: planned `{planned}`, requested `{requested}`"
+    )]
+    PlanIdentityMismatch {
+        /// Identity field that differed.
+        field: &'static str,
+        /// Identity sealed into the plan.
+        planned: String,
+        /// Identity supplied by the executor caller.
+        requested: String,
+    },
+
+    /// A fail-closed output action prevents execution.
+    #[error("crossbow: closure plan is blocked for `{path}`: {reason}")]
+    PlanBlocked {
+        /// Output path that cannot be realized safely.
+        path: String,
+        /// Planner reason for refusing execution.
+        reason: String,
+    },
 
     /// A cache probe could not be spawned.
     #[error("crossbow: failed to probe `{output}` in substituter `{substituter}`")]
@@ -232,6 +479,17 @@ pub enum Error {
         stderr: String,
     },
 
+    /// The initial realization failed with a structured prerequisite context.
+    #[error("crossbow: realization of `{attr}` failed (exit status {status:?}): {prerequisite}")]
+    RealizationMissingPrerequisite {
+        /// Nix attribute passed to `nix build`.
+        attr: String,
+        /// Process exit code, or `None` when the process ended without one.
+        status: Option<i32>,
+        /// Bounded context for the failed prerequisite.
+        prerequisite: Box<MissingPrerequisite>,
+    },
+
     /// `nix build` printed stdout that was not UTF-8.
     #[error("crossbow: `nix build --no-link --print-out-paths {attr}` produced non-UTF-8 output")]
     NixBuildUtf8 {
@@ -285,6 +543,16 @@ pub enum Error {
         toplevel: String,
     },
 
+    /// Reading a Nix store file (e.g. from a `crossbowRequirements` artifact) failed.
+    #[error("crossbow: failed to read `{file}`")]
+    NixStoreRead {
+        /// File path that failed to read.
+        file: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+
     /// Spawning `nixos-rebuild` failed.
     #[error("crossbow: failed to run `nixos-rebuild {action} --flake {flake_attr}`")]
     NixosRebuildRun {
@@ -317,6 +585,14 @@ pub enum Error {
         count: usize,
         /// Preview of missing paths.
         preview: String,
+    },
+
+    /// Embedded JSON metadata failed to deserialize.
+    #[error("crossbow: embedded metadata JSON is invalid")]
+    MetadataJson {
+        /// JSON parsing failure.
+        #[from]
+        source: serde_json::Error,
     },
 }
 
