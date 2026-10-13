@@ -422,6 +422,8 @@
             packages = [
               pkgs.alejandra
               pkgs.cargo
+              pkgs.cargo-audit
+              pkgs.cargo-deny
               pkgs.clippy
               pkgs.nix
               pkgs.rustc
