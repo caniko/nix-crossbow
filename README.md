@@ -25,6 +25,7 @@ Phase 1 implements Linux-to-Linux package cross-compilation through Zig/LLVM and
 - `lib.hardwareProfiles`: optional target hardware profiles such as `rockpro64`.
 - `lib.mkOptimizedHostPlatform`: merge a hardware profile into a Nix host platform descriptor.
 - `lib.withCrossSupport`: augment package outputs with cross variants.
+- `nixosModules.build-optimization`: declares `services.crossbow.buildOptimization.{enable,profile,hardwareProfile}` so host modules share one switch for `lib.applyBuildOptimization` wrappers. It declares options only; consumers read them where they wrap packages.
 - `lib.mkPinManifest`: normalize Crossbow cache roots into channel-grouped package and consumer-target requirements.
 
 ## Target Hardware Optimization

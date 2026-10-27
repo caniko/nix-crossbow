@@ -18,6 +18,7 @@
       flake = {
         lib = import ./lib {inherit inputs;};
         nixosModules.cross-builder = import ./modules/cross-builder.nix;
+        nixosModules.build-optimization = import ./modules/build-optimization.nix inputs.self.lib;
       };
 
       perSystem = {
@@ -404,6 +405,20 @@
             }
             touch $out
           '';
+
+          build-optimization-module = let
+            eval = modules:
+              (pkgs.lib.evalModules {
+                modules = [inputs.self.nixosModules.build-optimization] ++ modules;
+              }).config.services.crossbow.buildOptimization;
+            defaults = eval [];
+            fastLocal = eval [{services.crossbow.buildOptimization.profile = inputs.self.lib.buildOptimizationProfiles.fast-local;}];
+          in
+            assert !defaults.enable;
+            assert defaults.profile.name == "cache-first";
+            assert defaults.hardwareProfile == null;
+            assert fastLocal.profile.name == "fast-local";
+              pkgs.runCommand "crossbow-build-optimization-module" {} "touch $out";
 
           tiny-c-aarch64-linux = inputs.self.packages.${system}.tiny-c-aarch64-linux;
 
