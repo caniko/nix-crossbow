@@ -32,6 +32,12 @@ pub struct RequirementsArtifact {
     ///
     /// Empty when the artifact was produced by an older Crossbow version.
     pub root_fingerprints: Vec<String>,
+    /// `.drv` paths of build tools that must never be built locally for this
+    /// target (for example target-platform clang, mold or Go in a cross build).
+    ///
+    /// Empty when the artifact was produced by an older Crossbow version or
+    /// when the consumer declares no forbidden tools.
+    pub forbidden_build_drvs: Vec<String>,
 }
 
 impl RequirementsArtifact {
@@ -43,12 +49,15 @@ impl RequirementsArtifact {
         let fingerprint = read_file_optional(&artifact_path.join("fingerprint"))?;
         let root_labels = read_lines_optional(&artifact_path.join("root-labels"))?;
         let root_fingerprints = read_lines_optional(&artifact_path.join("root-fingerprints"))?;
+        let forbidden_build_drvs =
+            read_lines_optional(&artifact_path.join("nix-support/crossbow-forbidden-build-drvs"))?;
         Ok(Self {
             roots,
             drvs,
             fingerprint,
             root_labels,
             root_fingerprints,
+            forbidden_build_drvs,
         })
     }
 }
@@ -256,6 +265,26 @@ mod tests {
         let artifact = RequirementsArtifact::read(dir.path()).unwrap();
         assert!(artifact.roots.is_empty());
         assert!(artifact.drvs.is_empty());
+        assert!(artifact.forbidden_build_drvs.is_empty());
+    }
+
+    #[test]
+    fn reads_forbidden_build_drvs() {
+        let dir = TempDir::new().unwrap();
+        write_file(&dir, "roots", "");
+        write_file(&dir, "drvs", "");
+        fs::create_dir_all(dir.path().join("nix-support")).unwrap();
+        write_file(
+            &dir,
+            "nix-support/crossbow-forbidden-build-drvs",
+            "/nix/store/clang.drv\n/nix/store/mold.drv\n",
+        );
+
+        let artifact = RequirementsArtifact::read(dir.path()).unwrap();
+        assert_eq!(
+            artifact.forbidden_build_drvs,
+            vec!["/nix/store/clang.drv", "/nix/store/mold.drv"]
+        );
     }
 
     #[test]
@@ -295,6 +324,7 @@ mod tests {
             fingerprint: None,
             root_labels: vec!["system-toplevel".into(), "identity-cli".into()],
             root_fingerprints: vec!["fp1".into(), "fp2".into()],
+            forbidden_build_drvs: vec![],
         };
         let labeled = label_roots(&artifact);
         assert_eq!(labeled.len(), 2);
@@ -314,6 +344,7 @@ mod tests {
             fingerprint: None,
             root_labels: vec![],
             root_fingerprints: vec![],
+            forbidden_build_drvs: vec![],
         };
         let labeled = label_roots(&artifact);
         assert_eq!(labeled.len(), 2);

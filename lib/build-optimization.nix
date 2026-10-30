@@ -37,8 +37,11 @@
       # `nuke-references` has less to do downstream too. CGo-using packages
       # opt out by setting `goEnv = {}` on a custom profile.
       goEnv = {CGO_ENABLED = "0";};
+      # Build accelerators must run on the build machine. In a cross package
+      # set top-level `pkgs.mold` is a target build; `buildPackages` is the
+      # same set for native packages, so native derivations keep their hashes.
       nativeBuildInputs = pkgs: [
-        pkgs.mold
+        pkgs.buildPackages.mold
       ];
       description = "Use local build accelerators for derivations that are not expected to substitute.";
     };
@@ -68,17 +71,33 @@
     enable,
     pkgs,
     crossbowCrossPkgs ? null,
+    language ? "generic",
     consumerName ? "crossbow optimized package selection",
   }: let
-    useCrossPkgs = enable && crossbowCrossPkgs != null;
+    cross = enable && crossbowCrossPkgs != null;
+    # Pure-Go packages emit target binaries with the native toolchain, so they
+    # keep the native package set and take only the target platform from the
+    # cross set. Every other language needs the cross stdenv.
+    useCrossPkgs = cross && language != "go";
+    nativeGoCross = cross && language == "go";
     selectedPkgs =
       if useCrossPkgs
       then crossbowCrossPkgs
       else pkgs;
   in {
-    inherit selectedPkgs useCrossPkgs;
+    inherit selectedPkgs useCrossPkgs nativeGoCross;
     pkgs = selectedPkgs;
-    assertions = lib.optional useCrossPkgs {
+    # Non-null only for native Go cross builds; pass this to a Go package
+    # builder that supports target selection (harbor-go `mkGoPackage.target`).
+    targetPlatform =
+      if nativeGoCross
+      then crossbowCrossPkgs.stdenv.hostPlatform
+      else null;
+    targetSystem =
+      if nativeGoCross
+      then crossbowCrossPkgs.stdenv.hostPlatform.system
+      else null;
+    assertions = lib.optional cross {
       assertion =
         crossbowCrossPkgs.stdenv.buildPlatform.system
         != crossbowCrossPkgs.stdenv.hostPlatform.system;

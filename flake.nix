@@ -87,6 +87,10 @@
             }
           ];
         };
+        forbiddenBuildArtifact = inputs.self.lib.mkRequirementsArtifact {
+          buildPkgs = pkgs;
+          forbiddenBuildDrvs = [pkgs.hello];
+        };
         crossPackageProbeNative = inputs.self.lib.mkNixosNativeSubstitutedSystem {
           host = crossPackageProbeHost;
           modules = [
@@ -374,6 +378,43 @@
                 };
               }).pkgs.stdenv.hostPlatform.system
             }" = "aarch64-linux"
+            # Go native-cross keeps the native package set and only takes the
+            # target platform from the cross set.
+            test "${
+              (inputs.self.lib.selectOptimizedPkgs {
+                enable = true;
+                inherit pkgs;
+                crossbowCrossPkgs = crossRustProbeCrossPkgs;
+                language = "go";
+              }).pkgs.stdenv.hostPlatform.system
+            }" = "${pkgs.stdenv.hostPlatform.system}"
+            test "${
+              if
+                (inputs.self.lib.selectOptimizedPkgs {
+                  enable = true;
+                  inherit pkgs;
+                  crossbowCrossPkgs = crossRustProbeCrossPkgs;
+                  language = "go";
+                }).targetSystem
+                == "aarch64-linux"
+              then "1"
+              else "0"
+            }" = "1"
+            # Build accelerators resolve through buildPackages, not the target.
+            test "${
+              if
+                (builtins.head (inputs.self.lib.buildOptimizationProfiles.fast-local.nativeBuildInputs crossRustProbeCrossPkgs)).drvPath
+                == crossRustProbeCrossPkgs.buildPackages.mold.drvPath
+              then "1"
+              else "0"
+            }" = "1"
+            test "${
+              if
+                crossRustProbeCrossPkgs.buildPackages.mold.drvPath
+                == crossRustProbeCrossPkgs.mold.drvPath
+              then "1"
+              else "0"
+            }" = "0"
             test "${
               if inputs.self.lib.mkNixosStrictCrossSystem == inputs.self.lib.mkNixosSwitchSystem
               then "1"
@@ -387,6 +428,9 @@
             test -e ${crossPackageProbeRequirements}/drvs
             grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel}" ${crossPackageProbeRequirements}/roots >/dev/null
             grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel.drvPath}" ${crossPackageProbeRequirements}/drvs >/dev/null
+            test -e ${crossPackageProbeRequirements}/nix-support/crossbow-forbidden-build-drvs
+            test -z "$(tr -d '\n' < ${crossPackageProbeRequirements}/nix-support/crossbow-forbidden-build-drvs)"
+            grep -Fx "${builtins.unsafeDiscardStringContext pkgs.hello.drvPath}" ${forbiddenBuildArtifact}/nix-support/crossbow-forbidden-build-drvs >/dev/null
             touch $out
           '';
 
