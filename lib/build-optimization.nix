@@ -83,6 +83,11 @@
     selectedPkgs =
       if useCrossPkgs
       then crossbowCrossPkgs
+      else if nativeGoCross
+      # The config's own `pkgs` is the host-native cache-shaped set, so a Go
+      # target build keeps the *build-platform* toolchain and only borrows the
+      # target platform metadata from the cross set.
+      then crossbowCrossPkgs.buildPackages
       else pkgs;
   in {
     inherit selectedPkgs useCrossPkgs nativeGoCross;

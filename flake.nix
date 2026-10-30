@@ -106,6 +106,12 @@
           localSystem = {inherit system;};
           crossSystem = {system = "aarch64-linux";};
         };
+        crossGoSelection = inputs.self.lib.selectOptimizedPkgs {
+          enable = true;
+          inherit pkgs;
+          crossbowCrossPkgs = crossRustProbeCrossPkgs;
+          language = "go";
+        };
         crossRustProbeCargoArtifacts = pkgs.stdenv.mkDerivation {
           pname = "cross-rust-probe-cargo-artifacts";
           version = "0";
@@ -378,25 +384,17 @@
                 };
               }).pkgs.stdenv.hostPlatform.system
             }" = "aarch64-linux"
-            # Go native-cross keeps the native package set and only takes the
-            # target platform from the cross set.
+            # Go native-cross uses the build-platform toolchain and only takes
+            # the target platform from the cross set.
+            test "${crossGoSelection.pkgs.stdenv.hostPlatform.system}" = "${pkgs.stdenv.hostPlatform.system}"
+            test "${crossGoSelection.pkgs.stdenv.buildPlatform.system}" = "${pkgs.stdenv.hostPlatform.system}"
             test "${
-              (inputs.self.lib.selectOptimizedPkgs {
-                enable = true;
-                inherit pkgs;
-                crossbowCrossPkgs = crossRustProbeCrossPkgs;
-                language = "go";
-              }).pkgs.stdenv.hostPlatform.system
-            }" = "${pkgs.stdenv.hostPlatform.system}"
+              if crossGoSelection.useCrossPkgs
+              then "1"
+              else "0"
+            }" = "0"
             test "${
-              if
-                (inputs.self.lib.selectOptimizedPkgs {
-                  enable = true;
-                  inherit pkgs;
-                  crossbowCrossPkgs = crossRustProbeCrossPkgs;
-                  language = "go";
-                }).targetSystem
-                == "aarch64-linux"
+              if crossGoSelection.targetSystem == "aarch64-linux"
               then "1"
               else "0"
             }" = "1"
