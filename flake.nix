@@ -87,10 +87,6 @@
             }
           ];
         };
-        forbiddenBuildArtifact = inputs.self.lib.mkRequirementsArtifact {
-          buildPkgs = pkgs;
-          forbiddenBuildDrvs = [pkgs.hello];
-        };
         crossPackageProbeNative = inputs.self.lib.mkNixosNativeSubstitutedSystem {
           host = crossPackageProbeHost;
           modules = [
@@ -111,6 +107,13 @@
           inherit pkgs;
           crossbowCrossPkgs = crossRustProbeCrossPkgs;
           language = "go";
+        };
+        crossGoCgoSelection = inputs.self.lib.selectOptimizedPkgs {
+          enable = true;
+          inherit pkgs;
+          crossbowCrossPkgs = crossRustProbeCrossPkgs;
+          language = "go";
+          cgo = true;
         };
         crossRustProbeCargoArtifacts = pkgs.stdenv.mkDerivation {
           pname = "cross-rust-probe-cargo-artifacts";
@@ -398,6 +401,12 @@
               then "1"
               else "0"
             }" = "1"
+            # CGo keeps the cross set (it needs a target C toolchain).
+            test "${
+              if crossGoCgoSelection.useCrossPkgs && crossGoCgoSelection.targetSystem == null
+              then "1"
+              else "0"
+            }" = "1"
             # Build accelerators resolve through buildPackages, not the target.
             test "${
               if
@@ -406,9 +415,12 @@
               then "1"
               else "0"
             }" = "1"
+            # Only meaningful when the probe is a real cross (aarch64-linux hosts are native).
             test "${
               if
-                crossRustProbeCrossPkgs.buildPackages.mold.drvPath
+                crossRustProbeCrossPkgs.stdenv.buildPlatform.system
+                != crossRustProbeCrossPkgs.stdenv.hostPlatform.system
+                && crossRustProbeCrossPkgs.buildPackages.mold.drvPath
                 == crossRustProbeCrossPkgs.mold.drvPath
               then "1"
               else "0"
@@ -426,9 +438,6 @@
             test -e ${crossPackageProbeRequirements}/drvs
             grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel}" ${crossPackageProbeRequirements}/roots >/dev/null
             grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel.drvPath}" ${crossPackageProbeRequirements}/drvs >/dev/null
-            test -e ${crossPackageProbeRequirements}/nix-support/crossbow-forbidden-build-drvs
-            test -z "$(tr -d '\n' < ${crossPackageProbeRequirements}/nix-support/crossbow-forbidden-build-drvs)"
-            grep -Fx "${builtins.unsafeDiscardStringContext pkgs.hello.drvPath}" ${forbiddenBuildArtifact}/nix-support/crossbow-forbidden-build-drvs >/dev/null
             touch $out
           '';
 

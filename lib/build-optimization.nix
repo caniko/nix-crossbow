@@ -72,14 +72,16 @@
     pkgs,
     crossbowCrossPkgs ? null,
     language ? "generic",
+    # CGo needs a target C toolchain, so CGo builds keep the cross set.
+    cgo ? false,
     consumerName ? "crossbow optimized package selection",
   }: let
     cross = enable && crossbowCrossPkgs != null;
-    # Pure-Go packages emit target binaries with the native toolchain, so they
+    # Pure-Go (CGO disabled) packages emit target binaries with the native toolchain, so they
     # keep the native package set and take only the target platform from the
     # cross set. Every other language needs the cross stdenv.
-    useCrossPkgs = cross && language != "go";
-    nativeGoCross = cross && language == "go";
+    nativeGoCross = cross && language == "go" && !cgo;
+    useCrossPkgs = cross && !nativeGoCross;
     selectedPkgs =
       if useCrossPkgs
       then crossbowCrossPkgs

@@ -60,7 +60,6 @@
     buildPkgs,
     roots ? [],
     rootLabels ? [],
-    forbiddenBuildDrvs ? [],
   }: let
     fingerprint =
       builtins.hashString "sha256"
@@ -69,7 +68,6 @@
       if roots == [] || rootLabels == []
       then []
       else map (root: builtins.hashString "sha256" (builtins.unsafeDiscardStringContext root)) roots;
-    forbiddenDrvPaths = map (drv: builtins.unsafeDiscardStringContext drv.drvPath) forbiddenBuildDrvs;
   in
     buildPkgs.runCommand "crossbow-switch-requirements" {} ''
       mkdir -p "$out/nix-support"
@@ -92,12 +90,6 @@
         ${lib.concatStringsSep "\n" rootFingerprints}
         EOF
       ''}
-      # Build tools that must never be built locally for this target (for
-      # example target-platform clang/mold/Go in a cross build). Consumers can
-      # reject a plan whose build-local set intersects this list.
-      cat > "$out/nix-support/crossbow-forbidden-build-drvs" <<'EOF'
-      ${lib.concatStringsSep "\n" forbiddenDrvPaths}
-      EOF
       cp "$out/roots" "$out/nix-support/crossbow-requirements"
       cp "$out/drvs" "$out/nix-support/crossbow-requirement-drvs"
       cp "$out/fingerprint" "$out/nix-support/crossbow-requirements-fingerprint"
@@ -115,7 +107,6 @@
     buildPkgs ? null,
     crossPackageAttrNames ? [],
     crossPackageOverrides ? {},
-    forbiddenBuildDrvs ? [],
   }: let
     nativeSystem = mkNixosNativeSubstitutedSystem {
       inherit
@@ -150,9 +141,7 @@
     crossPackageRoots =
       map (
         name:
-          if crossPackageOverrides ? ${name}
-          then crossPackageOverrides.${name}
-          else crossPkgs.${name}
+          crossPackageOverrides.${name} or crossPkgs.${name}
       )
       crossPackageLabels;
     allRoots = [nativeSystem.config.system.build.toplevel] ++ crossPackageRoots;
@@ -162,7 +151,6 @@
       buildPkgs = artifactPkgs;
       roots = allRoots;
       rootLabels = allLabels;
-      inherit forbiddenBuildDrvs;
     };
 
   mkNixosSwitchSystem = {
