@@ -102,6 +102,19 @@
           localSystem = {inherit system;};
           crossSystem = {system = "aarch64-linux";};
         };
+        crossGoSelection = inputs.self.lib.selectOptimizedPkgs {
+          enable = true;
+          inherit pkgs;
+          crossbowCrossPkgs = crossRustProbeCrossPkgs;
+          language = "go";
+        };
+        crossGoCgoSelection = inputs.self.lib.selectOptimizedPkgs {
+          enable = true;
+          inherit pkgs;
+          crossbowCrossPkgs = crossRustProbeCrossPkgs;
+          language = "go";
+          cgo = true;
+        };
         crossRustProbeCargoArtifacts = pkgs.stdenv.mkDerivation {
           pname = "cross-rust-probe-cargo-artifacts";
           version = "0";
@@ -374,6 +387,44 @@
                 };
               }).pkgs.stdenv.hostPlatform.system
             }" = "aarch64-linux"
+            # Go native-cross uses the build-platform toolchain and only takes
+            # the target platform from the cross set.
+            test "${crossGoSelection.pkgs.stdenv.hostPlatform.system}" = "${pkgs.stdenv.hostPlatform.system}"
+            test "${crossGoSelection.pkgs.stdenv.buildPlatform.system}" = "${pkgs.stdenv.hostPlatform.system}"
+            test "${
+              if crossGoSelection.useCrossPkgs
+              then "1"
+              else "0"
+            }" = "0"
+            test "${
+              if crossGoSelection.targetSystem == "aarch64-linux"
+              then "1"
+              else "0"
+            }" = "1"
+            # CGo keeps the cross set (it needs a target C toolchain).
+            test "${
+              if crossGoCgoSelection.useCrossPkgs && crossGoCgoSelection.targetSystem == null
+              then "1"
+              else "0"
+            }" = "1"
+            # Build accelerators resolve through buildPackages, not the target.
+            test "${
+              if
+                (builtins.head (inputs.self.lib.buildOptimizationProfiles.fast-local.nativeBuildInputs crossRustProbeCrossPkgs)).drvPath
+                == crossRustProbeCrossPkgs.buildPackages.mold.drvPath
+              then "1"
+              else "0"
+            }" = "1"
+            # Only meaningful when the probe is a real cross (aarch64-linux hosts are native).
+            test "${
+              if
+                crossRustProbeCrossPkgs.stdenv.buildPlatform.system
+                != crossRustProbeCrossPkgs.stdenv.hostPlatform.system
+                && crossRustProbeCrossPkgs.buildPackages.mold.drvPath
+                == crossRustProbeCrossPkgs.mold.drvPath
+              then "1"
+              else "0"
+            }" = "0"
             test "${
               if inputs.self.lib.mkNixosStrictCrossSystem == inputs.self.lib.mkNixosSwitchSystem
               then "1"

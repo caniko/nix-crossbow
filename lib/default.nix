@@ -56,6 +56,8 @@
       inherit (toplevelOverride) mkToplevelOverrideModule;
       inherit
         (nixosSystems)
+        mkRequirementsArtifact
+        mkEmptyNixosSwitchRequirements
         mkNixosSwitchSystem
         mkNixosSwitchRequirements
         mkNixosStrictCrossSystem

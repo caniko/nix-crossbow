@@ -141,9 +141,7 @@
     crossPackageRoots =
       map (
         name:
-          if crossPackageOverrides ? ${name}
-          then crossPackageOverrides.${name}
-          else crossPkgs.${name}
+          crossPackageOverrides.${name} or crossPkgs.${name}
       )
       crossPackageLabels;
     allRoots = [nativeSystem.config.system.build.toplevel] ++ crossPackageRoots;
@@ -312,6 +310,8 @@
   mkNixosCrossSystem = mkNixosSwitchSystem;
 in {
   inherit
+    mkRequirementsArtifact
+    mkEmptyNixosSwitchRequirements
     mkNixosSwitchSystem
     mkNixosSwitchRequirements
     mkNixosStrictCrossSystem
