@@ -36,6 +36,19 @@ pub enum DerivationClass {
     Unhandled,
 }
 
+/// How expensive a derivation is to realize, from the derivation JSON.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DerivationCost {
+    /// Local-only glue (`preferLocalBuild`, `allowSubstitutes = false`, builtin).
+    Trivial,
+    /// Fixed-output derivation: a fetch, not a compile.
+    Fetch,
+    /// Anything else; also the value for plans that predate cost facts.
+    #[default]
+    Compile,
+}
+
 /// What to do with a derivation that is not available from any substituter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -186,6 +199,9 @@ pub struct DerivationPlan {
     pub system: String,
     /// Classification under the selected realization policy.
     pub class: DerivationClass,
+    /// Cost class derived from the derivation JSON; old plans read as `compile`.
+    #[serde(default)]
+    pub cost: DerivationCost,
     /// Concrete realization route selected at plan time.
     #[serde(default, skip_serializing_if = "is_default_route")]
     pub route: RealizationRoute,
@@ -334,9 +350,40 @@ struct DerivationNode {
     pname: Option<String>,
     #[serde(default)]
     env: DerivationEnv,
+    #[serde(default, rename = "structuredAttrs")]
+    structured_attrs: StructuredAttrs,
     outputs: BTreeMap<String, DerivationOutput>,
     #[serde(default)]
     inputs: DerivationInputs,
+}
+
+impl DerivationNode {
+    fn cost(&self) -> DerivationCost {
+        if self.outputs.values().any(|output| output.hash.is_some()) {
+            return DerivationCost::Fetch;
+        }
+        // Env values are strings: `preferLocalBuild = "1"`, `allowSubstitutes = ""`.
+        let prefer_local = self
+            .structured_attrs
+            .prefer_local_build
+            .or_else(|| {
+                self.env
+                    .prefer_local_build
+                    .as_deref()
+                    .map(|v| !v.is_empty())
+            })
+            .unwrap_or(false);
+        let no_substitutes = self
+            .structured_attrs
+            .allow_substitutes
+            .or_else(|| self.env.allow_substitutes.as_deref().map(|v| !v.is_empty()))
+            .is_some_and(|allow| !allow);
+        if prefer_local || no_substitutes || self.system == "builtin" {
+            DerivationCost::Trivial
+        } else {
+            DerivationCost::Compile
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -345,6 +392,22 @@ struct DerivationEnv {
     name: Option<String>,
     #[serde(default)]
     pname: Option<String>,
+    #[serde(default, rename = "preferLocalBuild")]
+    prefer_local_build: Option<String>,
+    #[serde(default, rename = "allowSubstitutes")]
+    allow_substitutes: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct StructuredAttrs {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    pname: Option<String>,
+    #[serde(default, rename = "preferLocalBuild")]
+    prefer_local_build: Option<bool>,
+    #[serde(default, rename = "allowSubstitutes")]
+    allow_substitutes: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -363,6 +426,9 @@ struct DerivationInput {
 struct DerivationOutput {
     #[serde(default)]
     path: Option<String>,
+    /// Present only on fixed-output derivations.
+    #[serde(default)]
+    hash: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -604,13 +670,16 @@ pub fn plan_closure_with_hints(
             name: node
                 .name
                 .clone()
+                .or_else(|| node.structured_attrs.name.clone())
                 .or_else(|| node.env.name.clone())
                 .filter(|name| !name.is_empty()),
             pname: node
                 .pname
                 .clone()
+                .or_else(|| node.structured_attrs.pname.clone())
                 .or_else(|| node.env.pname.clone())
                 .filter(|pname| !pname.is_empty()),
+            cost: node.cost(),
             output_names,
             outputs: outputs.clone(),
             system,
@@ -1535,6 +1604,68 @@ mod tests {
         );
     }
 
+    fn cost_of(node: &str) -> (DerivationCost, Option<String>) {
+        let json = format!(r#"{{"derivations": {{"a.drv": {node}}}, "version": 4}}"#);
+        let node = parse_graph(&json)
+            .unwrap()
+            .derivations
+            .remove("a.drv")
+            .unwrap();
+        let pname = node
+            .pname
+            .clone()
+            .or_else(|| node.structured_attrs.pname.clone())
+            .or_else(|| node.env.pname.clone());
+        (node.cost(), pname)
+    }
+
+    #[test]
+    fn cost_structured_attrs_prefer_local_build_is_trivial_with_pname() {
+        let (cost, pname) = cost_of(
+            r#"{"system": "x86_64-linux", "env": {}, "outputs": {"out": {"path": "o"}},
+                "structuredAttrs": {"pname": "clang", "preferLocalBuild": true}}"#,
+        );
+        assert_eq!(cost, DerivationCost::Trivial);
+        assert_eq!(pname.as_deref(), Some("clang"));
+    }
+
+    #[test]
+    fn cost_env_allow_substitutes_empty_is_trivial() {
+        let (cost, _) = cost_of(
+            r#"{"system": "x86_64-linux", "env": {"allowSubstitutes": ""},
+                "outputs": {"out": {"path": "o"}}}"#,
+        );
+        assert_eq!(cost, DerivationCost::Trivial);
+        let (cost, _) = cost_of(
+            r#"{"system": "x86_64-linux", "env": {"preferLocalBuild": "1"},
+                "outputs": {"out": {"path": "o"}}}"#,
+        );
+        assert_eq!(cost, DerivationCost::Trivial);
+    }
+
+    #[test]
+    fn cost_fixed_output_is_fetch() {
+        let (cost, _) = cost_of(
+            r#"{"system": "x86_64-linux", "env": {"allowSubstitutes": ""},
+                "outputs": {"out": {"hash": "sha256-x", "method": "flat", "path": "o"}}}"#,
+        );
+        assert_eq!(cost, DerivationCost::Fetch);
+    }
+
+    #[test]
+    fn cost_plain_derivation_is_compile_and_old_plans_default_to_compile() {
+        let (cost, _) = cost_of(
+            r#"{"system": "x86_64-linux", "env": {"allowSubstitutes": "1"},
+                "outputs": {"out": {"path": "o"}}}"#,
+        );
+        assert_eq!(cost, DerivationCost::Compile);
+        assert_eq!(DerivationCost::default(), DerivationCost::Compile);
+        assert_eq!(
+            serde_json::to_string(&DerivationCost::Trivial).unwrap(),
+            r#""trivial""#
+        );
+    }
+
     #[test]
     fn parse_graph_normalizes_paths_and_reads_names() {
         let graph = parse_graph(
@@ -1925,6 +2056,7 @@ mod tests {
                 outputs: vec![],
                 system: "x86_64-linux".to_owned(),
                 class: DerivationClass::BuildLocal,
+                cost: Default::default(),
                 route: RealizationRoute::BuildLocal,
                 hint: None,
                 probe: None,
@@ -2012,6 +2144,7 @@ mod tests {
             outputs: vec!["/nix/store/builtin".to_owned()],
             system: "builtin".to_owned(),
             class: DerivationClass::BuildLocal,
+            cost: Default::default(),
             route: builtin_route,
             hint: None,
             probe: Some(ProbeResult::SkippedKnownLocal),
@@ -2026,6 +2159,7 @@ mod tests {
             outputs: vec!["/nix/store/root".to_owned()],
             system: "x86_64-linux".to_owned(),
             class: DerivationClass::BuildLocal,
+            cost: Default::default(),
             route: RealizationRoute::BuildLocal,
             hint: None,
             probe: Some(ProbeResult::Missing),
@@ -2195,6 +2329,7 @@ mod tests {
             outputs: Vec::new(),
             system: "x86_64-linux".to_owned(),
             class: DerivationClass::BuildLocal,
+            cost: Default::default(),
             route: RealizationRoute::BuildLocal,
             hint: None,
             probe: None,

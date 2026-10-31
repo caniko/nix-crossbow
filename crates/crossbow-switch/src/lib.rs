@@ -34,9 +34,9 @@ pub use error::{
 };
 pub use executor::execute_plan;
 pub use planner::{
-    ClosurePlan, DerivationClass, DerivationPlan, MissRoute, OutputAction, PLAN_SCHEMA_VERSION,
-    PlanCounts, PlanDependency, PlanRoot, RealizationRoute, RouteHintSpec, plan_closure,
-    plan_closure_with_hints, plan_closure_with_substituters, supports_plan_schema,
+    ClosurePlan, DerivationClass, DerivationCost, DerivationPlan, MissRoute, OutputAction,
+    PLAN_SCHEMA_VERSION, PlanCounts, PlanDependency, PlanRoot, RealizationRoute, RouteHintSpec,
+    plan_closure, plan_closure_with_hints, plan_closure_with_substituters, supports_plan_schema,
 };
 pub use requirements::{LabeledRoot, RequirementsArtifact, RootDiff, diff_roots, label_roots};
 pub use runtime::RuntimePath;
