@@ -4,8 +4,8 @@
 
 - `DerivationPlan.cost` (`trivial` | `fetch` | `compile`) classifies each
   derivation from its derivation JSON; plans without it read as `compile`.
-  The plan schema stays at 3 because the field is additive and not part of
-  the plan identity.
+  The field is omitted when `compile`, so plans sealed before it keep their
+  canonical plan id; the plan schema stays at 3.
 - Read `pname`/`name` from `structuredAttrs` (derivation JSON version 4), which
   previously dropped them for structured-attrs derivations.
 

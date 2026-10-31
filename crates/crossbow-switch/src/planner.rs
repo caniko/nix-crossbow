@@ -49,6 +49,12 @@ pub enum DerivationCost {
     Compile,
 }
 
+impl DerivationCost {
+    fn is_compile(&self) -> bool {
+        *self == Self::Compile
+    }
+}
+
 /// What to do with a derivation that is not available from any substituter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -199,8 +205,9 @@ pub struct DerivationPlan {
     pub system: String,
     /// Classification under the selected realization policy.
     pub class: DerivationClass,
-    /// Cost class derived from the derivation JSON; old plans read as `compile`.
-    #[serde(default)]
+    /// Cost class derived from the derivation JSON. Omitted when `compile` so
+    /// plans sealed before cost facts keep their canonical plan id.
+    #[serde(default, skip_serializing_if = "DerivationCost::is_compile")]
     pub cost: DerivationCost,
     /// Concrete realization route selected at plan time.
     #[serde(default, skip_serializing_if = "is_default_route")]
@@ -1660,6 +1667,7 @@ mod tests {
         );
         assert_eq!(cost, DerivationCost::Compile);
         assert_eq!(DerivationCost::default(), DerivationCost::Compile);
+        assert!(DerivationCost::Compile.is_compile());
         assert_eq!(
             serde_json::to_string(&DerivationCost::Trivial).unwrap(),
             r#""trivial""#
