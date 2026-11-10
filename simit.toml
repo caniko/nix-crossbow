@@ -10,3 +10,16 @@ with_audit = true
 with_deny = true
 packages = ["crossbow-switch"]
 publish_strategy = "members"
+
+[release.github]
+repo = "caniko/nix-crossbow"
+target_branch = "trunk"
+
+[release.artifacts]
+runner = "ubuntu-24.04"
+prebuild_binaries = true
+binstall = true
+system_runners = { x86_64-linux = "ubuntu-24.04" }
+# No minisign trust root is committed for this repository yet; enable signing
+# together with keys/minisign.pub and the MINISIGN_* repository secrets.
+sign = false

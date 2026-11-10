@@ -2,9 +2,9 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    rs-harbor.url = "git+https://github.com/caniko/rs-harbor.git?ref=trunk&rev=05cc4f162b55fa904b687db1821e2463fa813e50";
-    nixpkgs.follows = "rs-harbor/nixpkgs";
-    rust-overlay.follows = "rs-harbor/rust-overlay";
+    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=7f03d58b0e6e748b4817417ff21958e074ec6faf";
+    nixpkgs.follows = "harbor-rs/nixpkgs";
+    rust-overlay.follows = "harbor-rs/rust-overlay";
     flake-parts.url = "github:hercules-ci/flake-parts";
   };
 
@@ -143,7 +143,7 @@
           if (crossRustProbePackage.drvAttrs ? cargoArtifacts) && (crossRustProbePackage.drvAttrs.cargoArtifacts ? drvAttrs)
           then (crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs.env or {}) // crossRustProbePackage.drvAttrs.cargoArtifacts.drvAttrs
           else {};
-        buildCache = inputs.rs-harbor.lib.mkBuildCachePolicy {
+        buildCache = inputs.harbor-rs.lib.mkBuildCachePolicy {
           inherit pkgs;
           buildPackageSet = pkgs.buildPackages;
           sccachePackage = pkgs.buildPackages.sccache;
@@ -155,41 +155,74 @@
           localSystem = {inherit system;};
           overlays = [(import inputs.rust-overlay)];
         };
-        toolchain = inputs.rs-harbor.lib.mkToolchain {
+        toolchain = inputs.harbor-rs.lib.mkToolchain {
           pkgs = rustPkgs;
           toolchainProfile = "stable";
           cache.enable = false;
         };
+        crossbowSwitch = builtins.fromTOML (builtins.readFile ./crates/crossbow-switch/Cargo.toml);
+        harborCross = inputs.harbor-rs.lib.mkCross {
+          pkgs = rustPkgs;
+          inherit system;
+        };
+        release = inputs.harbor-rs.lib.mkBinstallRelease {
+          pkgs = rustPkgs;
+          inherit system;
+          pname = crossbowSwitch.package.name;
+          version = crossbowSwitch.package.version;
+          commonArgs = {
+            src = ./.;
+            inherit (crossbowSwitch.package) version;
+            strictDeps = true;
+            # Cross-archives cannot execute their test binaries here; CI runs
+            # the suite natively, so the bundle build stays build-only.
+            doCheck = false;
+          };
+          cross = harborCross;
+          crates.crossbow-switch = {cargoToml = ./crates/crossbow-switch/Cargo.toml;};
+          # No darwin archive: `lib.mkCross` rejects aarch64-darwin -> linux, so
+          # the flake cannot expose aarch64-darwin packages.
+          targets = {
+            x86_64-linux = ["x86_64-linux-musl" "aarch64-linux-musl" "windows"];
+          };
+          # Rust's windows-gnu target shells out to `<triple>-dlltool`, which
+          # harbor-rs exposes through env vars only, so put it on PATH.
+          targetArgs.windows.nativeBuildInputs = [harborCross.mingwCC harborCross.mingwBinutils];
+        };
       in {
         inherit formatter;
 
-        packages = {
-          # The portable output also runs on hosted workers without a managed
-          # cache transport. Cache-shaped builds retain their explicit output.
-          crossbow-switch =
-            (rustPkgs.makeRustPlatform {
-              rustc = toolchain.rustToolchain;
-              cargo = toolchain.rustToolchain;
-            }).buildRustPackage {
-              pname = "crossbow-switch";
-              version = "0.2.0";
-              src = ./.;
-              cargoLock.lockFile = ./Cargo.lock;
-              cargoBuildFlags = ["-p" "crossbow-switch"];
-              cargoTestFlags = ["-p" "crossbow-switch"];
+        packages =
+          {
+            # The portable output also runs on hosted workers without a managed
+            # cache transport. Cache-shaped builds retain their explicit output.
+            crossbow-switch =
+              (rustPkgs.makeRustPlatform {
+                rustc = toolchain.rustToolchain;
+                cargo = toolchain.rustToolchain;
+              }).buildRustPackage {
+                pname = "crossbow-switch";
+                version = crossbowSwitch.package.version;
+                src = ./.;
+                cargoLock.lockFile = ./Cargo.lock;
+                cargoBuildFlags = ["-p" "crossbow-switch"];
+                cargoTestFlags = ["-p" "crossbow-switch"];
+              };
+            crossbow-switch-cached = buildCache.withRustCache {
+              package = inputs.self.packages.${system}.crossbow-switch;
             };
-          crossbow-switch-cached = buildCache.withRustCache {
-            package = inputs.self.packages.${system}.crossbow-switch;
-          };
 
-          tiny-c-aarch64-linux = inputs.self.lib.mkCross {
-            inherit pkgs;
-            build = system;
-            host = "aarch64-linux";
-            package = import ./examples/tiny-c.nix;
-            doCheck = false;
+            tiny-c-aarch64-linux = inputs.self.lib.mkCross {
+              inherit pkgs;
+              build = system;
+              host = "aarch64-linux";
+              package = import ./examples/tiny-c.nix;
+              doCheck = false;
+            };
+          }
+          // pkgs.lib.optionalAttrs (release.releaseBundle != null) {
+            release-bundle = release.releaseBundle;
           };
-        };
 
         apps.crossbow-switch = {
           type = "app";
@@ -197,291 +230,293 @@
           meta.description = "Run cache-shaped Crossbow NixOS switch orchestration";
         };
 
-        checks = {
-          crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
+        checks =
+          {
+            crossbow-switch = inputs.self.packages.${system}.crossbow-switch;
 
-          portable-package-cache-policy = assert !(inputs.self.packages.${system}.crossbow-switch.passthru.rsHarborBuildCacheWrapped or false);
-          assert inputs.self.packages.${system}.crossbow-switch-cached.passthru.rsHarborBuildCacheWrapped or false;
-            pkgs.runCommand "crossbow-portable-package-cache-policy" {} "touch $out";
+            portable-package-cache-policy = assert !(inputs.self.packages.${system}.crossbow-switch.passthru.rsHarborBuildCacheWrapped or false);
+            assert inputs.self.packages.${system}.crossbow-switch-cached.passthru.rsHarborBuildCacheWrapped or false;
+              pkgs.runCommand "crossbow-portable-package-cache-policy" {} "touch $out";
 
-          pin-manifest = let
-            manifest = inputs.self.lib.mkPinManifest {
-              roots = [
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  arch = "aarch64-linux";
-                  name = "direct";
-                  policy = "must-substitute";
-                  target = "target.direct";
-                }
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  hostSystem = "aarch64-linux";
-                  host = "thething";
-                  name = "assembled";
-                  policy = "cross-build";
-                  target = "target.assembled";
-                  cachePackages = ["zeta"];
-                }
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  arch = "aarch64-linux";
-                  name = "shared-one";
-                  policy = "cross-build";
-                  target = "target.shared-one";
-                  cachePackages = ["shared"];
-                  packageTargets.shared = "target.shared.one";
-                }
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  arch = "aarch64-linux";
-                  name = "shared-two";
-                  policy = "cross-build";
-                  target = "target.shared-two";
-                  cachePackages = ["shared"];
-                  packageTargets.shared = "target.shared.two";
-                }
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  arch = "aarch64-linux";
-                  name = "excluded";
-                  policy = "build-platform";
-                  target = "target.excluded";
-                }
-              ];
-            };
-            reordered = inputs.self.lib.mkPinManifest {
-              roots = [
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  policy = "build-platform";
-                  arch = "aarch64-linux";
-                  name = "excluded";
-                  target = "target.excluded";
-                }
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  policy = "cross-build";
-                  arch = "aarch64-linux";
-                  name = "shared-two";
-                  target = "target.shared-two";
-                  cachePackages = ["shared"];
-                  packageTargets.shared = "target.shared.two";
-                }
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  policy = "must-substitute";
-                  arch = "aarch64-linux";
-                  name = "direct";
-                  target = "target.direct";
-                }
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  policy = "cross-build";
-                  hostSystem = "aarch64-linux";
-                  host = "thething";
-                  name = "assembled";
-                  target = "target.assembled";
-                  cachePackages = ["zeta"];
-                }
-                {
-                  channel = "aarch64";
-                  inputName = "nixpkgs";
-                  policy = "cross-build";
-                  arch = "aarch64-linux";
-                  name = "shared-one";
-                  target = "target.shared-one";
-                  cachePackages = ["shared"];
-                  packageTargets.shared = "target.shared.one";
-                }
-              ];
-            };
-          in
-            pkgs.runCommand "crossbow-pin-manifest" {} ''
-              test ${pkgs.lib.escapeShellArg (builtins.toJSON manifest)} = ${pkgs.lib.escapeShellArg (builtins.toJSON reordered)}
-              test '${pkgs.lib.concatStringsSep " " manifest.groups.aarch64.packages}' = 'direct shared zeta'
-              test '${manifest.groups.aarch64.consumerTargets.zeta}' = 'nixosConfigurations.thething-crossbow.pkgs.zeta'
-              test '${manifest.groups.aarch64.requiredConsumerTargets."shared#1"}' = 'target.shared.two'
-              test '${toString (builtins.length manifest.groups.aarch64.entries)}' = 4
+            pin-manifest = let
+              manifest = inputs.self.lib.mkPinManifest {
+                roots = [
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    arch = "aarch64-linux";
+                    name = "direct";
+                    policy = "must-substitute";
+                    target = "target.direct";
+                  }
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    hostSystem = "aarch64-linux";
+                    host = "thething";
+                    name = "assembled";
+                    policy = "cross-build";
+                    target = "target.assembled";
+                    cachePackages = ["zeta"];
+                  }
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    arch = "aarch64-linux";
+                    name = "shared-one";
+                    policy = "cross-build";
+                    target = "target.shared-one";
+                    cachePackages = ["shared"];
+                    packageTargets.shared = "target.shared.one";
+                  }
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    arch = "aarch64-linux";
+                    name = "shared-two";
+                    policy = "cross-build";
+                    target = "target.shared-two";
+                    cachePackages = ["shared"];
+                    packageTargets.shared = "target.shared.two";
+                  }
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    arch = "aarch64-linux";
+                    name = "excluded";
+                    policy = "build-platform";
+                    target = "target.excluded";
+                  }
+                ];
+              };
+              reordered = inputs.self.lib.mkPinManifest {
+                roots = [
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    policy = "build-platform";
+                    arch = "aarch64-linux";
+                    name = "excluded";
+                    target = "target.excluded";
+                  }
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    policy = "cross-build";
+                    arch = "aarch64-linux";
+                    name = "shared-two";
+                    target = "target.shared-two";
+                    cachePackages = ["shared"];
+                    packageTargets.shared = "target.shared.two";
+                  }
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    policy = "must-substitute";
+                    arch = "aarch64-linux";
+                    name = "direct";
+                    target = "target.direct";
+                  }
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    policy = "cross-build";
+                    hostSystem = "aarch64-linux";
+                    host = "thething";
+                    name = "assembled";
+                    target = "target.assembled";
+                    cachePackages = ["zeta"];
+                  }
+                  {
+                    channel = "aarch64";
+                    inputName = "nixpkgs";
+                    policy = "cross-build";
+                    arch = "aarch64-linux";
+                    name = "shared-one";
+                    target = "target.shared-one";
+                    cachePackages = ["shared"];
+                    packageTargets.shared = "target.shared.one";
+                  }
+                ];
+              };
+            in
+              pkgs.runCommand "crossbow-pin-manifest" {} ''
+                test ${pkgs.lib.escapeShellArg (builtins.toJSON manifest)} = ${pkgs.lib.escapeShellArg (builtins.toJSON reordered)}
+                test '${pkgs.lib.concatStringsSep " " manifest.groups.aarch64.packages}' = 'direct shared zeta'
+                test '${manifest.groups.aarch64.consumerTargets.zeta}' = 'nixosConfigurations.thething-crossbow.pkgs.zeta'
+                test '${manifest.groups.aarch64.requiredConsumerTargets."shared#1"}' = 'target.shared.two'
+                test '${toString (builtins.length manifest.groups.aarch64.entries)}' = 4
+                touch $out
+              '';
+
+            crossbow-metadata-pkl =
+              pkgs.runCommand "crossbow-metadata-pkl" {
+                buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
+              } ''
+                pkl_json="$(mktemp)"
+                pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
+
+                for sidecar in \
+                  ${./data/crossbow-metadata.json} \
+                  ${./crates/crossbow-switch/data/crossbow-metadata.json}
+                do
+                  sidecar_json="$(mktemp)"
+                  jq -S -c . "$sidecar" > "$sidecar_json"
+                  if ! diff -u "$pkl_json" "$sidecar_json"; then
+                    echo "ERROR: $sidecar is out of sync with data/CrossbowMetadata.pkl" >&2
+                    echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
+                    exit 1
+                  fi
+                done
+
+                touch "$out"
+              '';
+
+            platform-map = pkgs.runCommand "crossbow-platform-map" {} ''
+              test "${inputs.self.lib.nixSystemToZigTarget "aarch64-linux"}" = "aarch64-linux-gnu"
+              test "${inputs.self.lib.nixSystemToGnuConfig "aarch64-linux"}" = "aarch64-unknown-linux-gnu"
+              test "${inputs.self.lib.targets.wasm32-wasi.config}" = "wasm32-wasi"
+              test "${inputs.self.lib.cacheModes.strict-cross.name}" = "strict-cross"
+              test "${inputs.self.lib.cacheModes.native-substituted.name}" = "native-substituted"
+              test "${inputs.self.lib.cacheModes.cache-shaped-with-cross-overrides.name}" = "cache-shaped-with-cross-overrides"
+              test "${
+                if inputs.self.lib.buildOptimizationProfiles.cache-first.changesHashes
+                then "1"
+                else "0"
+              }" = "0"
+              test "${
+                if inputs.self.lib.buildOptimizationProfiles.fast-local.changesHashes
+                then "1"
+                else "0"
+              }" = "1"
+              test "${
+                if builtins.elem "-flto=thin" inputs.self.lib.buildOptimizationProfiles.fast-local.cFlags
+                then "1"
+                else "0"
+              }" = "1"
+              test "${
+                if builtins.elem "-fuse-ld=mold" inputs.self.lib.buildOptimizationProfiles.fast-local.linkFlags
+                then "1"
+                else "0"
+              }" = "1"
+              test "${inputs.self.lib.hardwareProfiles.rockpro64.platform.gcc.tune}" = "cortex-a72.cortex-a53"
+              test "${inputs.self.lib.hardwareOptimizationName "rockpro64"}" = "rockpro64"
+              test "${(inputs.self.lib.mkOptimizedHostPlatform {
+                host = "aarch64-linux";
+                hardwareOptimization = "rockpro64";
+              }).gcc.tune}" = "cortex-a72.cortex-a53"
+              test "${
+                (inputs.self.lib.selectOptimizedPkgs {
+                  enable = false;
+                  inherit pkgs;
+                }).pkgs.stdenv.hostPlatform.system
+              }" = "${pkgs.stdenv.hostPlatform.system}"
+              test "${
+                (inputs.self.lib.selectOptimizedPkgs {
+                  enable = true;
+                  inherit pkgs;
+                  crossbowCrossPkgs = import inputs.nixpkgs {
+                    localSystem = {inherit system;};
+                    crossSystem = {system = "aarch64-linux";};
+                  };
+                }).pkgs.stdenv.hostPlatform.system
+              }" = "aarch64-linux"
+              # Go native-cross uses the build-platform toolchain and only takes
+              # the target platform from the cross set.
+              test "${crossGoSelection.pkgs.stdenv.hostPlatform.system}" = "${pkgs.stdenv.hostPlatform.system}"
+              test "${crossGoSelection.pkgs.stdenv.buildPlatform.system}" = "${pkgs.stdenv.hostPlatform.system}"
+              test "${
+                if crossGoSelection.useCrossPkgs
+                then "1"
+                else "0"
+              }" = "0"
+              test "${
+                if crossGoSelection.targetSystem == "aarch64-linux"
+                then "1"
+                else "0"
+              }" = "1"
+              # CGo keeps the cross set (it needs a target C toolchain).
+              test "${
+                if crossGoCgoSelection.useCrossPkgs && crossGoCgoSelection.targetSystem == null
+                then "1"
+                else "0"
+              }" = "1"
+              # Build accelerators resolve through buildPackages, not the target.
+              test "${
+                if
+                  (builtins.head (inputs.self.lib.buildOptimizationProfiles.fast-local.nativeBuildInputs crossRustProbeCrossPkgs)).drvPath
+                  == crossRustProbeCrossPkgs.buildPackages.mold.drvPath
+                then "1"
+                else "0"
+              }" = "1"
+              # Only meaningful when the probe is a real cross (aarch64-linux hosts are native).
+              test "${
+                if
+                  crossRustProbeCrossPkgs.stdenv.buildPlatform.system
+                  != crossRustProbeCrossPkgs.stdenv.hostPlatform.system
+                  && crossRustProbeCrossPkgs.buildPackages.mold.drvPath
+                  == crossRustProbeCrossPkgs.mold.drvPath
+                then "1"
+                else "0"
+              }" = "0"
+              test "${
+                if inputs.self.lib.mkNixosStrictCrossSystem == inputs.self.lib.mkNixosSwitchSystem
+                then "1"
+                else "0"
+              }" = "0"
+              test "${crossPackageProbe.config.crossbowProbe.package.stdenv.buildPlatform.system}" = "${system}"
+              test "${crossPackageProbe.config.crossbowProbe.package.stdenv.hostPlatform.system}" = "${crossPackageProbeHost}"
+              test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/roots
+              test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/drvs
+              test -e ${crossPackageProbeRequirements}/roots
+              test -e ${crossPackageProbeRequirements}/drvs
+              grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel}" ${crossPackageProbeRequirements}/roots >/dev/null
+              grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel.drvPath}" ${crossPackageProbeRequirements}/drvs >/dev/null
               touch $out
             '';
 
-          crossbow-metadata-pkl =
-            pkgs.runCommand "crossbow-metadata-pkl" {
-              buildInputs = [pkgs.diffutils pkgs.jq pkgs.pkl];
-            } ''
-              pkl_json="$(mktemp)"
-              pkl eval -f json ${./data/CrossbowMetadata.pkl} | jq -S -c . > "$pkl_json"
-
-              for sidecar in \
-                ${./data/crossbow-metadata.json} \
-                ${./crates/crossbow-switch/data/crossbow-metadata.json}
-              do
-                sidecar_json="$(mktemp)"
-                jq -S -c . "$sidecar" > "$sidecar_json"
-                if ! diff -u "$pkl_json" "$sidecar_json"; then
-                  echo "ERROR: $sidecar is out of sync with data/CrossbowMetadata.pkl" >&2
-                  echo "Regenerate with: pkl eval -f json data/CrossbowMetadata.pkl | jq . > data/crossbow-metadata.json" >&2
-                  exit 1
-                fi
-              done
-
-              touch "$out"
+            cross-rust-helper = pkgs.runCommand "cross-rust-helper" {} ''
+              test "${crossRustProbeEnv.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
+              test "${crossRustProbeEnv.HOST_CC or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
+              test "${crossRustProbeEnv.CC_FOR_BUILD or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
+              test "${crossRustProbeEnv.OLD_ENV or ""}" = "preserved"
+              test "${crossRustProbeEnv.EXTRA_ENV or ""}" = "merged"
+              test "${crossRustProbeCargoArtifactsEnv.CARGO_ARTIFACTS_OLD_ENV or ""}" = "preserved"
+              test "${crossRustProbeCargoArtifactsEnv.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
+              ${
+                if builtins.elem "hello" crossRustProbeNativeInputNames && builtins.elem "coreutils" crossRustProbeNativeInputNames
+                then "true"
+                else "echo 'cross-rust-helper nativeBuildInputs were not preserved and extended'; exit 1"
+              }
+              touch $out
             '';
 
-          platform-map = pkgs.runCommand "crossbow-platform-map" {} ''
-            test "${inputs.self.lib.nixSystemToZigTarget "aarch64-linux"}" = "aarch64-linux-gnu"
-            test "${inputs.self.lib.nixSystemToGnuConfig "aarch64-linux"}" = "aarch64-unknown-linux-gnu"
-            test "${inputs.self.lib.targets.wasm32-wasi.config}" = "wasm32-wasi"
-            test "${inputs.self.lib.cacheModes.strict-cross.name}" = "strict-cross"
-            test "${inputs.self.lib.cacheModes.native-substituted.name}" = "native-substituted"
-            test "${inputs.self.lib.cacheModes.cache-shaped-with-cross-overrides.name}" = "cache-shaped-with-cross-overrides"
-            test "${
-              if inputs.self.lib.buildOptimizationProfiles.cache-first.changesHashes
-              then "1"
-              else "0"
-            }" = "0"
-            test "${
-              if inputs.self.lib.buildOptimizationProfiles.fast-local.changesHashes
-              then "1"
-              else "0"
-            }" = "1"
-            test "${
-              if builtins.elem "-flto=thin" inputs.self.lib.buildOptimizationProfiles.fast-local.cFlags
-              then "1"
-              else "0"
-            }" = "1"
-            test "${
-              if builtins.elem "-fuse-ld=mold" inputs.self.lib.buildOptimizationProfiles.fast-local.linkFlags
-              then "1"
-              else "0"
-            }" = "1"
-            test "${inputs.self.lib.hardwareProfiles.rockpro64.platform.gcc.tune}" = "cortex-a72.cortex-a53"
-            test "${inputs.self.lib.hardwareOptimizationName "rockpro64"}" = "rockpro64"
-            test "${(inputs.self.lib.mkOptimizedHostPlatform {
-              host = "aarch64-linux";
-              hardwareOptimization = "rockpro64";
-            }).gcc.tune}" = "cortex-a72.cortex-a53"
-            test "${
-              (inputs.self.lib.selectOptimizedPkgs {
-                enable = false;
-                inherit pkgs;
-              }).pkgs.stdenv.hostPlatform.system
-            }" = "${pkgs.stdenv.hostPlatform.system}"
-            test "${
-              (inputs.self.lib.selectOptimizedPkgs {
-                enable = true;
-                inherit pkgs;
-                crossbowCrossPkgs = import inputs.nixpkgs {
-                  localSystem = {inherit system;};
-                  crossSystem = {system = "aarch64-linux";};
-                };
-              }).pkgs.stdenv.hostPlatform.system
-            }" = "aarch64-linux"
-            # Go native-cross uses the build-platform toolchain and only takes
-            # the target platform from the cross set.
-            test "${crossGoSelection.pkgs.stdenv.hostPlatform.system}" = "${pkgs.stdenv.hostPlatform.system}"
-            test "${crossGoSelection.pkgs.stdenv.buildPlatform.system}" = "${pkgs.stdenv.hostPlatform.system}"
-            test "${
-              if crossGoSelection.useCrossPkgs
-              then "1"
-              else "0"
-            }" = "0"
-            test "${
-              if crossGoSelection.targetSystem == "aarch64-linux"
-              then "1"
-              else "0"
-            }" = "1"
-            # CGo keeps the cross set (it needs a target C toolchain).
-            test "${
-              if crossGoCgoSelection.useCrossPkgs && crossGoCgoSelection.targetSystem == null
-              then "1"
-              else "0"
-            }" = "1"
-            # Build accelerators resolve through buildPackages, not the target.
-            test "${
-              if
-                (builtins.head (inputs.self.lib.buildOptimizationProfiles.fast-local.nativeBuildInputs crossRustProbeCrossPkgs)).drvPath
-                == crossRustProbeCrossPkgs.buildPackages.mold.drvPath
-              then "1"
-              else "0"
-            }" = "1"
-            # Only meaningful when the probe is a real cross (aarch64-linux hosts are native).
-            test "${
-              if
-                crossRustProbeCrossPkgs.stdenv.buildPlatform.system
-                != crossRustProbeCrossPkgs.stdenv.hostPlatform.system
-                && crossRustProbeCrossPkgs.buildPackages.mold.drvPath
-                == crossRustProbeCrossPkgs.mold.drvPath
-              then "1"
-              else "0"
-            }" = "0"
-            test "${
-              if inputs.self.lib.mkNixosStrictCrossSystem == inputs.self.lib.mkNixosSwitchSystem
-              then "1"
-              else "0"
-            }" = "0"
-            test "${crossPackageProbe.config.crossbowProbe.package.stdenv.buildPlatform.system}" = "${system}"
-            test "${crossPackageProbe.config.crossbowProbe.package.stdenv.hostPlatform.system}" = "${crossPackageProbeHost}"
-            test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/roots
-            test -e ${crossPackageProbe.config.system.build.crossbowRequirements}/drvs
-            test -e ${crossPackageProbeRequirements}/roots
-            test -e ${crossPackageProbeRequirements}/drvs
-            grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel}" ${crossPackageProbeRequirements}/roots >/dev/null
-            grep -Fx "${builtins.unsafeDiscardStringContext crossPackageProbeNative.config.system.build.toplevel.drvPath}" ${crossPackageProbeRequirements}/drvs >/dev/null
-            touch $out
-          '';
+            build-optimization-module = let
+              eval = modules:
+                (pkgs.lib.evalModules {
+                  modules = [inputs.self.nixosModules.build-optimization] ++ modules;
+                }).config.services.crossbow.buildOptimization;
+              defaults = eval [];
+              fastLocal = eval [{services.crossbow.buildOptimization.profile = inputs.self.lib.buildOptimizationProfiles.fast-local;}];
+            in
+              assert !defaults.enable;
+              assert defaults.profile.name == "cache-first";
+              assert defaults.hardwareProfile == null;
+              assert fastLocal.profile.name == "fast-local";
+                pkgs.runCommand "crossbow-build-optimization-module" {} "touch $out";
 
-          cross-rust-helper = pkgs.runCommand "cross-rust-helper" {} ''
-            test "${crossRustProbeEnv.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
-            test "${crossRustProbeEnv.HOST_CC or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
-            test "${crossRustProbeEnv.CC_FOR_BUILD or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
-            test "${crossRustProbeEnv.OLD_ENV or ""}" = "preserved"
-            test "${crossRustProbeEnv.EXTRA_ENV or ""}" = "merged"
-            test "${crossRustProbeCargoArtifactsEnv.CARGO_ARTIFACTS_OLD_ENV or ""}" = "preserved"
-            test "${crossRustProbeCargoArtifactsEnv.CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER or ""}" = "${crossRustProbeCrossPkgs.buildPackages.stdenv.cc}/bin/cc"
-            ${
-              if builtins.elem "hello" crossRustProbeNativeInputNames && builtins.elem "coreutils" crossRustProbeNativeInputNames
-              then "true"
-              else "echo 'cross-rust-helper nativeBuildInputs were not preserved and extended'; exit 1"
-            }
-            touch $out
-          '';
+            tiny-c-aarch64-linux = inputs.self.packages.${system}.tiny-c-aarch64-linux;
 
-          build-optimization-module = let
-            eval = modules:
-              (pkgs.lib.evalModules {
-                modules = [inputs.self.nixosModules.build-optimization] ++ modules;
-              }).config.services.crossbow.buildOptimization;
-            defaults = eval [];
-            fastLocal = eval [{services.crossbow.buildOptimization.profile = inputs.self.lib.buildOptimizationProfiles.fast-local;}];
-          in
-            assert !defaults.enable;
-            assert defaults.profile.name == "cache-first";
-            assert defaults.hardwareProfile == null;
-            assert fastLocal.profile.name == "fast-local";
-              pkgs.runCommand "crossbow-build-optimization-module" {} "touch $out";
-
-          tiny-c-aarch64-linux = inputs.self.packages.${system}.tiny-c-aarch64-linux;
-
-          unsupported-linux-darwin-message = pkgs.runCommand "crossbow-unsupported-linux-darwin-message" {} ''
-            message='${builtins.replaceStrings ["'"] ["'\\''"] (inputs.self.lib.unsupportedToolchainMessage {
-              build = "x86_64-linux";
-              host = "aarch64-darwin";
-            })}'
-            printf '%s' "$message" | grep -F "darwinSdk" >/dev/null
-            touch $out
-          '';
-        };
+            unsupported-linux-darwin-message = pkgs.runCommand "crossbow-unsupported-linux-darwin-message" {} ''
+              message='${builtins.replaceStrings ["'"] ["'\\''"] (inputs.self.lib.unsupportedToolchainMessage {
+                build = "x86_64-linux";
+                host = "aarch64-darwin";
+              })}'
+              printf '%s' "$message" | grep -F "darwinSdk" >/dev/null
+              touch $out
+            '';
+          }
+          // release.checks;
 
         devShells = rec {
           default = pkgs.mkShell {
