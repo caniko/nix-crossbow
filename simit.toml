@@ -9,3 +9,4 @@ with_docs = true
 with_audit = true
 with_deny = true
 packages = ["crossbow-switch"]
+publish_strategy = "members"
