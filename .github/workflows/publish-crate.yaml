@@ -86,6 +86,8 @@ jobs:
 
           git_fetch --force --tags origin "refs/tags/${tag}:refs/tags/${tag}"
           git verify-tag "$tag"
+          signed_tag_name="$(git cat-file tag "refs/tags/$tag" | sed -n '1,/^$/s/^tag //p')"
+          test "$signed_tag_name" = "$tag" || { echo 'Signed tag object name differs from the release label' >&2; exit 1; }
           validated_sha="$(git rev-parse --verify "refs/tags/${tag}^{commit}")"
           checkout_sha="$(git rev-parse --verify HEAD)"
           if [ "$validated_sha" != "$checkout_sha" ]; then
@@ -154,6 +156,8 @@ jobs:
           nix develop -c cargo package --locked --allow-dirty --no-verify -p crossbow-switch --target-dir "$RUNNER_TEMP/simit-package-target"
           mkdir -p "$RUNNER_TEMP/simit-crates/crossbow-switch"
           cp "$RUNNER_TEMP/simit-package-target/package/crossbow-switch-$version.crate" "$RUNNER_TEMP/simit-crates/crossbow-switch/"
+          size="$(wc -c < "$RUNNER_TEMP/simit-crates/crossbow-switch/crossbow-switch-$version.crate")"
+          test "$size" -le 10485760 || { echo "crate crossbow-switch archive is $size bytes, over the crates.io upload limit of 10485760 bytes (10 MiB)" >&2; exit 1; }
       - name: Retain original-run archive crossbow-switch
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
