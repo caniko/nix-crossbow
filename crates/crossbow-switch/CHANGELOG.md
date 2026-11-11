@@ -1,5 +1,12 @@
 # Changelog
 
+## [Unreleased]
+
+## [0.2.1] - 2026-11-11
+
+- Release checksums (`SHA256SUMS.txt`) are now minisign-signed with the
+  public trust root committed at `keys/minisign.pub`.
+
 ## [0.2.0] - 2026-10-31
 
 - `DerivationPlan.cost` (`trivial` | `fetch` | `compile`) classifies each
