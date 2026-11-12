@@ -30,7 +30,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -80,11 +80,6 @@ jobs:
           event_sha="${GITHUB_SHA:-${FORGE_SHA:-${FORGEJO_SHA:-}}}"
           test -n "$event_sha" && test "$validated_sha" = "$event_sha" && test "$checkout_sha" = "$event_sha" || { echo "Signed tag commit does not match the immutable event checkout" >&2; exit 1; }
           git worktree add --detach "$tag_worktree" "$validated_sha"
-          if ! grep -q "^## \[$VERSION\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]" "$tag_worktree/CHANGELOG.md"; then
-            echo "CHANGELOG.md missing section for $VERSION" >&2
-            exit 1
-          fi
-
           IS_PRERELEASE=false
           if printf '%s\n' "$VERSION" | grep -Eq -- '-(rc|beta|alpha)\.[0-9]+$'; then IS_PRERELEASE=true; fi
 
@@ -108,7 +103,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -160,7 +155,7 @@ jobs:
           fetch-depth: 0
           ref: ${{ github.sha }}
           persist-credentials: false
-      - uses: cachix/install-nix-action@ba0dd844c9180cbf77aa72a116d6fbc515d0e87b # v27
+      - uses: cachix/install-nix-action@630ae543ea3a38a9a4166f03376c02c50f408342 # v31
         with:
           extra_nix_config: |
             experimental-features = nix-command flakes
@@ -210,11 +205,6 @@ jobs:
           event_sha="${GITHUB_SHA:-${FORGE_SHA:-${FORGEJO_SHA:-}}}"
           test -n "$event_sha" && test "$validated_sha" = "$event_sha" && test "$checkout_sha" = "$event_sha" || { echo "Signed tag commit does not match the immutable event checkout" >&2; exit 1; }
           git worktree add --detach "$tag_worktree" "$validated_sha"
-          if ! grep -q "^## \[$VERSION\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]" "$tag_worktree/CHANGELOG.md"; then
-            echo "CHANGELOG.md missing section for $VERSION" >&2
-            exit 1
-          fi
-
           IS_PRERELEASE=false
           if printf '%s\n' "$VERSION" | grep -Eq -- '-(rc|beta|alpha)\.[0-9]+$'; then IS_PRERELEASE=true; fi
 
@@ -224,13 +214,25 @@ jobs:
         run: |
           set -euo pipefail
           . ./release-env
-          awk -v version="$VERSION" '
-            $0 ~ "^## \\[" version "\\] - [0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]$" { found = 1; print; next }
-            found && /^## \[/ { exit }
-            found && /^\[[^]]+\]: / { exit }
-            found { print }
-            END { if (!found) exit 1 }
-          ' CHANGELOG.md > release-notes.md
+          {
+            set -euo pipefail
+            git rev-parse --verify "refs/tags/$TAG^{commit}" >/dev/null
+            previous=''
+            best_distance=''
+            while IFS= read -r candidate; do
+              [ "$candidate" != "$TAG" ] || continue
+              case "$candidate" in ''*) suffix="${candidate#''}" ;; *) continue ;; esac
+              printf '%s\n' "$suffix" | grep -Eq '^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\+[0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*)?$' || continue
+              distance=$(git rev-list --count "$candidate..$TAG")
+              [ "$distance" -gt 0 ] || continue
+              if [ -z "$best_distance" ] || [ "$distance" -lt "$best_distance" ]; then
+                previous="$candidate"
+                best_distance="$distance"
+              fi
+            done < <(git for-each-ref --merged "refs/tags/$TAG" --format='%(refname:strip=2)' refs/tags)
+            if [ -n "$previous" ]; then range="$previous..$TAG"; else range="refs/tags/$TAG"; fi
+            git log --reverse --format='- %s (%h)' "$range" --
+          } > release-notes.md
       - name: Check release credentials
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -270,13 +272,14 @@ jobs:
           set -euo pipefail
           mkdir -p release
           count=0
-          while IFS= read -r file; do
-            name="$(basename "$file")"
-            test ! -e "release/$name" || { echo "release artifact collision: $name" >&2; exit 1; }
-            cp "$file" "release/$name"
-            count=$((count + 1))
-          done < <(find .simit-prebuilt -mindepth 2 -type f -print | LC_ALL=C sort)
-          test "$count" -gt 0
+          if [ -d .simit-prebuilt ]; then
+            while IFS= read -r file; do
+              name="$(basename "$file")"
+              test ! -e "release/$name" || { echo "release artifact collision: $name" >&2; exit 1; }
+              cp "$file" "release/$name"
+              count=$((count + 1))
+            done < <(find .simit-prebuilt -mindepth 1 -type f -print | LC_ALL=C sort)
+          fi
       - name: Build release artifacts
         run: |
           set -euo pipefail

@@ -2,6 +2,11 @@
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-11-12
+
+- Release archives: the GitHub release now builds and publishes the signed
+  cargo-binstall archives (the previous tag's release workflow failed).
+
 ## [0.2.1] - 2026-11-11
 
 - Release checksums (`SHA256SUMS.txt`) are now minisign-signed with the
