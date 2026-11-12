@@ -11,6 +11,12 @@ with_deny = true
 packages = ["crossbow-switch"]
 publish_strategy = "members"
 
+[release.notes]
+# The changelog lives at crates/crossbow-switch/CHANGELOG.md; simit's
+# changelog notes source validates a root CHANGELOG.md. Notes come from the
+# commit range instead.
+source = "git"
+
 [release.github]
 repo = "caniko/nix-crossbow"
 target_branch = "trunk"
