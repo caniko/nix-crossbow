@@ -2,7 +2,7 @@
   description = "QEMU-free cross-compilation helpers for Nix flakes";
 
   inputs = {
-    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=7f03d58b0e6e748b4817417ff21958e074ec6faf";
+    harbor-rs.url = "git+https://github.com/caniko/harbor-rs.git?ref=trunk&rev=32ff87a4cbf5eac35e8bfa5bd4fb5ab887eb77fd";
     nixpkgs.follows = "harbor-rs/nixpkgs";
     rust-overlay.follows = "harbor-rs/rust-overlay";
     flake-parts.url = "github:hercules-ci/flake-parts";
