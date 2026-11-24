@@ -2,7 +2,7 @@
 
 ## [Unreleased]
 
-## [0.3.1] - 2026-11-24
+## [0.3.2] - 2026-11-24
 
 - Batch route-hint resolution and accept already resolved toplevels via
   `PlanTarget::ResolvedToplevel` (#14).
