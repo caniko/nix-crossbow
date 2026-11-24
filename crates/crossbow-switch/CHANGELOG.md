@@ -2,13 +2,12 @@
 
 ## [Unreleased]
 
-## [0.3.1] - 2026-11-24
+## [0.3.3] - 2026-11-24
 
-- Batch route-hint resolution and accept already resolved toplevels via
-  `PlanTarget::ResolvedToplevel` (#14).
-- Split planning into `resolve_plan_inputs` and `plan_resolved_closure`; disable
-  import from derivation during root and hint resolution with
-  `--no-allow-import-from-derivation` (#14).
+- Batch route-hint evaluation in `resolve_hint_drvs` (#14).
+- Split planning into `resolve_plan_inputs` and `plan_resolved_closure`.
+  Accept already resolved toplevels via `PlanTarget::ResolvedToplevel` and
+  disable import from derivation during root and hint resolution (#14).
 
 ## [0.2.2] - 2026-11-12
 
