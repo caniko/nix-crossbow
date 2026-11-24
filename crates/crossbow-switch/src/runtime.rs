@@ -1,10 +1,10 @@
 //! Planning and verification of cached runtime references across stores.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+use crate::planner::{PlanNix, SystemNix};
 use crate::{Error, Result};
 
 /// One exact cached runtime path, recorded in dependency-first restore order.
@@ -30,15 +30,22 @@ pub(crate) struct PathInfo {
 type StoreInfo = BTreeMap<String, Option<PathInfo>>;
 
 pub(crate) fn query_store(store: &str, paths: &[String]) -> Result<StoreInfo> {
+    query_store_with(&SystemNix, store, paths)
+}
+
+pub(crate) fn query_store_with(
+    nix: &dyn PlanNix,
+    store: &str,
+    paths: &[String],
+) -> Result<StoreInfo> {
     if paths.is_empty() {
         return Ok(StoreInfo::new());
     }
     // Local metadata comes directly from the daemon; a remote ping separates
     // an unavailable cache from an ordinary per-path miss.
     if store != "daemon" {
-        let ping = Command::new("nix")
-            .args(["store", "ping", "--store", store])
-            .output()
+        let ping = nix
+            .output(&["store", "ping", "--store", store])
             .map_err(|source| Error::PlannerCacheProbe {
                 substituter: store.to_owned(),
                 output: paths.first().cloned().unwrap_or_default(),
@@ -54,18 +61,18 @@ pub(crate) fn query_store(store: &str, paths: &[String]) -> Result<StoreInfo> {
     }
     let mut result = StoreInfo::new();
     for chunk in paths.chunks(1024) {
-        let output = Command::new("nix")
-            .args([
-                "path-info",
-                "--no-allow-import-from-derivation",
-                "--json",
-                "--json-format",
-                "1",
-                "--store",
-                store,
-            ])
-            .args(chunk)
-            .output()
+        let mut args = vec![
+            "path-info",
+            "--no-allow-import-from-derivation",
+            "--json",
+            "--json-format",
+            "1",
+            "--store",
+            store,
+        ];
+        args.extend(chunk.iter().map(String::as_str));
+        let output = nix
+            .output(&args)
             .map_err(|source| Error::PlannerCacheProbe {
                 substituter: store.to_owned(),
                 output: chunk[0].clone(),
@@ -94,11 +101,14 @@ pub(crate) fn query_store(store: &str, paths: &[String]) -> Result<StoreInfo> {
     Ok(result)
 }
 
-pub(crate) fn plan_runtime_paths(
+pub(crate) fn plan_runtime_paths_with(
+    nix: &dyn PlanNix,
     roots: &BTreeMap<String, String>,
     substituters: &[String],
 ) -> Result<Vec<RuntimePath>> {
-    plan_with_probe(roots, substituters, &query_store)
+    plan_with_probe(roots, substituters, &|store, paths| {
+        query_store_with(nix, store, paths)
+    })
 }
 
 fn plan_with_probe(

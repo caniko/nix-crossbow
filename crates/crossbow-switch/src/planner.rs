@@ -1,8 +1,7 @@
 //! Structured planning for cache-shaped Crossbow realizations.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -343,12 +342,12 @@ fn slice_is_empty<T>(value: &&[T]) -> bool {
     value.is_empty()
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct DerivationGraph {
     derivations: BTreeMap<String, DerivationNode>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 struct DerivationNode {
     system: String,
     #[serde(default)]
@@ -393,7 +392,7 @@ impl DerivationNode {
     }
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct DerivationEnv {
     #[serde(default)]
     name: Option<String>,
@@ -405,7 +404,7 @@ struct DerivationEnv {
     allow_substitutes: Option<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct StructuredAttrs {
     #[serde(default)]
     name: Option<String>,
@@ -417,19 +416,19 @@ struct StructuredAttrs {
     allow_substitutes: Option<bool>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct DerivationInputs {
     #[serde(default)]
     drvs: BTreeMap<String, DerivationInput>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct DerivationInput {
     #[serde(default)]
     outputs: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct DerivationOutput {
     #[serde(default)]
     path: Option<String>,
@@ -443,6 +442,53 @@ struct OutputEntry {
     #[serde(rename = "drvPath")]
     drv_path: String,
     outputs: BTreeMap<String, String>,
+}
+
+/// Source of the planner's requested derivation outputs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlanTarget<'a> {
+    /// Resolve a Nix installable without IFD and infer the logical flake installable.
+    Installable(&'a str),
+    /// Resolve an already evaluated store derivation without re-evaluating the flake.
+    /// For a toplevel requiring IFD, evaluate it outside the lease first.
+    ResolvedToplevel {
+        /// Logical flake installable, preserved verbatim.
+        flake_installable: &'a str,
+        /// Logical toplevel installable, preserved verbatim.
+        toplevel_installable: &'a str,
+        /// Absolute store `.drv` path, optionally with a `^` output selector.
+        drv_installable: &'a str,
+    },
+}
+
+/// Store derivations and resolved hints, ready for availability planning.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedPlanInputs {
+    flake_installable: String,
+    toplevel_installable: String,
+    roots: Vec<PlanRoot>,
+    root_graph: DerivationGraph,
+    hint_drvs: BTreeMap<String, RouteHintSpec>,
+}
+
+impl ResolvedPlanInputs {
+    /// Logical flake installable recorded in the plan.
+    #[must_use]
+    pub fn flake_installable(&self) -> &str {
+        &self.flake_installable
+    }
+
+    /// Logical toplevel installable recorded in the plan.
+    #[must_use]
+    pub fn toplevel_installable(&self) -> &str {
+        &self.toplevel_installable
+    }
+
+    /// Concrete derivations and outputs requested by the planner.
+    #[must_use]
+    pub fn roots(&self) -> &[PlanRoot] {
+        &self.roots
+    }
 }
 
 /// Computes a structured plan from Nix's derivation closure.
@@ -501,18 +547,110 @@ pub fn plan_closure_with_hints(
     policy: &RealizationPolicy,
     hints: &[RouteHintSpec],
 ) -> Result<ClosurePlan> {
-    let roots = resolve_roots(attr, substituters, policy)?;
-    let root_args = ["derivation", "show", "--no-pretty", attr]
-        .into_iter()
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
-    let root_graph = parse_graph(&run_nix(&root_args)?)?;
+    // Preserve policy validation before any Nix command.
+    crate::realization_nix_flags(policy)?;
+    let inputs = resolve_plan_inputs(PlanTarget::Installable(attr), hints)?;
+    plan_resolved_closure(inputs, build_system, host_system, substituters, policy)
+}
+
+/// Resolves concrete roots and route hints without probing output availability.
+///
+/// Import from derivation (IFD) is disabled so this phase cannot trigger builds under
+/// an evaluation lease. Resolve IFD-dependent toplevels outside the lease, then
+/// pass the concrete derivation via [`PlanTarget::ResolvedToplevel`]. Use concrete
+/// `.drv` paths for route hints that would otherwise need IFD.
+pub fn resolve_plan_inputs(
+    target: PlanTarget<'_>,
+    hints: &[RouteHintSpec],
+) -> Result<ResolvedPlanInputs> {
+    resolve_plan_inputs_with(&SystemNix, target, hints)
+}
+
+fn resolve_plan_inputs_with(
+    nix: &dyn PlanNix,
+    target: PlanTarget<'_>,
+    hints: &[RouteHintSpec],
+) -> Result<ResolvedPlanInputs> {
+    let (flake_installable, toplevel_installable, roots, root_graph) = match target {
+        PlanTarget::Installable(attr) => {
+            let (roots, graph) = resolve_installable(nix, attr)?;
+            (flake_installable_for_toplevel(attr), attr, roots, graph)
+        }
+        PlanTarget::ResolvedToplevel {
+            flake_installable,
+            toplevel_installable,
+            drv_installable,
+        } => {
+            let (drv, selector) = store_drv(drv_installable).ok_or_else(|| {
+                invalid_root(
+                    drv_installable,
+                    "expected a canonical store .drv with an optional output selector",
+                )
+            })?;
+            let (roots, graph) = resolve_store_root(nix, drv, selector)?;
+            (
+                flake_installable.to_owned(),
+                toplevel_installable,
+                roots,
+                graph,
+            )
+        }
+    };
+    let (root_graph, hint_drvs) = if roots.is_empty() {
+        (DerivationGraph::default(), BTreeMap::new())
+    } else {
+        let hint_drvs = resolve_hint_drvs(nix, hints, &root_graph)?;
+        (root_graph, hint_drvs)
+    };
+    Ok(ResolvedPlanInputs {
+        flake_installable,
+        toplevel_installable: toplevel_installable.to_owned(),
+        roots,
+        root_graph,
+        hint_drvs,
+    })
+}
+
+/// Computes and seals a closure plan using only concrete derivations and store paths.
+pub fn plan_resolved_closure(
+    inputs: ResolvedPlanInputs,
+    build_system: &str,
+    host_system: &str,
+    substituters: &[String],
+    policy: &RealizationPolicy,
+) -> Result<ClosurePlan> {
+    plan_resolved_closure_with(
+        &SystemNix,
+        inputs,
+        build_system,
+        host_system,
+        substituters,
+        policy,
+    )
+}
+
+fn plan_resolved_closure_with(
+    nix: &dyn PlanNix,
+    inputs: ResolvedPlanInputs,
+    build_system: &str,
+    host_system: &str,
+    substituters: &[String],
+    policy: &RealizationPolicy,
+) -> Result<ClosurePlan> {
+    crate::realization_nix_flags(policy)?;
+    let ResolvedPlanInputs {
+        flake_installable,
+        toplevel_installable,
+        roots,
+        root_graph: mut graph,
+        hint_drvs,
+    } = inputs;
     if roots.is_empty() {
         return ClosurePlan {
             schema_version: PLAN_SCHEMA_VERSION,
             plan_id: String::new(),
-            toplevel_installable: attr.to_owned(),
-            flake_installable: flake_installable_for_toplevel(attr),
+            toplevel_installable,
+            flake_installable,
             build_system: build_system.to_owned(),
             host_system: host_system.to_owned(),
             roots,
@@ -523,8 +661,6 @@ pub fn plan_closure_with_hints(
         .seal();
     }
 
-    let hint_drvs = resolve_hint_drvs(hints)?;
-    let mut graph = root_graph;
     let mut required = BTreeMap::<String, BTreeSet<String>>::new();
     for root in &roots {
         required
@@ -544,12 +680,13 @@ pub fn plan_closure_with_hints(
             .cloned()
             .collect::<BTreeSet<_>>();
         if !missing.is_empty() {
-            load_derivations(&mut graph, &missing)?;
+            load_derivations(nix, &mut graph, &missing)?;
         }
 
         let unresolved = unresolved_outputs(&required, &output_paths);
         if !unresolved.is_empty() {
             output_paths.extend(resolve_output_paths(
+                nix,
                 &graph,
                 &unresolved,
                 substituters,
@@ -578,7 +715,7 @@ pub fn plan_closure_with_hints(
             .cloned()
             .collect::<Vec<_>>();
         if !outputs_to_probe.is_empty() {
-            availability.extend(probe_outputs(substituters, &outputs_to_probe)?);
+            availability.extend(probe_outputs(nix, substituters, &outputs_to_probe)?);
         }
 
         if !expand_frontier(
@@ -624,10 +761,8 @@ pub fn plan_closure_with_hints(
                         })
                 };
                 let route = select_route(
-                    &key,
                     &probe,
-                    hints,
-                    &hint_drvs,
+                    hint_drvs.get(&key),
                     &system,
                     build_system,
                     host_system,
@@ -710,13 +845,13 @@ pub fn plan_closure_with_hints(
             _ => None,
         })
         .collect();
-    let runtime_paths = crate::runtime::plan_runtime_paths(&runtime_roots, substituters)?;
+    let runtime_paths = crate::runtime::plan_runtime_paths_with(nix, &runtime_roots, substituters)?;
 
     ClosurePlan {
         schema_version: PLAN_SCHEMA_VERSION,
         plan_id: String::new(),
-        toplevel_installable: attr.to_owned(),
-        flake_installable: flake_installable_for_toplevel(attr),
+        toplevel_installable,
+        flake_installable,
         build_system: build_system.to_owned(),
         host_system: host_system.to_owned(),
         roots,
@@ -739,14 +874,240 @@ fn flake_installable_for_toplevel(toplevel: &str) -> String {
         })
 }
 
-fn resolve_roots(
-    attr: &str,
-    substituters: &[String],
-    policy: &RealizationPolicy,
-) -> Result<Vec<PlanRoot>> {
-    let args = dry_run_args(&[attr.to_owned()], substituters, policy)?;
-    let output = run_command_silent("nix", &args, format!("nix build --dry-run --json {attr}"))?;
-    parse_roots(&output)
+const RESOLUTION_FLAGS: &[&str] = &[
+    "--no-write-lock-file",
+    "--no-allow-import-from-derivation",
+    "--option",
+    "substitute",
+    "false",
+    "--option",
+    "substituters",
+    "",
+];
+
+fn show_derivations(nix: &dyn PlanNix, installables: &[&str]) -> Result<DerivationGraph> {
+    let mut args = vec!["derivation", "show", "--no-pretty"];
+    args.extend_from_slice(RESOLUTION_FLAGS);
+    args.push("--");
+    args.extend_from_slice(installables);
+    parse_graph(&run_nix(
+        nix,
+        &args,
+        format!("nix derivation show {}", installables.join(" ")),
+    )?)
+}
+
+fn eval_projection(nix: &dyn PlanNix, installable: &str, projection: &str) -> Result<String> {
+    let mut args = vec!["eval", "--json"];
+    args.extend_from_slice(RESOLUTION_FLAGS);
+    args.extend(["--apply", projection, "--", installable]);
+    run_nix(nix, &args, format!("nix eval {installable}"))
+}
+
+fn identifier(value: &str) -> bool {
+    let mut bytes = value.bytes();
+    bytes
+        .next()
+        .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+        && bytes.all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn split_selector(installable: &str) -> Option<(&str, Option<&str>)> {
+    match installable.rsplit_once('^') {
+        None => Some((installable, None)),
+        Some((base, selector)) if selector == "*" || selector.split(',').all(identifier) => {
+            Some((base, Some(selector)))
+        }
+        Some(_) => None,
+    }
+}
+
+fn store_name(name: &str) -> bool {
+    !matches!(name, "" | "." | "..")
+        && name.len() <= 211
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+-._?=".contains(&b))
+}
+
+fn store_drv(installable: &str) -> Option<(&str, Option<&str>)> {
+    let (bare, selector) = split_selector(installable)?;
+    let (hash, name) = bare.strip_prefix("/nix/store/")?.split_once('-')?;
+    let stem = name.strip_suffix(".drv")?;
+    (hash.len() == 32
+        && hash
+            .bytes()
+            .all(|b| b"0123456789abcdfghijklmnpqrsvwxyz".contains(&b))
+        && !stem.is_empty()
+        && store_name(name))
+    .then_some((bare, selector))
+}
+
+fn invalid_root(installable: &str, reason: &str) -> Error {
+    Error::PlannerCommandFailed {
+        command: format!(
+            "resolve planner root {}",
+            crate::redact_identifier(installable)
+        ),
+        stderr: reason.to_owned(),
+    }
+}
+
+// Keep these guards shared: the hint fast path must not bind anything native
+// installable resolution would reject due to malformed output metadata.
+const OUTPUT_METADATA: &str = r#"
+  plain = s: builtins.isString s && !builtins.hasContext s;
+  validMeta = d:
+    if d ? outputSpecified then
+      builtins.isBool d.outputSpecified
+      && (!(d.outputSpecified && d ? outputName) || plain d.outputName)
+    else
+      builtins.isAttrs (d.meta or {})
+      && builtins.isInt (d.meta.priority or 0)
+      && builtins.isList (d.meta.outputsToInstall or [])
+      && builtins.all plain (d.meta.outputsToInstall or []);
+  isDrv = d: builtins.isAttrs d && (d.type or null) == "derivation";
+"#;
+
+const ROOT_PROJECTION: &str = r#"
+  if isDrv d then
+    if !builtins.isString d.drvPath then throw "expected a derivation path"
+    else {
+      drvPath = d.drvPath;
+      outputs =
+        if explicit then []
+        else if !validMeta d then throw "invalid derivation output metadata"
+        else if d ? outputSpecified then
+          if d.outputSpecified && d ? outputName then [ d.outputName ] else [ "out" ]
+        else let names = d.meta.outputsToInstall or [];
+        in if names == [] then [ "out" ] else names;
+      fromString = false;
+    }
+  else if builtins.isString d then
+    let
+      context = builtins.getContext d;
+      paths = builtins.attrNames context;
+      path = builtins.head paths;
+      entry = context.${path};
+      outputs = entry.outputs or [];
+    in if builtins.length paths == 1 && builtins.length outputs == 1
+          && !(entry.path or false) && !(entry.allOutputs or false)
+       then { drvPath = path; inherit outputs; fromString = true; }
+       else throw "expected a string with exactly one built derivation output"
+  else throw "expected a derivation or a string referencing a built derivation output"
+"#;
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RootProjection {
+    drv_path: String,
+    outputs: Vec<String>,
+    from_string: bool,
+}
+
+fn resolve_installable(nix: &dyn PlanNix, attr: &str) -> Result<(Vec<PlanRoot>, DerivationGraph)> {
+    if let Some((drv, Some(selector))) = store_drv(attr) {
+        return resolve_store_root(nix, drv, Some(selector));
+    }
+    if attr.starts_with("/nix/store/") && !attr.contains('#') {
+        // Native lookup retains the old diagnostics for invalid/nonexistent
+        // opaque installables. A bare store path requests the path itself,
+        // not the outputs of its derivation.
+        let graph = show_derivations(nix, &[attr])?;
+        if graph.derivations.is_empty() {
+            return Ok((Vec::new(), graph));
+        }
+        return Err(invalid_root(
+            attr,
+            "an opaque store path does not select derivation outputs; specify ^out or another output",
+        ));
+    }
+    let (_, selector) =
+        split_selector(attr).ok_or_else(|| invalid_root(attr, "invalid output selector"))?;
+    let expr = format!(
+        "d: let {OUTPUT_METADATA} explicit = {}; in {ROOT_PROJECTION}",
+        selector.is_some()
+    );
+    // Let Nix parse the full installable: removing the selector can make a
+    // caret inside a quoted attribute look like an output separator.
+    let output = eval_projection(nix, attr, &expr)?;
+    let projected: RootProjection =
+        serde_json::from_str(&output).map_err(|source| Error::PlannerJson { source })?;
+    let Some((drv, None)) = store_drv(&projected.drv_path) else {
+        return Err(invalid_root(
+            attr,
+            "evaluation did not return a canonical store .drv",
+        ));
+    };
+    if projected.from_string {
+        let native = show_derivations(nix, &[attr])?;
+        if !native.derivations.contains_key(&derivation_key(drv)) {
+            return Err(Error::PlannerMissingDerivation {
+                drv: drv.to_owned(),
+            });
+        }
+    }
+    if selector.is_some() && !projected.from_string {
+        return resolve_store_root(nix, drv, selector);
+    }
+    let graph = show_derivations(nix, &[drv])?;
+    let root = checked_root(&graph, drv, projected.outputs.into_iter().collect())?;
+    Ok((vec![root], graph))
+}
+
+fn resolve_store_root(
+    nix: &dyn PlanNix,
+    drv: &str,
+    selector: Option<&str>,
+) -> Result<(Vec<PlanRoot>, DerivationGraph)> {
+    let graph = show_derivations(nix, &[drv])?;
+    let root = selected_store_root(&graph, drv, selector)?;
+    Ok((vec![root], graph))
+}
+
+fn selected_store_root(
+    graph: &DerivationGraph,
+    drv: &str,
+    selector: Option<&str>,
+) -> Result<PlanRoot> {
+    let node = root_node(graph, drv)?;
+    let outputs = match selector {
+        Some("*") => node.outputs.keys().cloned().collect(),
+        Some(names) => names.split(',').map(str::to_owned).collect(),
+        None if node.outputs.len() == 1 => node.outputs.keys().cloned().collect(),
+        None => {
+            return Err(invalid_root(
+                drv,
+                "a bare .drv must declare exactly one output; specify ^* or named outputs",
+            ));
+        }
+    };
+    checked_root(graph, drv, outputs)
+}
+
+fn root_node<'a>(graph: &'a DerivationGraph, drv: &str) -> Result<&'a DerivationNode> {
+    graph
+        .derivations
+        .get(&derivation_key(drv))
+        .ok_or_else(|| Error::PlannerMissingDerivation {
+            drv: drv.to_owned(),
+        })
+}
+
+fn checked_root(graph: &DerivationGraph, drv: &str, outputs: BTreeSet<String>) -> Result<PlanRoot> {
+    let node = root_node(graph, drv)?;
+    for output in &outputs {
+        if !node.outputs.contains_key(output) {
+            return Err(Error::PlannerMissingOutput {
+                drv: drv.to_owned(),
+                output: output.clone(),
+            });
+        }
+    }
+    Ok(PlanRoot {
+        drv: drv.to_owned(),
+        outputs: outputs.into_iter().collect(),
+    })
 }
 
 fn unresolved_outputs(
@@ -760,6 +1121,7 @@ fn unresolved_outputs(
         .collect()
 }
 
+#[cfg(test)]
 fn parse_roots(output: &str) -> Result<Vec<PlanRoot>> {
     let entries: Vec<OutputEntry> =
         serde_json::from_str(output).map_err(|source| Error::PlannerJson { source })?;
@@ -878,20 +1240,199 @@ fn dependency_first(mut plans: Vec<DerivationPlan>, roots: &[PlanRoot]) -> Vec<D
 ///
 /// Hints bind to derivation store paths, not attribute names, so a hint always
 /// targets the same derivation regardless of how the frozen flake is reached.
-fn resolve_hint_drvs(hints: &[RouteHintSpec]) -> Result<BTreeMap<String, RouteHintSpec>> {
-    let mut resolved = BTreeMap::new();
-    for hint in hints {
-        let args = ["derivation", "show", "--no-pretty", &hint.installable]
+fn simple_flake_hint(installable: &str) -> Option<(&str, bool, Vec<&str>)> {
+    let (source, fragment) = installable.split_once('#')?;
+    if source.is_empty() {
+        return None;
+    }
+    let (fragment, _) = split_selector(fragment)?;
+    let absolute = fragment.starts_with('.');
+    let path = fragment.strip_prefix('.').unwrap_or(fragment);
+    path.split('.')
+        .all(identifier)
+        .then(|| (source, absolute, path.split('.').collect()))
+}
+
+fn encode_hint_paths(paths: &[Vec<&str>]) -> String {
+    let mut candidate = String::from("[ ");
+    for path in paths {
+        candidate.push_str("[ ");
+        for segment in path {
+            debug_assert!(identifier(segment));
+            candidate.push('"');
+            candidate.push_str(segment);
+            candidate.push_str("\" ");
+        }
+        candidate.push_str("] ");
+    }
+    candidate.push_str("] ");
+    candidate
+}
+
+// Leave room below Linux's 128 KiB per-argument limit, including the NUL.
+const HINT_PROJECTION_MAX_BYTES: usize = 64 * 1024;
+
+fn hint_projection(candidates: &str) -> String {
+    format!(
+        r#"
+      outputs: let
+        {OUTPUT_METADATA}
+        lookup = c: name:
+          if c.hit && builtins.isAttrs c.v && builtins.hasAttr name c.v
+          then {{ hit = true; v = builtins.getAttr name c.v; }}
+          else {{ hit = false; }};
+        resolve = paths: let
+          firstHit = rest:
+            if rest == [] then null else
+            let c = builtins.foldl' lookup {{ hit = true; v = outputs; }} (builtins.head rest);
+                d = c.v;
+            in if !c.hit then firstHit (builtins.tail rest)
+               else if isDrv d && validMeta d && builtins.isString (d.drvPath or null)
+               then d.drvPath else null;
+          attempt = builtins.tryEval (firstHit paths);
+        in if attempt.success then attempt.value else null;
+      in builtins.map resolve [ {candidates} ]
+    "#
+    )
+}
+
+fn resolve_hint_drvs(
+    nix: &dyn PlanNix,
+    hints: &[RouteHintSpec],
+    root_graph: &DerivationGraph,
+) -> Result<BTreeMap<String, RouteHintSpec>> {
+    let mut slots = vec![None; hints.len()];
+    let mut groups = BTreeMap::<_, Vec<_>>::new();
+    let mut needs_system = false;
+    for (index, hint) in hints.iter().enumerate() {
+        if let Some((drv, selector)) = store_drv(&hint.installable) {
+            let key = derivation_key(drv);
+            if selector.is_none_or(|selector| {
+                root_graph.derivations.get(&key).is_some_and(|node| {
+                    selector == "*"
+                        || selector
+                            .split(',')
+                            .all(|name| node.outputs.contains_key(name))
+                })
+            }) {
+                slots[index] = Some(key);
+            }
+        } else if let Some((source, absolute, path)) = simple_flake_hint(&hint.installable) {
+            needs_system |= !absolute;
+            groups
+                .entry(source)
+                .or_default()
+                .push((index, absolute, path));
+        }
+    }
+    // `nix config show` accepts no flake lock flags and does not evaluate Nix.
+    let system = needs_system
+        .then(|| {
+            run_nix(
+                nix,
+                &["config", "show", "system"],
+                "nix config show system".to_owned(),
+            )
+            .ok()
+        })
+        .flatten();
+    let system = system
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| identifier(value));
+    let candidate_budget = HINT_PROJECTION_MAX_BYTES - hint_projection("").len();
+    for (source, group) in groups {
+        let installable = format!("{source}#.");
+        let mut group = group
             .into_iter()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        let graph = parse_graph(&run_nix(&args)?)?;
-        let Some(key) = graph.derivations.keys().next() else {
-            return Err(Error::PlannerMissingDerivation {
-                drv: hint.installable.clone(),
-            });
+            .filter_map(|(index, absolute, path)| {
+                let paths = if absolute {
+                    vec![path]
+                } else {
+                    let system = system?;
+                    let prefixed = |prefix| {
+                        [prefix, system]
+                            .into_iter()
+                            .chain(path.iter().copied())
+                            .collect()
+                    };
+                    vec![prefixed("packages"), prefixed("legacyPackages"), path]
+                };
+                let candidate = encode_hint_paths(&paths);
+                // Replay an individually oversized entry with native lookup.
+                (candidate.len() <= candidate_budget).then_some((index, candidate))
+            })
+            .peekable();
+        while let Some((index, mut candidates)) = group.next() {
+            let mut indices = vec![index];
+            while let Some((index, next)) =
+                group.next_if(|(_, next)| candidates.len() + next.len() <= candidate_budget)
+            {
+                indices.push(index);
+                candidates.push_str(&next);
+            }
+            let Ok(output) = eval_projection(nix, &installable, &hint_projection(&candidates))
+            else {
+                continue;
+            };
+            let Ok(paths) = serde_json::from_str::<Vec<Option<String>>>(&output) else {
+                continue;
+            };
+            if paths.len() != indices.len() {
+                continue;
+            }
+            for (index, path) in indices.into_iter().zip(paths) {
+                if let Some((drv, None)) = path.as_deref().and_then(store_drv) {
+                    slots[index] = Some(derivation_key(drv));
+                }
+            }
+        }
+    }
+
+    let candidates = slots
+        .iter()
+        .flatten()
+        .filter(|key| !root_graph.derivations.contains_key(*key))
+        .map(|key| store_path(key))
+        .collect::<BTreeSet<_>>();
+    let mut verified = BTreeSet::new();
+    for chunk in candidates
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .chunks(256)
+    {
+        if let Ok(graph) = show_derivations(nix, chunk) {
+            verified.extend(
+                chunk
+                    .iter()
+                    .map(|drv| derivation_key(drv))
+                    .filter(|key| graph.derivations.contains_key(key)),
+            );
+        }
+    }
+    let mut resolved = BTreeMap::new();
+    for (slot, hint) in slots.into_iter().zip(hints) {
+        let key = match slot
+            .filter(|key| root_graph.derivations.contains_key(key) || verified.contains(key))
+        {
+            Some(key) => key,
+            None => {
+                let graph = show_derivations(nix, &[&hint.installable])?;
+                if let Some((drv, Some(selector))) = store_drv(&hint.installable) {
+                    // `derivation show` can succeed even for an absent output.
+                    selected_store_root(&graph, drv, Some(selector))?;
+                    derivation_key(drv)
+                } else {
+                    graph.derivations.into_keys().next().ok_or_else(|| {
+                        Error::PlannerMissingDerivation {
+                            drv: hint.installable.clone(),
+                        }
+                    })?
+                }
+            }
         };
-        resolved.insert(derivation_key(key), hint.clone());
+        resolved.insert(key, hint.clone());
     }
     Ok(resolved)
 }
@@ -961,18 +1502,14 @@ fn derive_probe_result(
 }
 
 /// Chooses the realization route for one frontier derivation.
-#[allow(clippy::too_many_arguments)]
 fn select_route(
-    key: &str,
     probe: &ProbeResult,
-    hints: &[RouteHintSpec],
-    hint_drvs: &BTreeMap<String, RouteHintSpec>,
+    hint: Option<&RouteHintSpec>,
     system: &str,
     build_system: &str,
     host_system: &str,
     policy: &RealizationPolicy,
 ) -> RealizationRoute {
-    let hint = hint_drvs.get(key);
     if system == "builtin" {
         return RealizationRoute::BuildLocal;
     }
@@ -987,7 +1524,7 @@ fn select_route(
         },
         ProbeResult::Missing => {
             if let Some(hint) = hint {
-                return route_for_hint(hint, hints, system, build_system, policy);
+                return route_for_hint(hint, system, build_system, policy);
             }
             if system == build_system {
                 return RealizationRoute::BuildLocal;
@@ -1014,7 +1551,6 @@ fn select_route(
 
 fn route_for_hint(
     hint: &RouteHintSpec,
-    _hints: &[RouteHintSpec],
     system: &str,
     build_system: &str,
     policy: &RealizationPolicy,
@@ -1056,7 +1592,7 @@ fn route_for_miss(
     policy: &RealizationPolicy,
 ) -> RealizationRoute {
     match hint {
-        Some(hint) => route_for_hint(hint, &[], system, build_system, policy),
+        Some(hint) => route_for_hint(hint, system, build_system, policy),
         None => {
             if system == build_system {
                 RealizationRoute::BuildLocal
@@ -1155,19 +1691,17 @@ fn parse_graph(value: &str) -> Result<DerivationGraph> {
     })
 }
 
-fn load_derivations(graph: &mut DerivationGraph, keys: &BTreeSet<String>) -> Result<()> {
+fn load_derivations(
+    nix: &dyn PlanNix,
+    graph: &mut DerivationGraph,
+    keys: &BTreeSet<String>,
+) -> Result<()> {
     for chunk in keys.iter().collect::<Vec<_>>().chunks(256) {
-        let mut args = vec![
-            "derivation".to_owned(),
-            "show".to_owned(),
-            "--no-pretty".to_owned(),
-        ];
-        args.extend(chunk.iter().map(|path| store_path(path)));
-        let batch = parse_graph(&run_command(
-            "nix",
-            &args,
-            format!("nix derivation show batch-count={}", chunk.len()),
-        )?)?;
+        let paths = chunk
+            .iter()
+            .map(|path| store_path(path))
+            .collect::<Vec<_>>();
+        let batch = show_derivations(nix, &paths.iter().map(String::as_str).collect::<Vec<_>>())?;
         for key in chunk {
             if !batch.derivations.contains_key(*key) {
                 return Err(Error::PlannerMissingDerivation {
@@ -1193,6 +1727,7 @@ fn store_path(path: &str) -> String {
 }
 
 fn resolve_output_paths(
+    nix: &dyn PlanNix,
     graph: &DerivationGraph,
     outputs: &BTreeSet<(String, String)>,
     substituters: &[String],
@@ -1232,9 +1767,9 @@ fn resolve_output_paths(
             .map(|(_, _, spec)| spec.clone())
             .collect::<Vec<_>>();
         let args = dry_run_args(&specs, substituters, policy)?;
-        let output = run_command_silent(
-            "nix",
-            &args,
+        let output = run_nix(
+            nix,
+            &args.iter().map(String::as_str).collect::<Vec<_>>(),
             format!("nix build --dry-run --json output-count={}", chunk.len()),
         )?;
         let entries: Vec<OutputEntry> =
@@ -1285,58 +1820,32 @@ fn planner_realization_flags(
     Ok(flags)
 }
 
-fn run_nix(args: &[String]) -> Result<String> {
-    run_command("nix", args, format!("nix {}", args.join(" ")))
+pub(super) trait PlanNix: Sync {
+    fn output(&self, args: &[&str]) -> std::io::Result<Output>;
 }
 
-fn run_command(program: &str, args: &[String], command: String) -> Result<String> {
-    run_command_with_stderr(program, args, command, Stdio::inherit())
+pub(super) struct SystemNix;
+
+impl PlanNix for SystemNix {
+    fn output(&self, args: &[&str]) -> std::io::Result<Output> {
+        Command::new("nix").args(args).output()
+    }
 }
 
-fn run_command_silent(program: &str, args: &[String], command: String) -> Result<String> {
-    run_command_with_stderr(program, args, command, Stdio::null())
-}
-
-fn run_command_with_stderr(
-    program: &str,
-    args: &[String],
-    command: String,
-    stderr: Stdio,
-) -> Result<String> {
+fn run_nix(nix: &dyn PlanNix, args: &[&str], command: String) -> Result<String> {
+    let command = crate::redact_identifier(&command);
     eprintln!("crossbow: stage=plan command={command}");
-    let mut child = Command::new(program)
-        .args(args)
-        .stdout(Stdio::piped())
-        .stderr(stderr)
-        .spawn()
-        .map_err(|source| Error::PlannerCommand {
-            command: command.clone(),
-            source,
-        })?;
-    let mut stdout = Vec::new();
-    child
-        .stdout
-        .take()
-        .ok_or_else(|| Error::PlannerCommandFailed {
-            command: command.clone(),
-            stderr: "planner stdout was not captured".to_owned(),
-        })?
-        .read_to_end(&mut stdout)
-        .map_err(|source| Error::PlannerCommandFailed {
-            command: command.clone(),
-            stderr: format!("failed to read planner output: {source}"),
-        })?;
-    let status = child.wait().map_err(|source| Error::PlannerCommand {
+    let output = nix.output(args).map_err(|source| Error::PlannerCommand {
         command: command.clone(),
         source,
     })?;
-    if !status.success() {
+    if !output.status.success() {
         return Err(Error::PlannerCommandFailed {
             command,
-            stderr: "planner command failed".to_owned(),
+            stderr: crate::redact_diagnostic(String::from_utf8_lossy(&output.stderr).trim()),
         });
     }
-    String::from_utf8(stdout).map_err(|source| Error::PlannerUtf8 { command, source })
+    String::from_utf8(output.stdout).map_err(|source| Error::PlannerUtf8 { command, source })
 }
 
 /// Probes every requested output against the substituters, in parallel.
@@ -1348,6 +1857,7 @@ fn run_command_with_stderr(
 /// results: the errored store cannot be ruled out as a source, so its outputs
 /// must not be treated as cache misses.
 fn probe_outputs(
+    nix: &dyn PlanNix,
     substituters: &[String],
     outputs: &[String],
 ) -> Result<BTreeMap<String, ProbeResult>> {
@@ -1358,7 +1868,7 @@ fn probe_outputs(
         return Ok(BTreeMap::new());
     }
 
-    let local = probe_substituter_outputs("daemon", outputs);
+    let local = probe_substituter_outputs(nix, "daemon", outputs);
     let mut availability = BTreeMap::new();
     let pending = match &local {
         Ok(probed) => outputs
@@ -1393,7 +1903,7 @@ fn probe_outputs(
             let own = pending.clone();
             handles.push((
                 substituter.clone(),
-                scope.spawn(move || probe_substituter_outputs(&store, &own)),
+                scope.spawn(move || probe_substituter_outputs(nix, &store, &own)),
             ));
         }
         for (substituter, handle) in handles {
@@ -1521,10 +2031,11 @@ fn merge_store_probe_results(
 
 /// Queries one substituter for every output path, in bounded batches.
 fn probe_substituter_outputs(
+    nix: &dyn PlanNix,
     substituter: &str,
     outputs: &[String],
 ) -> Result<BTreeMap<String, bool>> {
-    Ok(crate::runtime::query_store(substituter, outputs)?
+    Ok(crate::runtime::query_store_with(nix, substituter, outputs)?
         .into_iter()
         .map(|(path, info)| (path, info.is_some()))
         .collect())
@@ -1534,6 +2045,506 @@ fn probe_substituter_outputs(
 mod tests {
     use super::*;
     use serde_json::Value;
+    use std::os::unix::process::ExitStatusExt;
+    use std::sync::Mutex;
+
+    const ROOT: &str = "/nix/store/00000000000000000000000000000000-root.drv";
+    const CHILD: &str = "/nix/store/11111111111111111111111111111111-child.drv";
+    const MISSING: &str = "/nix/store/22222222222222222222222222222222-missing.drv";
+    const OUT: &str = "/nix/store/33333333333333333333333333333333-root";
+
+    impl<F: Fn(&[&str]) -> Output + Sync> PlanNix for F {
+        fn output(&self, args: &[&str]) -> std::io::Result<Output> {
+            Ok(self(args))
+        }
+    }
+
+    fn reply(code: i32, stdout: Value) -> Output {
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: serde_json::to_vec(&stdout).unwrap(),
+            stderr: b"test failure".to_vec(),
+        }
+    }
+
+    fn graph(paths: &[&str]) -> Value {
+        serde_json::json!({
+            "derivations": paths.iter().map(|path| {
+                    (path.to_string(), serde_json::json!({
+                    "system": "x86_64-linux",
+                    "outputs": { "out": { "path": OUT } }
+                }))
+            }).collect::<serde_json::Map<_,_>>()
+        })
+    }
+
+    fn hint(installable: &str) -> RouteHintSpec {
+        RouteHintSpec {
+            label: installable.to_owned(),
+            installable: installable.to_owned(),
+            on_miss: MissRoute::BuildLocal,
+            origin: None,
+            skip_probe: false,
+        }
+    }
+
+    fn positionals<'a>(args: &[&'a str]) -> &'a str {
+        assert!(!args.contains(&"--no-update-lock-file"));
+        assert!(
+            args.windows(RESOLUTION_FLAGS.len())
+                .any(|w| w == RESOLUTION_FLAGS)
+        );
+        args.last().copied().unwrap()
+    }
+
+    #[test]
+    fn hints_batch_by_source_validate_store_paths_and_apply_in_input_order() {
+        let seen = Mutex::new(Vec::new());
+        let complex = r#"path:a#"quoted.attr""#;
+        let root_selected = format!("{ROOT}^out");
+        let nix = |args: &[&str]| {
+            if args == ["config", "show", "system"] {
+                seen.lock().unwrap().push("system".to_owned());
+                return Output {
+                    stdout: b"x86_64-linux\n".to_vec(),
+                    ..reply(0, Value::Null)
+                };
+            }
+            let target = positionals(args);
+            seen.lock().unwrap().push(target.to_owned());
+            match (args[0], target) {
+                ("eval", "path:a#.") => {
+                    let expr = args[args.iter().position(|arg| *arg == "--apply").unwrap() + 1];
+                    assert!(expr.contains(r#"[ [ "absolute" ] ]"#));
+                    if expr.contains(r#""nested""#) {
+                        assert!(expr.contains(r#"[ "packages" "x86_64-linux" "packages" "nested" ] [ "legacyPackages" "x86_64-linux" "packages" "nested" ] [ "packages" "nested" ]"#));
+                        reply(0, serde_json::json!([ROOT, CHILD]))
+                    } else {
+                        reply(0, serde_json::json!([CHILD]))
+                    }
+                }
+                ("eval", "path:b#.") => reply(0, serde_json::json!([ROOT])),
+                ("derivation", CHILD | MISSING) if args.ends_with(&[CHILD, MISSING]) => {
+                    // A successful but incomplete batch validates only CHILD.
+                    reply(0, graph(&[CHILD]))
+                }
+                ("derivation", CHILD) => reply(0, graph(&[CHILD])),
+                ("derivation", MISSING) => reply(0, graph(&[])),
+                ("derivation", path) if path == complex => reply(0, graph(&[CHILD, ROOT])),
+                _ => panic!("unexpected Nix invocation: {args:?}"),
+            }
+        };
+        let root_graph = parse_graph(&graph(&[ROOT]).to_string()).unwrap();
+        let ordered = [
+            "path:b#first",
+            "path:a#packages.nested",
+            ROOT,
+            complex,
+            "path:a#.absolute",
+            &root_selected,
+        ];
+        let resolved = resolve_hint_drvs(&nix, &ordered.map(hint), &root_graph).unwrap();
+        assert_eq!(resolved[&derivation_key(ROOT)].label, root_selected);
+        assert_eq!(resolved[&derivation_key(CHILD)].label, "path:a#.absolute");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["system", "path:a#.", "path:b#.", CHILD, complex]
+        );
+
+        assert!(matches!(
+            resolve_hint_drvs(&nix, &[hint("path:a#.absolute"), hint(MISSING)], &root_graph),
+            Err(Error::PlannerMissingDerivation { drv }) if drv == MISSING
+        ));
+    }
+
+    #[test]
+    fn literal_hint_replays_invalid_selectors_without_overwriting_a_valid_hint() {
+        let root_graph = parse_graph(&graph(&[ROOT]).to_string()).unwrap();
+        for selector in [".-bad", "missing"] {
+            let invalid = format!("{ROOT}^{selector}");
+            let nix = |args: &[&str]| {
+                assert_eq!(&args[..2], ["derivation", "show"]);
+                assert_eq!(positionals(args), invalid);
+                if selector == "missing" {
+                    // Nix can show the drv even when the requested output does not exist.
+                    reply(0, graph(&[ROOT]))
+                } else {
+                    reply(1, Value::Null)
+                }
+            };
+            assert!(resolve_hint_drvs(&nix, &[hint(ROOT), hint(&invalid)], &root_graph).is_err());
+        }
+    }
+
+    #[test]
+    fn large_hint_group_batches_by_encoded_size_and_keeps_input_order() {
+        let hints = (0..600)
+            .map(|i| hint(&format!("path:a#.item{i}_{}", "x".repeat(240))))
+            .collect::<Vec<_>>();
+        let seen = Mutex::new(0);
+        let calls = Mutex::new(0);
+        let nix = |args: &[&str]| {
+            assert_eq!(args[0], "eval", "unexpected native replay: {args:?}");
+            assert_eq!(positionals(args), "path:a#.");
+            let expr = args[args.iter().position(|arg| *arg == "--apply").unwrap() + 1];
+            assert!(expr.len() <= 64 * 1024, "oversized --apply: {}", expr.len());
+            let mut seen = seen.lock().unwrap();
+            let mut paths = Vec::new();
+            for segment in expr.split('"').filter(|s| s.starts_with("item")) {
+                assert_eq!(format!("path:a#.{segment}"), hints[*seen].installable);
+                *seen += 1;
+                paths.push(ROOT);
+            }
+            assert!(paths.len() > 1, "expected a batch, not single-hint eval");
+            *calls.lock().unwrap() += 1;
+            reply(0, serde_json::json!(paths))
+        };
+        let root_graph = parse_graph(&graph(&[ROOT]).to_string()).unwrap();
+        let resolved = resolve_hint_drvs(&nix, &hints, &root_graph).unwrap();
+        assert_eq!(resolved[&derivation_key(ROOT)], *hints.last().unwrap());
+        assert_eq!(seen.into_inner().unwrap(), hints.len());
+        assert!(calls.into_inner().unwrap() > 1);
+    }
+
+    #[test]
+    fn speculative_failures_replay_the_original_installables_in_order() {
+        let seen = Mutex::new(Vec::new());
+        let first = "path:z#.first";
+        let malformed = "path:a#.bad^out,";
+        let second = "path:a#.second";
+        let nix = |args: &[&str]| {
+            let target = positionals(args);
+            seen.lock().unwrap().push(target.to_owned());
+            match (args[0], target) {
+                ("eval", "path:z#.") => reply(1, Value::Null),
+                ("eval", "path:a#.") => reply(0, serde_json::json!([ROOT, ROOT])),
+                ("derivation", path) if path == first => reply(0, graph(&[ROOT])),
+                ("derivation", path) if path == malformed => reply(1, Value::Null),
+                _ => panic!("unexpected Nix invocation: {args:?}"),
+            }
+        };
+        assert!(matches!(
+            resolve_hint_drvs(&nix, &[first, malformed, second].map(hint), &DerivationGraph::default()),
+            Err(Error::PlannerCommandFailed { command, .. }) if command.ends_with(malformed)
+        ));
+        assert_eq!(
+            *seen.lock().unwrap(),
+            ["path:a#.", "path:z#.", first, malformed]
+        );
+    }
+
+    #[test]
+    fn resolution_and_availability_use_disjoint_nix_operations() {
+        let flake = "path:never-evaluated#.logical identity";
+        let toplevel = "path:never-evaluated#.opaque identity";
+        let resolve = |args: &[&str]| {
+            assert_eq!(&args[..3], ["derivation", "show", "--no-pretty"]);
+            assert_eq!(positionals(args), ROOT);
+            let mut pending = graph(&[ROOT]);
+            pending["derivations"][ROOT]["outputs"]["out"] = serde_json::json!({});
+            reply(0, pending)
+        };
+        let target = |drv_installable| PlanTarget::ResolvedToplevel {
+            flake_installable: flake,
+            toplevel_installable: toplevel,
+            drv_installable,
+        };
+        let inputs = resolve_plan_inputs_with(&resolve, target(ROOT), &[hint(ROOT)]).unwrap();
+        assert_eq!(inputs.roots()[0].outputs, ["out"]);
+        for invalid in [
+            "root.drv",
+            "/nix/store/eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee-root.drv",
+            "/nix/store/00000000000000000000000000000000-dir/root.drv",
+            "path:flake#root",
+            "/nix/store/00000000000000000000000000000000-root.drv^out,",
+        ] {
+            assert!(
+                resolve_plan_inputs_with(&resolve, target(invalid), &[]).is_err(),
+                "{invalid}"
+            );
+        }
+
+        let cache = "https://test.invalid";
+        let calls = Mutex::new(Vec::new());
+        let availability = |args: &[&str]| {
+            assert!(!args.iter().any(|arg| arg.contains('#')));
+            if args[0] == "build" {
+                assert_eq!(&args[..4], ["build", "--dry-run", "--json", "--no-link"]);
+                assert_eq!(args[4], format!("{ROOT}^out"));
+                return reply(
+                    0,
+                    serde_json::json!([{ "drvPath": ROOT, "outputs": { "out": OUT } }]),
+                );
+            }
+            let store = args[args.iter().position(|arg| *arg == "--store").unwrap() + 1];
+            calls
+                .lock()
+                .unwrap()
+                .push((args[0].to_owned(), store.to_owned()));
+            match (args[0], store) {
+                ("store", remote) if remote == cache => {
+                    assert_eq!(args[1], "ping");
+                    reply(0, Value::Null)
+                }
+                ("path-info", "daemon") => {
+                    assert_eq!(args.last(), Some(&OUT));
+                    reply(1, serde_json::json!({ OUT: null }))
+                }
+                ("path-info", remote) if remote == cache => {
+                    assert_eq!(args.last(), Some(&OUT));
+                    reply(
+                        0,
+                        serde_json::json!({ OUT: { "narHash": "sha256-test", "references": [] } }),
+                    )
+                }
+                _ => panic!("unexpected Nix invocation: {args:?}"),
+            }
+        };
+        let plan = plan_resolved_closure_with(
+            &availability,
+            inputs,
+            "x86_64-linux",
+            "aarch64-linux",
+            &[cache.to_owned()],
+            &RealizationPolicy::SubstituteOnly,
+        )
+        .unwrap();
+        assert_eq!(plan.flake_installable, flake);
+        assert_eq!(plan.toplevel_installable, toplevel);
+        assert_eq!(plan.runtime_paths.len(), 1);
+        assert_eq!(
+            calls.into_inner().unwrap().len(),
+            6,
+            "both frontier and runtime stores are probed"
+        );
+        assert_eq!(plan.plan_id, plan.canonical_plan_id().unwrap());
+        let switch = crate::SwitchPlan {
+            action: "build",
+            flake_attr: flake,
+            toplevel_attr: toplevel,
+            target_ssh: None,
+            use_substitutes: false,
+            capture: false,
+            sudo: false,
+            remote_sudo: false,
+            max_jobs: None,
+            realization_policy: RealizationPolicy::SubstituteOnly,
+        };
+        assert!(matches!(
+            crate::prepare_planned_switch_with_executor(&switch, &plan, |_, _| Err(
+                Error::PlannerNoSubstituters
+            )),
+            Err(Error::PlannerNoSubstituters)
+        ));
+        let different = crate::SwitchPlan {
+            flake_attr: "different",
+            ..switch
+        };
+        assert!(matches!(
+            crate::prepare_planned_switch(&different, &plan),
+            Err(Error::PlanIdentityMismatch {
+                field: "flake_installable",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn real_nix_projects_roots_and_batches_hints_without_a_lockfile() {
+        if Command::new("nix").arg("--version").output().is_err() {
+            return;
+        }
+        let flake = tempfile::tempdir().unwrap();
+        std::fs::create_dir(flake.path().join("input")).unwrap();
+        std::fs::write(
+            flake.path().join("input/flake.nix"),
+            "{ outputs = { self }: { marker = true; }; }",
+        )
+        .unwrap();
+        std::fs::write(
+            flake.path().join("flake.nix"),
+            r#"{
+              inputs.fixture.url = "path:./input";
+              outputs = { self, fixture }: let
+                d = derivation {
+                  name = "crossbow-planner-projection";
+                  system = "builtin";
+                  builder = "builtin:unused";
+                  outputs = [ "out" "dev" ];
+                };
+              in assert fixture.marker; {
+                nixosConfigurations.example.config.system.build.toplevel = d;
+                "hi^there" = d;
+                pkg = d // { meta.outputsToInstall = [ "dev" ]; };
+                selected = d.dev // { outputSpecified = true; };
+                text = "${d.dev}";
+                shadow = d;
+                packages.x86_64-linux.shadow = "not a derivation";
+              };
+            }"#,
+        )
+        .unwrap();
+        let source = format!("path:{}", flake.path().display());
+        let toplevel = format!("{source}#nixosConfigurations.example.config.system.build.toplevel");
+        let legacy = resolve_plan_inputs(PlanTarget::Installable(&toplevel), &[]).unwrap();
+        let drv = &legacy.roots()[0].drv;
+        let resolve = |drv_installable: &str| {
+            resolve_plan_inputs(
+                PlanTarget::ResolvedToplevel {
+                    flake_installable: legacy.flake_installable(),
+                    toplevel_installable: &toplevel,
+                    drv_installable,
+                },
+                &[],
+            )
+        };
+        let explicit = format!("{drv}^out");
+        let resolved = resolve(&explicit).unwrap();
+        let stores = ["https://unused.invalid".to_owned()];
+        let policy = &RealizationPolicy::SubstituteOnly;
+        let plan = |inputs| plan_resolved_closure(inputs, "x", "y", &stores, policy).unwrap();
+        let wrapped = plan_closure_with_hints(&toplevel, "x", "y", &stores, policy, &[]).unwrap();
+        let bytes = |plan: &ClosurePlan| serde_json::to_vec(plan).unwrap();
+        assert_eq!(bytes(&wrapped), bytes(&plan(resolved)));
+        assert_eq!(bytes(&wrapped), bytes(&plan(legacy.clone())));
+        let hints = [hint(&format!("{source}#.shadow")), hint(&explicit)];
+        let wrapped_with_hints =
+            plan_closure_with_hints(&toplevel, "x", "y", &stores, policy, &hints).unwrap();
+        let split_with_hints =
+            resolve_plan_inputs(PlanTarget::Installable(&toplevel), &hints).unwrap();
+        assert_eq!(bytes(&wrapped_with_hints), bytes(&plan(split_with_hints)));
+        assert_eq!(
+            wrapped_with_hints.derivations[0].hint.as_deref(),
+            Some(explicit.as_str())
+        );
+        assert!(resolve(drv).is_err());
+        for (suffix, expected) in [("^dev,out,dev", ["dev", "out"]), ("^*", ["dev", "out"])] {
+            assert_eq!(
+                resolve(&format!("{drv}{suffix}")).unwrap().roots()[0].outputs,
+                expected
+            );
+        }
+        for fragment in ["pkg", "selected", "text", "pkg^dev"] {
+            let inputs = resolve_plan_inputs(
+                PlanTarget::Installable(&format!("{source}#{fragment}")),
+                &[],
+            )
+            .unwrap();
+            assert_eq!(inputs.roots()[0].outputs, ["dev"], "{fragment}");
+        }
+        let caret = format!(r#"{source}#"hi^there"^out"#);
+        let native = run_nix(
+            &SystemNix,
+            &[
+                "build",
+                "--dry-run",
+                "--json",
+                "--no-link",
+                "--no-write-lock-file",
+                "--option",
+                "substituters",
+                "",
+                "--",
+                &caret,
+            ],
+            "native caret root".to_owned(),
+        )
+        .unwrap();
+        let inputs = resolve_plan_inputs(PlanTarget::Installable(&caret), &[]).unwrap();
+        assert_eq!(inputs.roots(), parse_roots(&native).unwrap());
+
+        let candidates = [
+            vec![vec!["packages", "x86_64-linux", "shadow"], vec!["shadow"]],
+            vec![vec!["shadow"]],
+            vec![vec!["pkg"]],
+        ]
+        .iter()
+        .map(|paths| encode_hint_paths(paths))
+        .collect::<String>();
+        let output = eval_projection(
+            &SystemNix,
+            &format!("{source}#."),
+            &hint_projection(&candidates),
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Vec<Option<String>>>(&output).unwrap(),
+            [None, Some(drv.clone()), Some(drv.clone())]
+        );
+        assert!(!flake.path().join("flake.lock").exists());
+        assert!(resolve_plan_inputs(PlanTarget::Installable(drv), &[]).is_err());
+    }
+
+    #[test]
+    fn real_nix_batch_hint_lookup_does_not_force_lower_priority_prefixes() {
+        if Command::new("nix").arg("--version").output().is_err() {
+            return;
+        }
+        let flake = tempfile::tempdir().unwrap();
+        std::fs::write(
+            flake.path().join("flake.nix"),
+            r#"{
+              outputs = { self }: {
+                packages.x86_64-linux.p = derivation {
+                  name = "crossbow-first-hit";
+                  system = "builtin";
+                  builder = "builtin:unused";
+                };
+                packages.x86_64-linux.shadow = "not a derivation";
+                legacyPackages = throw "unused";
+              };
+            }"#,
+        )
+        .unwrap();
+        let source = format!("path:{}", flake.path().display());
+        let candidates = ["p", "shadow"].map(|name| {
+            encode_hint_paths(&[
+                vec!["packages", "x86_64-linux", name],
+                vec!["legacyPackages", "x86_64-linux", name],
+                vec![name],
+            ])
+        });
+        let output = eval_projection(
+            &SystemNix,
+            &format!("{source}#."),
+            &hint_projection(&candidates.concat()),
+        )
+        .unwrap();
+        let paths: Vec<Option<String>> = serde_json::from_str(&output).unwrap();
+        assert!(
+            paths[0]
+                .as_deref()
+                .unwrap()
+                .ends_with("-crossbow-first-hit.drv")
+        );
+        assert_eq!(paths[1], None);
+    }
+
+    #[test]
+    fn empty_roots_skip_hints_and_seal_without_nix() {
+        let opaque = "/nix/store/00000000000000000000000000000000-opaque";
+        let nix = |args: &[&str]| {
+            assert_eq!(positionals(args), opaque);
+            reply(0, graph(&[]))
+        };
+        let inputs =
+            resolve_plan_inputs_with(&nix, PlanTarget::Installable(opaque), &[hint("unresolved")])
+                .unwrap();
+        let no_nix = |args: &[&str]| panic!("unexpected Nix invocation: {args:?}");
+        let plan = plan_resolved_closure_with(
+            &no_nix,
+            inputs,
+            "x",
+            "y",
+            &[],
+            &RealizationPolicy::SubstituteOnly,
+        )
+        .unwrap();
+        assert!(plan.roots.is_empty());
+        assert!(plan.derivations.is_empty());
+        assert_eq!(plan.toplevel_installable, opaque);
+        assert_eq!(plan.plan_id, plan.canonical_plan_id().unwrap());
+    }
 
     #[test]
     fn serializes_machine_readable_plan() {
@@ -1850,6 +2861,7 @@ mod tests {
         );
         paths.extend(
             resolve_output_paths(
+                &SystemNix,
                 &graph,
                 &unresolved,
                 &["https://cache".to_owned()],
@@ -2039,12 +3051,10 @@ mod tests {
     #[test]
     fn indeterminate_probe_always_fails_closed() {
         let route = select_route(
-            "root.drv",
             &ProbeResult::Indeterminate {
                 errors: vec!["cache".to_owned()],
             },
-            &[],
-            &BTreeMap::new(),
+            None,
             "x86_64-linux",
             "x86_64-linux",
             "aarch64-linux",
@@ -2133,10 +3143,8 @@ mod tests {
     #[test]
     fn builtin_dependency_is_ordered_before_its_consumer_and_build_local() {
         let builtin_route = select_route(
-            "builtin.drv",
             &ProbeResult::SkippedKnownLocal,
-            &[],
-            &BTreeMap::new(),
+            None,
             "builtin",
             "x86_64-linux",
             "aarch64-linux",
@@ -2202,7 +3210,7 @@ mod tests {
 
     #[test]
     fn known_local_hint_skips_probe_and_routes_build_local() {
-        let hints = vec![RouteHintSpec {
+        let hints = [RouteHintSpec {
             label: "identity-cli".into(),
             installable: ".#identity-cli".into(),
             on_miss: MissRoute::BuildLocal,
@@ -2226,10 +3234,8 @@ mod tests {
         assert_eq!(probe, ProbeResult::SkippedKnownLocal);
 
         let route = select_route(
-            "identity.drv",
             &probe,
-            &hints,
-            &hint_drvs,
+            hint_drvs.get("identity.drv"),
             "x86_64-linux",
             "x86_64-linux",
             "aarch64-linux",
@@ -2241,10 +3247,8 @@ mod tests {
     #[test]
     fn local_present_probe_routes_already_present() {
         let route = select_route(
-            "local.drv",
             &ProbeResult::LocalPresent,
-            &[],
-            &BTreeMap::new(),
+            None,
             "x86_64-linux",
             "x86_64-linux",
             "aarch64-linux",
@@ -2265,7 +3269,6 @@ mod tests {
         };
         let route = route_for_hint(
             &spec,
-            &[],
             "aarch64-linux",
             "x86_64-linux",
             &RealizationPolicy::SubstituteOnly,
@@ -2284,7 +3287,6 @@ mod tests {
         };
         let no_builder = route_for_hint(
             &spec,
-            &[],
             "aarch64-linux",
             "x86_64-linux",
             &RealizationPolicy::SubstituteOnly,
@@ -2293,7 +3295,6 @@ mod tests {
 
         let with_builder = route_for_hint(
             &spec,
-            &[],
             "aarch64-linux",
             "x86_64-linux",
             &RealizationPolicy::RemoteNative {
@@ -2319,7 +3320,6 @@ mod tests {
         };
         let route = route_for_hint(
             &spec,
-            &[],
             "aarch64-linux",
             "x86_64-linux",
             &RealizationPolicy::SubstituteOnly,
