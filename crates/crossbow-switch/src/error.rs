@@ -576,6 +576,15 @@ pub enum Error {
         stderr: String,
     },
 
+    /// An executable architecture audit blocked closure publication.
+    #[cfg(unix)]
+    #[error(transparent)]
+    ClosureAudit(#[from] crate::audit::AuditError),
+
+    /// Native-recovery inputs could not be safely used.
+    #[error("crossbow: invalid native recovery requirements: {0}")]
+    InvalidRecoveryRequirements(String),
+
     /// Cache verification reported paths missing after publication.
     #[error(
         "crossbow: {count} paths are missing from cache after publish; first missing paths: {preview}"
