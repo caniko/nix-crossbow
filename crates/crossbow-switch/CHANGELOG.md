@@ -2,6 +2,19 @@
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-27
+
+### Added
+
+- The `audit` API checks executables in a supplied closure for ELF architecture
+  mismatches and follows store shebang chains. It supports explicit path
+  exceptions and returns typed findings
+  ([#17](https://github.com/caniko/nix-crossbow/pull/17)).
+- The `recovery` API batches prerequisite builds for changed, added, or missing
+  roots, then publishes and verifies their closures before asking the caller to
+  release stale roots
+  ([#17](https://github.com/caniko/nix-crossbow/pull/17)).
+
 ## [0.3.3] - 2026-11-24
 
 - Batch route-hint evaluation in `resolve_hint_drvs` (#14).
@@ -42,3 +55,6 @@ First registry release of the existing Crossbow runtime library and executable.
   compiler checks, without changing runtime or persisted-state behavior.
 - Portable Nix packaging for hosted workers, with managed compiler-cache
   wrapping available through the separate `crossbow-switch-cached` output.
+
+[Unreleased]: https://github.com/caniko/nix-crossbow/compare/0.4.0...HEAD
+[0.4.0]: https://github.com/caniko/nix-crossbow/compare/0.3.3...0.4.0
