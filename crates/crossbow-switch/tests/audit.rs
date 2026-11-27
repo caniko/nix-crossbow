@@ -3,9 +3,27 @@
 use std::{cell::RefCell, fs, os::unix::fs::PermissionsExt, path::Path};
 
 use crossbow_switch::{
-    Error, Publisher, Result,
-    audit::{AuditError, AuditFindingKind, AuditOptions, AuditingPublisher, audit_paths},
+    Error, PreparedSwitch, Publisher, Result,
+    audit::{
+        AuditError, AuditFindingKind, AuditOptions, AuditingPublisher, audit_paths,
+        audit_prepared_switch,
+    },
 };
+
+#[test]
+fn rejects_prepared_switch_without_a_captured_closure() {
+    let prepared = PreparedSwitch {
+        frozen_flake: "path:/fixture".into(),
+        toplevel_attr: "fixture".into(),
+        toplevel: "/nix/store/fixture".into(),
+        closure: vec![],
+        fingerprint: "uncaptured".into(),
+    };
+    assert!(matches!(
+        audit_prepared_switch(&prepared, &AuditOptions::new("x86_64-linux")),
+        Err(AuditError::UncapturedClosure)
+    ));
+}
 
 #[derive(Default)]
 struct Cache(RefCell<Vec<Vec<String>>>);

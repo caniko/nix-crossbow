@@ -98,6 +98,9 @@ pub enum AuditFindingKind {
 #[non_exhaustive]
 #[derive(Debug, Error)]
 pub enum AuditError {
+    /// No closure was captured for the realized candidate.
+    #[error("closure audit requires a captured closure; prepare the switch with capture enabled")]
+    UncapturedClosure,
     /// Target has no supported ELF machine mapping.
     #[error("closure audit has no ELF machine mapping for {0}")]
     UnsupportedTarget(String),
@@ -125,6 +128,9 @@ pub fn audit_prepared_switch(
     prepared: &PreparedSwitch,
     options: &AuditOptions<'_>,
 ) -> Result<AuditReport, AuditError> {
+    if prepared.closure.is_empty() {
+        return Err(AuditError::UncapturedClosure);
+    }
     let mut report = audit_paths(&prepared.closure, options)?;
     report.prepared_fingerprint = Some(prepared.fingerprint.clone());
     Ok(report)
