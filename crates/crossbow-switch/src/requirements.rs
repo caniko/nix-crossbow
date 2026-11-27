@@ -103,9 +103,9 @@ pub fn label_roots(artifact: &RequirementsArtifact) -> Vec<LabeledRoot> {
 pub struct RootDiff {
     /// Labels present in `new` but absent from `old`.
     pub added: Vec<LabeledRoot>,
-    /// Labels present in both but with a different fingerprint.
+    /// Labels present in both but with a different path or no matching fingerprint.
     pub changed: Vec<LabeledRoot>,
-    /// Labels present in both with the same fingerprint.
+    /// Labels present in both with the same path and nonempty fingerprint.
     pub unchanged: Vec<LabeledRoot>,
     /// Labels present in `old` but absent from `new`.
     pub removed: Vec<String>,
@@ -129,7 +129,9 @@ pub fn diff_roots(old: &[LabeledRoot], new: &[LabeledRoot]) -> RootDiff {
                 added.push(new_root.clone());
             }
             Some(old_root) => {
-                if old_root.fingerprint == new_root.fingerprint && !new_root.fingerprint.is_empty()
+                if old_root.path == new_root.path
+                    && old_root.fingerprint == new_root.fingerprint
+                    && !new_root.fingerprint.is_empty()
                 {
                     unchanged.push(new_root.clone());
                 } else {

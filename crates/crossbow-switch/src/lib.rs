@@ -13,6 +13,9 @@ use std::thread;
 
 use sha2::{Digest, Sha256};
 
+/// Executable architecture audits for Unix Nix stores.
+#[cfg(unix)]
+pub mod audit;
 /// Command-line entry points for the `crossbow-switch` binary.
 pub mod cli;
 /// Error and result types shared by the library and binary.
@@ -23,6 +26,8 @@ pub mod executor;
 pub mod metadata;
 /// Structured derivation-closure planning for cache-shaped realizations.
 pub mod planner;
+/// Opt-in preparation of explicitly selected native recovery roots.
+pub mod recovery;
 /// Parsed Crossbow requirements artifact (roots, drvs, fingerprint).
 pub mod requirements;
 mod runtime;
@@ -664,20 +669,7 @@ fn finish_switch(
         eprintln!("crossbow: stage=publish paths={}", paths.len());
         publisher.publish(paths)?;
         eprintln!("crossbow: stage=verify paths={}", paths.len());
-        let missing = verifier.verify_present(paths)?;
-
-        if !missing.is_empty() {
-            let preview = missing
-                .iter()
-                .take(5)
-                .map(String::as_str)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(Error::MissingCachePaths {
-                count: missing.len(),
-                preview,
-            });
-        }
+        require_cache_paths(verifier, paths)?;
     }
 
     if plan.action == "build" {
@@ -685,6 +677,22 @@ fn finish_switch(
     }
 
     runner.activate(plan, &prepared)
+}
+
+fn require_cache_paths(verifier: &dyn Verifier, paths: &[String]) -> Result<()> {
+    let missing = verifier.verify_present(paths)?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    Err(Error::MissingCachePaths {
+        count: missing.len(),
+        preview: missing
+            .iter()
+            .take(5)
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join(", "),
+    })
 }
 
 fn prepare_switch_with_runner(
